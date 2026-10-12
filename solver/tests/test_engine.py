@@ -169,7 +169,7 @@ class SolverTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
     def test_default_twelve_person_model_matches_js_validator(self):
         folder = Path(__file__).resolve().parent
-        fixture = subprocess.run(['node', str(folder / 'default_fixture.mjs')], text=True, capture_output=True, check=True)
+        fixture = subprocess.run(['node', str(folder / 'default_fixture.mjs')], text=True, encoding='utf-8', capture_output=True, check=True)
         s = json.loads(fixture.stdout)
         s['employees'][0]['unavailableDates'] = ['2026-10-02']
         s['rules']['separationGroups'] = [dict(id='separate', name='互斥', employeeIds=['employee-1', 'employee-2'], shiftIds=[])]
@@ -179,20 +179,20 @@ class SolverTest(unittest.TestCase):
         result = solve(r)
         self.assertFeasible(result)
         self.assertEqual(result['stats']['shortageCount'], 0)
-        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, capture_output=True, check=True)
+        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
     def test_cli_stdout_single_json_and_info(self):
         main = Path(__file__).resolve().parents[1] / 'main.py'
-        result = subprocess.run([sys.executable, str(main)], input=json.dumps(request(state())), text=True, capture_output=True, check=True)
+        result = subprocess.run([sys.executable, str(main)], input=json.dumps(request(state())), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertFeasible(json.loads(result.stdout))
         self.assertEqual(len(result.stdout.strip().splitlines()), 1)
-        info = subprocess.run([sys.executable, str(main), '--info'], text=True, capture_output=True, check=True)
+        info = subprocess.run([sys.executable, str(main), '--info'], text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(info.stdout)['engine'], 'ortools-cp-sat')
 
     def test_hosted_stages_do_not_contaminate_result_json(self):
         main = Path(__file__).resolve().parents[1] / 'main.py'
-        result = subprocess.run([sys.executable, str(main), '--hosted'], input=json.dumps(request(state())), text=True, capture_output=True, check=True, timeout=15)
+        result = subprocess.run([sys.executable, str(main), '--hosted'], input=json.dumps(request(state())), text=True, encoding='utf-8', capture_output=True, check=True, timeout=15)
         self.assertFeasible(json.loads(result.stdout))
         self.assertEqual(len(result.stdout.strip().splitlines()), 1)
         stages = [line for line in result.stderr.splitlines() if line.startswith('SHIFTFLOW_STAGE_V1:')]
@@ -200,7 +200,7 @@ class SolverTest(unittest.TestCase):
 
     def test_native_self_test_actually_completes_constraint_search(self):
         main = Path(__file__).resolve().parents[1] / 'main.py'
-        result = subprocess.run([sys.executable, str(main), '--hosted', '--self-test'], text=True, capture_output=True, check=True, timeout=15)
+        result = subprocess.run([sys.executable, str(main), '--hosted', '--self-test'], text=True, encoding='utf-8', capture_output=True, check=True, timeout=15)
         info = json.loads(result.stdout)
         self.assertEqual(info['engine'], 'ortools-cp-sat')
         self.assertIs(info['selfTest'], True)

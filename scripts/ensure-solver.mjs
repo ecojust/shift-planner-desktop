@@ -49,11 +49,11 @@ main(async () => {
       console.log('首次准备开发环境，需要联网安装本地 Python 依赖…');
       run(process.execPath, [join(projectRoot, 'scripts', 'setup-solver.mjs')]);
     }
-    console.log('正在校验开发模式 Python 求解器，不使用旧的单文件打包程序…');
+    console.log('正在校验开发模式 Python 求解器（启动最多 120 秒），不使用旧的单文件打包程序…');
     try {
       const commandArgs = [join(solverRoot, 'main.py')];
-      const info = parseFrozenInfo(await captureFrozen(venvPython, [...commandArgs, '--info', '--hosted'], { cwd: projectRoot, startupTimeoutMs: 30_000 }));
-      parseFrozenInfo(await captureFrozen(venvPython, [...commandArgs, '--self-test', '--hosted'], { cwd: projectRoot, startupTimeoutMs: 30_000 }), true);
+      const info = parseFrozenInfo(await captureFrozen(venvPython, [...commandArgs, '--info', '--hosted'], { cwd: projectRoot }));
+      parseFrozenInfo(await captureFrozen(venvPython, [...commandArgs, '--self-test', '--hosted'], { cwd: projectRoot }), true);
       console.log(`开发求解器已就绪：项目 Python + OR-Tools ${info.version}，实际求解自检通过。`);
       return;
     } catch (error) { throw new Error(`开发模式求解器检查失败，已保留具体诊断；不会自动改用旧单文件程序。依赖缺失时运行 npm run solver:setup；启动异常时运行 npm run solver:doctor。\n${error.message}`); }

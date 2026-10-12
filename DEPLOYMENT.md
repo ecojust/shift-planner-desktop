@@ -43,7 +43,7 @@ npm run desktop:build
 
 开发运行使用 `npm run desktop:dev`，前置检查仅验证项目 `solver/.venv` 并执行小型自检，Tauri 直接调用这个固定环境中的 Python 与 `solver/main.py`。该路径不依赖发行运行目录，也不需要每次重新下载依赖或执行 PyInstaller。源码修改后重新发起求解会读取当前 Python 文件；若修改了 Rust、项目配置或启动脚本，应停止旧开发进程再重新启动。
 
-专用 `.github/workflows/macos-arm64.yml` 手动触发，全部测试、原生资源审计及整月求解验证通过后，自动发布包含 DMG 和对应源码的 GitHub prerelease。已完成 macOS 15 ARM64 原生构建及包内求解测试，运行要求为 M 芯片、macOS 14+；Mac 图形界面与安装过程尚未实测。通用 `.github/workflows/desktop-build.yml` 仍仅上传 Windows/macOS 构建产物，不自动发布；Windows 尚未原生验证。完整范围见 [验证记录](docs/VERIFICATION.md)。默认构建未配置 Windows 商业代码签名或 Apple Developer ID 签名、公证。
+专用 `.github/workflows/macos-arm64.yml` 手动触发，全部测试、原生资源审计及整月求解验证通过后，自动发布包含 DMG 和对应源码的 GitHub prerelease。已完成 macOS 15 ARM64 原生构建及包内求解测试，运行要求为 M 芯片、macOS 14+；Mac 图形界面与安装过程尚未实测。三平台 `.github/workflows/desktop-build.yml` 通过 **Build desktop installers** 手动触发，分别在 Windows x64、Intel Mac、M 芯片 Mac 原生运行器构建，全部检查通过后自动发布三个安装包、源码及报告；具体运行结果见对应 Actions 记录。完整范围见 [验证记录](docs/VERIFICATION.md)。默认构建未配置 Windows 商业代码签名或 Apple Developer ID 签名、公证。
 
 桌面版通过本地进程通信求解，不启动 HTTP 服务，也不需要部署 Python 服务。桌面求解器缺失或启动失败时显示错误，不会退回网页算法。对安装包进行实际系统验证后，再向该平台的使用者分发。
 

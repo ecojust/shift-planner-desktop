@@ -13,8 +13,8 @@ main(async () => {
     throw new Error('现有 solver/.venv 的 Python 版本不支持，请删除该虚拟环境后使用 Python 3.12 重建。');
   }
   run(venvPython, ['-m', 'pip', 'install', '--disable-pip-version-check', '-r', join(solverRoot, 'requirements.txt'), `pyinstaller==${pyinstallerVersion}`]);
-  console.log('依赖安装完成，正在校验 Python / OR-Tools 启动…');
-  const result = await captureFrozen(venvPython, [join(solverRoot, 'main.py'), '--info', '--hosted'], { startupTimeoutMs: 30_000 });
+  console.log('依赖安装完成，正在校验 Python / OR-Tools 启动（最多 120 秒；异常时会显示具体依赖的导入位置）…');
+  const result = await captureFrozen(venvPython, [join(solverRoot, 'main.py'), '--info', '--hosted']);
   console.log(JSON.stringify(parseFrozenInfo(result)));
   console.log('求解环境准备完成。最终桌面安装包会包含该求解器，使用者无需安装 Python。');
 });

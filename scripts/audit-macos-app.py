@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inspect a macOS .app without running any executable inside the bundle.
 
-Usage: python3 scripts/audit-macos-app.py /path/to/ShiftFlow.app > audit.json
+Usage: python3 scripts/audit-macos-app.py /path/to/ShiftFlow.app [--arch arm64|x86_64] > audit.json
 Exit 1 means a structural, architecture, or symlink validation failed. A bundle
 declaring an older macOS version than a dependency's minos is reported, but does
 not fail this audit. This report is static evidence, not an installation test.
@@ -20,6 +20,8 @@ from typing import BinaryIO
 
 
 ARM64 = 0x0100000C
+X86_64 = 0x01000007
+TARGET_CPUS = {"arm64": ARM64, "x86_64": X86_64}
 MACOS = 1
 THIN_MAGIC = {
     b"\xce\xfa\xed\xfe": ("<", 28),
@@ -33,7 +35,7 @@ FAT_MAGIC = {
     b"\xca\xfe\xba\xbf": (">", True),
     b"\xbf\xba\xfe\xca": ("<", True),
 }
-CPU_NAMES = {ARM64: "arm64", 0x01000007: "x86_64", 7: "i386", 12: "arm"}
+CPU_NAMES = {ARM64: "arm64", X86_64: "x86_64", 7: "i386", 12: "arm"}
 PLATFORM_NAMES = {1: "macOS", 2: "iOS", 3: "tvOS", 4: "watchOS", 6: "Mac Catalyst"}
 
 
@@ -130,13 +132,17 @@ def inspect_macho(path: Path) -> dict | None:
     return {"bytes": length, "slices": slices}
 
 
-def audit_app(argument: str) -> dict:
+def audit_app(argument: str, arch: str = "arm64") -> dict:
+    if arch not in TARGET_CPUS:
+        raise ValueError(f"Unsupported target architecture: {arch}")
+    target_cpu = TARGET_CPUS[arch]
     errors: list[dict] = []
     warnings: list[dict] = []
     root = Path(argument).expanduser().resolve()
     report = {
         "schema_version": 1,
         "app_path": str(root),
+        "target_architecture": arch,
         "method": "Static Mach-O load-command and bundle-path inspection; no bundled program was executed.",
         "bundle": {}, "summary": {}, "minimum_system_assessment": {},
         "key_components": {"main": [], "solver": [], "python": [], "numpy": [], "ortools": []},
@@ -182,14 +188,14 @@ def audit_app(argument: str) -> dict:
                     continue
                 item["path"] = relative(path)
                 report["macho_objects"].append(item)
-                arm_slices = [slice_ for slice_ in item["slices"] if slice_["cpu_type"] == ARM64]
-                if not arm_slices:
-                    errors.append({"code": "macho_missing_arm64", "path": relative(path)})
-                for slice_ in arm_slices:
+                target_slices = [slice_ for slice_ in item["slices"] if slice_["cpu_type"] == target_cpu]
+                if not target_slices:
+                    errors.append({"code": f"macho_missing_{arch}", "path": relative(path), "target_architecture": arch})
+                for slice_ in target_slices:
                     if not slice_["version_commands"]:
-                        warnings.append({"code": "arm64_minimum_not_declared", "path": relative(path)})
+                        warnings.append({"code": f"{arch}_minimum_not_declared", "path": relative(path)})
                     elif any(command["platform"] != MACOS for command in slice_["version_commands"]):
-                        warnings.append({"code": "arm64_non_macos_platform", "path": relative(path)})
+                        warnings.append({"code": f"{arch}_non_macos_platform", "path": relative(path)})
             except (OSError, ValueError, struct.error) as error:
                 errors.append({"code": "file_inspection_failed", "path": relative(path), "message": str(error)})
 
@@ -220,16 +226,16 @@ def audit_app(argument: str) -> dict:
 
     all_versions = []
     macos_versions = []
-    arm_objects = 0
+    target_objects = 0
     minimum_unknown = []
     for item in report["macho_objects"]:
-        arm_slices = [slice_ for slice_ in item["slices"] if slice_["cpu_type"] == ARM64]
-        if arm_slices:
-            arm_objects += 1
-        commands = [command for slice_ in arm_slices for command in slice_["version_commands"]]
+        target_slices = [slice_ for slice_ in item["slices"] if slice_["cpu_type"] == target_cpu]
+        if target_slices:
+            target_objects += 1
+        commands = [command for slice_ in target_slices for command in slice_["version_commands"]]
         all_versions.extend(command["minos"] for command in commands)
         macos_versions.extend(command["minos"] for command in commands if command["platform"] == MACOS)
-        if arm_slices and not any(command["platform"] == MACOS for command in commands):
+        if target_slices and not any(command["platform"] == MACOS for command in commands):
             minimum_unknown.append(item["path"])
         path_lower = "/" + item["path"].lower()
         basename = Path(item["path"]).name.lower()
@@ -245,7 +251,8 @@ def audit_app(argument: str) -> dict:
         if "/ortools/" in path_lower or "/ortools.libs/" in path_lower or "libortools" in basename:
             categories.append("ortools")
         compact = {"path": item["path"], "architectures": [slice_["architecture"] for slice_ in item["slices"]],
-                   "arm64_version_commands": commands}
+                   "target_architecture": arch, "target_version_commands": commands,
+                   f"{arch}_version_commands": commands}
         for category in categories:
             report["key_components"][category].append(compact)
     if not report["macho_objects"]:
@@ -257,8 +264,8 @@ def audit_app(argument: str) -> dict:
     macos_maximum = max(macos_versions, key=version_key) if macos_versions else None
     declared = info.get("LSMinimumSystemVersion")
     per_architecture = info.get("LSMinimumSystemVersionByArchitecture")
-    if isinstance(per_architecture, dict) and per_architecture.get("arm64"):
-        declared = per_architecture["arm64"]
+    if isinstance(per_architecture, dict) and per_architecture.get(arch):
+        declared = per_architecture[arch]
     understated = None
     if isinstance(declared, str) and macos_maximum:
         try:
@@ -267,24 +274,35 @@ def audit_app(argument: str) -> dict:
             warnings.append({"code": "invalid_declared_minimum", "value": declared})
     if understated:
         warnings.append({"code": "declared_minimum_below_bundled_dependency",
-                         "declared": declared, "observed_macos_arm64_max_minos": macos_maximum})
+                         "declared": declared, "target_architecture": arch,
+                         "observed_macos_max_minos": macos_maximum,
+                         f"observed_macos_{arch}_max_minos": macos_maximum})
     report["summary"] = {
-        "macho_object_count": len(report["macho_objects"]), "arm64_object_count": arm_objects,
-        "all_macho_objects_contain_arm64": bool(arm_objects) and arm_objects == len(report["macho_objects"]),
-        "arm64_max_minos": maximum, "macos_arm64_max_minos": macos_maximum,
-        "arm64_objects_without_macos_minimum": minimum_unknown,
+        "macho_object_count": len(report["macho_objects"]),
+        "target_architecture": arch, "target_object_count": target_objects,
+        "all_macho_objects_contain_target_architecture": bool(target_objects) and target_objects == len(report["macho_objects"]),
+        "target_max_minos": maximum, "macos_target_max_minos": macos_maximum,
+        "target_objects_without_macos_minimum": minimum_unknown,
+        # Architecture-specific aliases preserve the existing ARM64 report schema.
+        f"{arch}_object_count": target_objects,
+        f"all_macho_objects_contain_{arch}": bool(target_objects) and target_objects == len(report["macho_objects"]),
+        f"{arch}_max_minos": maximum, f"macos_{arch}_max_minos": macos_maximum,
+        f"{arch}_objects_without_macos_minimum": minimum_unknown,
         "symlink_count": len(report["symlinks"]),
         "all_symlinks_internal_and_resolvable": all(link["valid"] for link in report["symlinks"]),
     }
     report["minimum_system_assessment"] = {
-        "effective_declared_arm64_minimum": declared,
-        "observed_macos_arm64_max_minos": macos_maximum,
+        "target_architecture": arch,
+        "effective_declared_minimum": declared,
+        "observed_macos_max_minos": macos_maximum,
+        f"effective_declared_{arch}_minimum": declared,
+        f"observed_macos_{arch}_max_minos": macos_maximum,
         "declaration_understates_observed_minimum": understated,
         "observed_maximum_objects": [item["path"] for item in report["macho_objects"] if any(
             command["platform"] == MACOS and command["minos"] == macos_maximum
-            for slice_ in item["slices"] if slice_["cpu_type"] == ARM64 for command in slice_["version_commands"]
+            for slice_ in item["slices"] if slice_["cpu_type"] == target_cpu for command in slice_["version_commands"]
         )],
-        "limitation": "This is the highest declared minimum among bundled macOS ARM64 objects, not a runtime compatibility guarantee. Optional libraries may not always load; undeclared requirements and actual OS behavior still require testing. SDK versions are not minimum OS versions.",
+        "limitation": f"This is the highest declared minimum among bundled macOS {arch} objects, not a runtime compatibility guarantee. Optional libraries may not always load; undeclared requirements and actual OS behavior still require testing. SDK versions are not minimum OS versions.",
     }
     report["validation"]["passed"] = not errors
     return report
@@ -293,8 +311,9 @@ def audit_app(argument: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app", help="Path to the extracted .app directory")
+    parser.add_argument("--arch", choices=tuple(TARGET_CPUS), default="arm64", help="Required Mach-O architecture (default: arm64)")
     arguments = parser.parse_args()
-    report = audit_app(arguments.app)
+    report = audit_app(arguments.app, arguments.arch)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return 0 if report["validation"]["passed"] else 1
 

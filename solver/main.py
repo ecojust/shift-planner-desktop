@@ -1,6 +1,7 @@
 """One bounded JSON request on stdin, exactly one JSON response on stdout."""
 import json
 import sys
+import time
 
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 
@@ -19,11 +20,47 @@ def emit(result):
     stage('finishing')
 
 
+def load_engine():
+    if '--hosted' not in sys.argv[1:]:
+        from engine import solve
+        return solve
+    # Native dependency initialization can be slow or stall before any search
+    # starts. Mark the actual imports, without changing stdout or model rules.
+    import faulthandler
+    import importlib
+    began = time.monotonic()
+    traceback_scheduled = False
+
+    def diagnostic(module, action):
+        sys.stderr.write(f'SHIFTFLOW_IMPORT_V1:{module}:{action}:{time.monotonic() - began:.3f}s\n')
+        sys.stderr.flush()
+
+    try:
+        try:
+            # One bounded traceback identifies the exact blocked import even
+            # when the native loader never returns. The host still owns timeout.
+            faulthandler.dump_traceback_later(20, repeat=False, file=sys.stderr)
+            traceback_scheduled = True
+        except (OSError, RuntimeError, ValueError):
+            pass  # A redirected in-memory stderr may not have a file descriptor.
+        for module in ('numpy', 'pandas', 'ortools.sat.python.cp_model'):
+            diagnostic(module, 'begin')
+            importlib.import_module(module)
+            diagnostic(module, 'ready')
+        diagnostic('engine', 'begin')
+        from engine import solve
+        diagnostic('engine', 'ready')
+        return solve
+    finally:
+        if traceback_scheduled:
+            faulthandler.cancel_dump_traceback_later()
+
+
 def main():
     stage('loading')
     # Import the real native engine after announcing the stage. This lets the
     # host distinguish a slow Python/native-library startup from a slow model.
-    from engine import solve
+    solve = load_engine()
     if '--self-test' in sys.argv[1:]:
         import ortools
         from ortools.sat.python import cp_model

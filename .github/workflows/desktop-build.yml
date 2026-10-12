@@ -1,21 +1,51 @@
 name: Build desktop installers
 
-# Native builds only. This workflow does not publish a release or deploy a site.
+# Native builds for all three architectures, then publish one verified release.
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: desktop-release-${{ github.run_id }}
+  cancel-in-progress: false
+
 jobs:
   desktop:
-    name: Desktop (${{ matrix.os }})
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - name: Windows x64
+            os: windows-2022
+            id: windows-x64
+            python: x64
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+          - name: macOS Intel x64
+            os: macos-15-intel
+            id: macos-x64
+            python: x64
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+          - name: macOS Apple Silicon
+            os: macos-15
+            id: macos-arm64
+            python: arm64
+            target: aarch64-apple-darwin
+            bundles: app,dmg
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: bash
+    env:
+      SHIFT_FLOW_TARGET: ${{ matrix.target }}
+      SHIFT_FLOW_PLATFORM_ID: ${{ matrix.id }}
+      PYTHONUTF8: '1'
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,35 +55,119 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+          architecture: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Show native build platform
-        run: rustc -vV
+      - name: Verify native Node, Python and Rust architecture
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+          const expected = process.env.SHIFT_FLOW_TARGET;
+          const rust = execFileSync('rustc', ['-vV'], { encoding: 'utf8' });
+          assert.equal(rust.match(/^host: (.+)$/m)?.[1]?.trim(), expected);
+          const python = JSON.parse(execFileSync('python', ['-c', 'import json,platform,sys; print(json.dumps({"platform":sys.platform,"machine":platform.machine(),"executable":sys.executable}))'], { encoding: 'utf8' }));
+          const arch = expected.startsWith('aarch64') ? 'arm64' : 'x64';
+          const platform = expected.endsWith('apple-darwin') ? 'darwin' : 'win32';
+          assert.equal(process.arch, arch);
+          assert.equal(process.platform, platform);
+          assert.equal(python.platform, platform);
+          assert.equal(({ AMD64: 'x64', amd64: 'x64', x86_64: 'x64', arm64: 'arm64', aarch64: 'arm64' })[python.machine], arch);
+          appendFileSync(process.env.GITHUB_ENV, `SHIFT_FLOW_PYTHON=${python.executable}\n`);
+          console.log(JSON.stringify({ target: expected, node: process.arch, python }, null, 2));
+          NODE
       - name: Install frontend dependencies
         run: npm ci
-      - name: Prepare bundled solver
-        run: npm run solver:setup
-      - name: Test frontend rules
+      - name: Prepare local Python solver
+        run: npm run solver:ensure -- --dev
+      - name: Test frontend rules and process helpers
         run: npm test
-      - name: Test CP-SAT solver
+      - name: Type-check and build Vue interface
+        run: npm run build
+      - name: Test real CP-SAT constraints
         run: npm run solver:test
-      - name: Freeze native solver
+      - name: Test Mac native architecture audit
+        if: runner.os == 'macOS'
+        run: python -m unittest discover -s scripts/tests -p 'test_audit_macos_app.py' -v
+      - name: Freeze and self-test native solver
         run: npm run solver:build
-      - name: Test desktop process bridge
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - name: Test Rust process lifecycle
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
       - name: Verify development Python integration
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib python_source_solver_solves_real_schedule -- --ignored --nocapture
-      - name: Verify native frozen solver integration
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib frozen_sidecar_solves_real_schedule -- --ignored --nocapture
-      - name: Build desktop app
-        run: npm run desktop:build
-      - name: Upload installers and solver manifest
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib python_source_solver_solves_real_schedule -- --ignored --nocapture
+      - name: Verify native directory runtime integration
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib frozen_sidecar_solves_real_schedule -- --ignored --nocapture
+      - name: Build native desktop installer
+        run: npm run desktop:build -- --bundles ${{ matrix.bundles }}
+      - name: Install Windows package for real resource validation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installers = @(Get-ChildItem -Path 'src-tauri/target/release/bundle/nsis' -Filter '*.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected exactly one NSIS installer' }
+          $installDirectory = Join-Path $env:RUNNER_TEMP 'shift-flow-installed'
+          # NSIS requires /D last, without quotes even if the directory contains spaces.
+          $installerProcess = Start-Process -FilePath $installers[0].FullName -ArgumentList @('/S', "/D=$installDirectory") -PassThru
+          if (-not $installerProcess.WaitForExit(180000)) {
+            & taskkill.exe /PID $installerProcess.Id /T /F
+            throw 'Windows installer timed out'
+          }
+          if ($installerProcess.ExitCode -ne 0) { throw "Installer exit code: $($installerProcess.ExitCode)" }
+          if (-not (Test-Path -LiteralPath (Join-Path $installDirectory 'solver-runtime/shiftflow-solver.exe'))) {
+            throw 'The installed package is missing its solver runtime'
+          }
+          "SHIFT_FLOW_INSTALLED_APP=$installDirectory" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Verify installed runtime, native architecture and complete month
+        run: node scripts/verify-desktop-bundle.mjs
+      - name: Stage uniquely named installer
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { copyFileSync, readdirSync, statSync } from 'node:fs';
+          import { join } from 'node:path';
+          const windows = process.platform === 'win32';
+          const extension = windows ? '.exe' : '.dmg';
+          const directory = join('src-tauri/target/release/bundle', windows ? 'nsis' : 'dmg');
+          const installers = readdirSync(directory).filter(name => name.endsWith(extension));
+          assert.equal(installers.length, 1);
+          const file = `artifacts/shift-flow-${process.env.SHIFT_FLOW_PLATFORM_ID}${extension}`;
+          copyFileSync(join(directory, installers[0]), file);
+          assert.ok(statSync(file).size > 0);
+          console.log(file);
+          NODE
+      - name: Upload verified platform package
         uses: actions/upload-artifact@v4
         with:
-          name: shift-flow-${{ matrix.os }}
+          name: shift-flow-${{ matrix.id }}
           if-no-files-found: error
           retention-days: 14
-          path: |
-            src-tauri/target/release/bundle/**/*.msi
-            src-tauri/target/release/bundle/**/*.exe
-            src-tauri/target/release/bundle/**/*.dmg
-            solver/build/*/manifest.json
+          compression-level: 0
+          path: artifacts/
+
+  release:
+    name: Publish all verified desktop installers
+    needs: desktop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shift-flow-*
+          merge-multiple: true
+          path: artifacts
+      - name: Archive exact source and verify all platform evidence
+        run: |
+          git archive --format=zip --prefix=shift-planner/ --output=artifacts/shift-planner-source.zip "$GITHUB_SHA"
+          node scripts/prepare-desktop-release.mjs
+      - name: Publish complete verified release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-desktop-release.mjs

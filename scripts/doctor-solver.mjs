@@ -17,9 +17,10 @@ main(async () => {
     let observed;
     try {
       const result = await captureFrozen(command, commandArgs, { cwd: projectRoot, ...options });
-      observed = { elapsedSeconds: result.elapsedSeconds, stage: result.stage, stages: result.stages };
+      observed = { elapsedSeconds: result.elapsedSeconds, stage: result.stage, stages: result.stages,
+        imports: result.stderr.split('\n').filter(line => line.startsWith('SHIFTFLOW_IMPORT_V1:')) };
       const data = parse(result);
-      report.checks[name] = { ok: true, elapsedSeconds: result.elapsedSeconds, stage: result.stage, stages: result.stages, data };
+      report.checks[name] = { ok: true, ...observed, data };
       log(`  通过（${result.elapsedSeconds} 秒）`);
       return data;
     } catch (error) {
@@ -38,12 +39,12 @@ main(async () => {
     await check('python', '检查项目 Python 架构', venvPython, ['-c',
       'import json, platform, sys; print(json.dumps({"version": platform.python_version(), "machine": platform.machine(), "platform": sys.platform}))'],
     { startupTimeoutMs: 15_000, hardTimeoutMs: 15_000 }, result => JSON.parse(result.stdout));
-    const sourceInfo = await check('sourceInfo', '检查 Python 源码启动（含 OR-Tools 导入，最多 30 秒）', venvPython,
+    const sourceInfo = await check('sourceInfo', '检查 Python 源码启动（含 OR-Tools 导入，最多 120 秒）', venvPython,
       [join(solverRoot, 'main.py'), '--info', '--hosted'],
-      { startupTimeoutMs: 30_000, hardTimeoutMs: 40_000 }, result => parseFrozenInfo(result));
+      {}, result => parseFrozenInfo(result));
     if (sourceInfo) await check('sourceSelfTest', '检查开发模式实际 CP-SAT 求解', venvPython,
       [join(solverRoot, 'main.py'), '--self-test', '--hosted'],
-      { startupTimeoutMs: 30_000 }, result => parseFrozenInfo(result, true));
+      {}, result => parseFrozenInfo(result, true));
   } else report.checks.python = { ok: false, error: '项目 solver/.venv 不存在。诊断不会安装 Python。' };
   const architecture = { arm64: 'aarch64', x64: 'x86_64' }[process.arch];
   const platform = { darwin: 'apple-darwin', win32: 'pc-windows-msvc', linux: 'unknown-linux-gnu' }[process.platform];
