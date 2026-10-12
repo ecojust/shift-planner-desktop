@@ -24,6 +24,7 @@ jobs:
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { execFileSync } from 'node:child_process';
+          import { stripVTControlCharacters } from 'node:util';
           process.on('uncaughtException', error => {
             const message = `${error.message}\n${String(error.stderr || '')}`.replace(/https:\/\/\S+/g, '[URL omitted]').slice(-12000);
             console.log(`::error title=Diagnostic reader failure::${message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A')}`);
@@ -33,7 +34,7 @@ jobs:
           const base = `repos/${process.env.GITHUB_REPOSITORY}/actions/jobs/${process.env.JOB_ID}`;
           const job = JSON.parse(execFileSync('gh', ['api', base], { encoding: 'utf8' }));
           assert.equal(job.status, 'completed');
-          const text = execFileSync('gh', ['api', `${base}/logs`], { encoding: 'utf8', timeout: 120000, maxBuffer: 32 * 1024 * 1024 });
+          const text = stripVTControlCharacters(execFileSync('gh', ['api', `${base}/logs`, '--allow-escape-sequences'], { encoding: 'utf8', timeout: 120000, maxBuffer: 32 * 1024 * 1024 }));
           const lines = text.split('\n');
           const selected = new Set();
           for (let index = 0; index < lines.length; index++) {
