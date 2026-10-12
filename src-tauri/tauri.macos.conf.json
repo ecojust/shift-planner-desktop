@@ -3,6 +3,7 @@
   "bundle": {
     "resources": [],
     "macOS": {
+      "minimumSystemVersion": "14.0",
       "files": {
         "Resources/solver-runtime": "solver-runtime"
       }

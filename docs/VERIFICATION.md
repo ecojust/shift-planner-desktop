@@ -1,6 +1,20 @@
-# 启动修复验证记录
+# 桌面构建与求解验证记录
 
-验证日期：2026-10-12。构建与窗口测试环境为 Linux x86_64；Windows/macOS 安装和实机运行尚未验证。
+验证日期：2026-10-12。现已完成 macOS 15 ARM64 原生安装包构建、包内求解器与资源审计；此前完成 Linux x86_64 窗口测试。Mac 图形界面交互、安装/卸载及文件对话框未实测，Windows 尚未原生验证。
+
+## Mac 原生构建与最终 App 验证
+
+原始构建：[38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)，对应源码提交 `e1e6df1dac5134b6ea6bef69bcc58b7c52fcb095`。随后在同类 macOS 15 ARM64 运行器上完成 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 审计，没有重建或修改原始应用字节。
+
+- 前端测试 57 项、Python OR-Tools 测试 21 项、Rust 普通测试 16 项全部通过；另两项真实集成测试单独执行并通过。
+- 源码 Python 与发行 onedir 两条真实集成路径均返回 OPTIMAL、29 条安排、零缺员，完成进程回收与临时目录清理。
+- 真正生成 `.app` 和 ARM64 `.dmg`，并在最终 `.app/Contents/Resources/solver-runtime` 内执行引擎加载与 CP-SAT 自检；分别约 1.13 秒、0.58 秒，OR-Tools 版本 9.14.6206。
+- 用最终 App 内的求解器执行默认 12 人、2026 年 10 月、每日 2/2/1 人的排班模型，搜索预算 5 秒：返回 OPTIMAL、155 个班位、零缺员；结果通过独立 TypeScript 规则检查，问题数为零。建模与求解约 3.95 秒，包含启动的总耗时约 5.22 秒。
+- 资源审计检查 234 个 Mach-O 对象均含 ARM64，103 个符号链接全部留在包内且有效；原始 DMG、App ZIP 校验和保持一致。
+
+审计发现 NumPy 扩展声明的最高最低系统版本为 macOS 14.0。该历史构建的 Info.plist 仍声明 11.0，不能据此承诺支持 macOS 11–13；现有包按 **macOS 14+** 交付。后续 Mac 构建配置已明确提高至 14.0，自动发布前也会校验应用声明和实际依赖最低版本。macOS 14 的运行兼容性尚未单独实测。
+
+当前包已作为 [macOS Apple Silicon 测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0) 公开，未进行 Apple Developer ID 签名或 Apple 公证。新的 `macos-arm64.yml` 由用户手动启动，在全部检查成功后自动发布 prerelease；通用 `desktop-build.yml` 仍只产出 Actions artifact。自动发布流程的新增步骤不等同于已经执行了下一次完整构建。
 
 ## 定位与调整
 
@@ -11,7 +25,7 @@
 - 120 秒启动预算与实际求解时限独立；显示阶段、区分错误、支持取消及进程回收。完整合法结果不因进程退出清理超时而丢失。
 - 离线 `solver:doctor` 对比源码与新运行目录，旧 onefile 只记录存在情况，不启动它。
 
-## 本次已验证
+## 此前 Linux 启动修复验证
 
 - `npm test`：57 项通过，包含规则、津贴、Excel、结果保护及新增进程超时/资源完整性测试。
 - `npm run solver:test`：21 项实际 OR-Tools 测试通过，含阶段协议及原生小模型自检。
@@ -30,6 +44,6 @@ Linux 窗口测试使用虚拟显示器与工作区 GTK/WebKit 运行库，未�
 
 此前版本已经验证实际桌面 Excel 保存、网页 Worker 排班、过期异步结果丢弃及移动端布局。本次未重做全部导出操作；当前 57 项测试继续覆盖其核心规则与文件格式。
 
-Windows 与 macOS 的原生安装包、安装/卸载、文件对话框及正式签名/公证仍需目标系统验证。提供的手动 GitHub Actions 工作流包含两种启动方式的集成检查，但尚未远程运行。参见 [桌面构建说明](DESKTOP_BUILD.md)。
+Windows 原生构建和运行尚未验证。Mac 已完成上文列明的原生构建和包内求解验证，但不包含人工安装/卸载、图形界面交互和文件对话框测试，也未完成 Developer ID 签名或公证。参见 [桌面构建说明](DESKTOP_BUILD.md)。
 
 求解核心使用 OR-Tools CP-SAT，不实现 PerfectTablePlan 的遗传算法；参考范围见 [参考记录](PERFECTTABLEPLAN_REFERENCE.md)。

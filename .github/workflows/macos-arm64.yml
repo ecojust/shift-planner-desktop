@@ -1,11 +1,15 @@
 name: Build macOS Apple Silicon installer
 
-# Manual, native Apple Silicon build. No release creation or deployment.
+# Manual native build; all checks must pass before an automatic public prerelease.
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: macos-arm64-release-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   macos-arm64:
@@ -93,6 +97,79 @@ jobs:
           writeFileSync('artifacts/native-validation.json', `${JSON.stringify(report, null, 2)}\n`);
           console.log(JSON.stringify(report, null, 2));
           NODE
+      - name: Audit final app structure and macOS 14 compatibility floor
+        run: |
+          apps=(src-tauri/target/release/bundle/macos/*.app)
+          test "${#apps[@]}" -eq 1
+          python scripts/audit-macos-app.py "${apps[0]}" > artifacts/macos-app-audit.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const report = JSON.parse(readFileSync('artifacts/macos-app-audit.json', 'utf8'));
+          const compare = (left, right) => {
+            const a = String(left).split('.').map(Number);
+            const b = String(right).split('.').map(Number);
+            assert.ok(a.length <= 3 && b.length <= 3 && a.every(Number.isInteger) && b.every(Number.isInteger));
+            for (let index = 0; index < 3; index++) {
+              const difference = (a[index] || 0) - (b[index] || 0);
+              if (difference) return Math.sign(difference);
+            }
+            return 0;
+          };
+          assert.equal(report.validation.passed, true);
+          assert.deepEqual(report.validation.errors, []);
+          assert.equal(report.summary.all_macho_objects_contain_arm64, true);
+          assert.equal(report.summary.all_symlinks_internal_and_resolvable, true);
+          assert.equal(compare(report.minimum_system_assessment.effective_declared_arm64_minimum, '14.0'), 0, 'App must declare macOS 14 as its minimum');
+          assert.ok(report.summary.macos_arm64_max_minos, 'Missing native dependency minimum OS information');
+          assert.ok(compare(report.summary.macos_arm64_max_minos, '14.0') <= 0, 'Bundled dependencies require newer than the advertised macOS 14 minimum');
+          assert.equal(report.minimum_system_assessment.declaration_understates_observed_minimum, false);
+          console.log(JSON.stringify(report.summary, null, 2));
+          NODE
+      - name: Verify a complete demo month through the final app runtime
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readdirSync, writeFileSync } from 'node:fs';
+          import { resolve, join } from 'node:path';
+          import { makeDefaultState } from './src/defaults.ts';
+          import { validateSchedule } from './src/scheduler.ts';
+          import { captureFrozen } from './scripts/frozen-process.mjs';
+          const directory = resolve('src-tauri/target/release/bundle/macos');
+          const apps = readdirSync(directory).filter(name => name.endsWith('.app'));
+          assert.equal(apps.length, 1);
+          const runtime = join(directory, apps[0], 'Contents', 'Resources', 'solver-runtime');
+          const state = makeDefaultState('2026-10');
+          state.assignments = [];
+          assert.equal(state.employees.length, 12);
+          assert.deepEqual(state.shifts.map(shift => shift.required), [2, 2, 1]);
+          const requestId = `macos-release-${process.env.GITHUB_RUN_ID}`;
+          const request = { protocolVersion: 1, requestId, state, options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010 } };
+          const execution = await captureFrozen(join(runtime, 'shiftflow-solver'), ['--hosted'], {
+            cwd: runtime, input: JSON.stringify(request),
+            startupTimeoutMs: 120_000, solveTimeoutMs: 20_000, finishTimeoutMs: 5_000,
+          });
+          const result = JSON.parse(execution.stdout);
+          assert.equal(result.protocolVersion, 1);
+          assert.equal(result.requestId, requestId);
+          assert.equal(result.engine, 'ortools-cp-sat');
+          assert.ok(['OPTIMAL', 'FEASIBLE'].includes(result.status), result.message);
+          assert.equal(result.assignments.length, 155);
+          assert.equal(result.stats.shortageCount, 0);
+          const issues = validateSchedule({ ...state, assignments: result.assignments });
+          assert.deepEqual(issues, []);
+          const report = {
+            buildCommit: process.env.GITHUB_SHA, buildRun: process.env.GITHUB_RUN_ID,
+            target: 'aarch64-apple-darwin', fixture: 'Built-in demo; no user data',
+            month: state.month, employeeCount: 12, shiftsPerDay: [2, 2, 1], searchLimitSeconds: 5,
+            status: result.status, assignmentCount: result.assignments.length,
+            shortageCount: result.stats.shortageCount, independentRuleIssues: issues,
+            solverStats: result.stats, elapsedSeconds: execution.elapsedSeconds,
+            stages: execution.stages, checkedAppRuntime: true,
+          };
+          writeFileSync('artifacts/macos-month-schedule-validation.json', `${JSON.stringify(report, null, 2)}\n`);
+          console.log(JSON.stringify(report, null, 2));
+          NODE
       - name: Archive app preserving links and copy installer
         run: |
           apps=(src-tauri/target/release/bundle/macos/*.app)
@@ -103,7 +180,17 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" artifacts/shift-flow-macos-arm64.app.zip
           cp "${dmgs[0]}" artifacts/shift-flow-macos-arm64.dmg
           cp solver/build/aarch64-apple-darwin/manifest.json artifacts/solver-manifest.json
+          git archive --format=zip --prefix=shift-planner/ --output=artifacts/shift-planner-source.zip "$GITHUB_SHA"
           shasum -a 256 artifacts/*.dmg artifacts/*.zip > artifacts/SHA256SUMS
+          # Release checksums cover exactly the public delivery files, without the duplicate app ZIP.
+          (
+            cd artifacts
+            shasum -a 256 shift-flow-macos-arm64.dmg shift-planner-source.zip native-validation.json solver-manifest.json macos-app-audit.json macos-month-schedule-validation.json
+          ) > artifacts/release-SHA256SUMS
+          (
+            cd artifacts
+            shasum -a 256 -c release-SHA256SUMS
+          )
       - name: Upload verified ARM64 installer and app archive
         uses: actions/upload-artifact@v4
         with:
@@ -112,3 +199,63 @@ jobs:
           retention-days: 14
           compression-level: 0
           path: artifacts/
+      - name: Publish verified installer and source as a prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
+          tag="macos-arm64-v${version}-${GITHUB_RUN_ID}"
+          cat > release-notes.md <<EOF
+          排班时光 ${version} · Apple Silicon 测试发行版
+
+          适用于 M 系列芯片的 Mac，要求 macOS 14 或更新系统；在 macOS 15 ARM64 原生构建并验证。
+          本版本未进行 Apple Developer ID 签名或 Apple 公证。
+
+          下载 shift-flow-macos-arm64.dmg 即可安装，内含 Python 和 OR-Tools，无需另装算法环境。
+          shift-planner-source.zip 为本次构建提交的精确源码；无需重复下载 Actions 中的 App ZIP。
+
+          发布前已通过前端、Python 与 Rust 测试、最终 App 原生资源审计及完整月份真实求解验证：12 人、155 条安排、0 缺员、独立规则检查无问题。
+          原生依赖最低系统版本已核对；这不代表已在每个 macOS 14+ 系统版本上进行实机测试。
+
+          源码提交：${GITHUB_SHA}
+          构建记录：https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          EOF
+          # --target does not override an existing Git tag: verify it before creating a release.
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" > existing-tag.json 2> tag-check-error.txt; then
+            test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha)" = "$GITHUB_SHA"
+          elif ! grep -q 'HTTP 404' tag-check-error.txt; then
+            cat tag-check-error.txt >&2
+            exit 1
+          fi
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,tagName,url > existing-release.json; then
+            # Reuse only a release from this exact source; never replace published attachments.
+            node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const release = JSON.parse(readFileSync('existing-release.json', 'utf8'));
+          assert.equal(release.targetCommitish, process.env.GITHUB_SHA, 'Existing tag targets a different source commit');
+          assert.equal(release.isPrerelease, true, 'Refusing to change an existing stable release');
+          console.log(`Checking existing prerelease without replacing assets: ${release.url}`);
+          NODE
+          else
+            # Upload while still a draft so a failed upload cannot publish an incomplete release.
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "排班时光 ${version} · M 芯片 · macOS 14+（未公证）" --notes-file release-notes.md artifacts/shift-flow-macos-arm64.dmg artifacts/shift-planner-source.zip artifacts/native-validation.json artifacts/solver-manifest.json artifacts/macos-app-audit.json artifacts/macos-month-schedule-validation.json artifacts/release-SHA256SUMS
+          fi
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,assets > release-ready.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const release = JSON.parse(readFileSync('release-ready.json', 'utf8'));
+          assert.equal(release.targetCommitish, process.env.GITHUB_SHA);
+          assert.equal(release.isPrerelease, true);
+          const required = ['shift-flow-macos-arm64.dmg', 'shift-planner-source.zip', 'native-validation.json', 'solver-manifest.json', 'macos-app-audit.json', 'macos-month-schedule-validation.json', 'release-SHA256SUMS'];
+          for (const name of required) {
+            const assets = release.assets.filter(asset => asset.name === name);
+            assert.equal(assets.length, 1, `Incomplete release: missing or duplicate ${name}; refusing publication`);
+            assert.ok(assets[0].size > 0, `Empty attachment: ${name}; refusing publication`);
+          }
+          NODE
+          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq .sha)" = "$GITHUB_SHA"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,url,assets

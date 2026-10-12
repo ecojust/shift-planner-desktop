@@ -130,9 +130,13 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 ## GitHub Actions
 
-已提供 `.github/workflows/desktop-build.yml`，仅在 Actions 中手动执行 **Build desktop installers** 时运行，没有自动发布或部署步骤。它分别在 `windows-latest`、`macos-latest` 原生运行器上安装依赖、运行测试、冻结求解器、构建 Tauri，再上传安装包和求解器清单。
+专用 `.github/workflows/macos-arm64.yml` 在 Actions 中手动执行 **Build macOS Apple Silicon installer**，使用固定 `macos-15` ARM64 运行器。所有前端、Python、Rust、最终 App 加载、资源审计及整月排班验证通过后，自动创建 GitHub prerelease。发行版要求 M 芯片和 macOS 14+，附件包含独立 DMG、精确构建提交的源码 ZIP、验证报告与校验和；完整 App ZIP 仅保留在 Actions artifact 中，使用者不需要重复下载。
 
-当前已提供这套 CI，尚未完成新版 Windows/macOS 原生安装包构建或安装验证。新版 Linux 验证范围以 [验证记录](VERIFICATION.md) 为准；不能写成 Windows/macOS 安装包已经生成或通过实机验证。完成原生构建后，仍需分别检查安装、启动、求解、取消和文件导出。
+自动发布标签包含项目版本与 run ID。同一次运行重跑时先核对已有发行版对应的源码提交，不覆盖已发布附件。历史 `.github/workflows/macos-delivery.yml` 保留为手动草稿恢复流程，不会自动公开发布。
+
+通用 `.github/workflows/desktop-build.yml` 仍在手动执行 **Build desktop installers** 时，分别使用 `windows-latest`、`macos-latest` 构建并上传 Actions artifact；该通用流程没有自动 Release 发布步骤。
+
+Mac 原生构建 [38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)（源码 `e1e6df1`）及最终 App 审计/完整月求解 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 均成功，现有包已发布为 [测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0)。验证环境为 macOS 15 ARM64；依赖要求 macOS 14+，不代表已遍历测试所有兼容系统版本。Mac 图形界面交互、安装/卸载、文件对话框仍未实测，Windows 尚未原生验证。详细证据与此前 Linux 窗口测试见 [验证记录](VERIFICATION.md)。
 
 `macos-latest` 的实际架构以当次日志中的 Rust host triple 为准，工作流不会在一个运行器上同时产出 Intel 和 Apple Silicon 两种包。需要另外一种架构时，请选择提供该架构的原生 macOS 运行器，或在对应 Mac 本地执行上面的构建命令。
 
