@@ -33,7 +33,7 @@ if (existingTag) {
   gh(['api', '--method', 'POST', `repos/${repository}/git/refs`, '-f', `ref=refs/tags/${manifest.tag}`, '-f', `sha=${manifest.commit}`]);
 }
 
-const view = () => json(['release', 'view', manifest.tag, '--repo', repository, '--json', 'databaseId,isDraft,isPrerelease,targetCommitish,url,assets']);
+const view = () => json(['release', 'view', manifest.tag, '--repo', repository, '--json', 'apiUrl,isDraft,isPrerelease,targetCommitish,url,assets']);
 let release;
 try { release = view(); }
 catch (error) { if (!missing(error)) throw error; }
@@ -48,7 +48,13 @@ if (release) {
 release = view();
 assert.equal(release.targetCommitish, manifest.commit);
 assert.equal(release.isPrerelease, true);
-const remote = json(['api', `repos/${repository}/releases/${release.databaseId}`]);
+// gh's "id" is a GraphQL node ID, not the numeric REST ID; apiUrl is stable across CLI versions.
+const releaseApi = new URL(release.apiUrl);
+const expectedPrefix = `/repos/${repository}/releases/`;
+assert.equal(releaseApi.origin, 'https://api.github.com');
+assert.ok(releaseApi.pathname.startsWith(expectedPrefix));
+assert.match(releaseApi.pathname.slice(expectedPrefix.length), /^\d+$/);
+const remote = json(['api', releaseApi.pathname.slice(1)]);
 for (const file of manifest.files) {
   const matches = remote.assets.filter(asset => asset.name === file.name);
   assert.equal(matches.length, 1, `Incomplete release: ${file.name}; refusing publication`);
