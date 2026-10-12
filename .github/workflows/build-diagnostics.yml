@@ -24,6 +24,11 @@ jobs:
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { execFileSync } from 'node:child_process';
+          process.on('uncaughtException', error => {
+            const message = `${error.message}\n${String(error.stderr || '')}`.replace(/https:\/\/\S+/g, '[URL omitted]').slice(-12000);
+            console.log(`::error title=Diagnostic reader failure::${message.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A')}`);
+            process.exitCode = 1;
+          });
           assert.match(process.env.JOB_ID, /^\d+$/);
           const base = `repos/${process.env.GITHUB_REPOSITORY}/actions/jobs/${process.env.JOB_ID}`;
           const job = JSON.parse(execFileSync('gh', ['api', base], { encoding: 'utf8' }));
