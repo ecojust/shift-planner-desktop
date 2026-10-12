@@ -102,7 +102,7 @@ test('backend status prose cannot duplicate preservation text in the final resul
 
 test('startup diagnostics identify the actual reported startup phase', async () => {
   const { formatSolverError } = await import('../DesktopSolver.ts')
-  for (const [phase, clue] of [['starting', '组件解压或系统检查'], ['loading', '依赖加载'], ['reading', '数据读取']]) {
+  for (const [phase, clue] of [['starting', '运行时载入或系统检查'], ['loading', '依赖加载'], ['reading', '数据读取']]) {
     const failure = formatSolverError(`STARTUP_TIMEOUT: 等待超时（阶段 ${phase}）；原排班未被替换。`)
     assert.match(failure.message, new RegExp(clue))
     assert.match(failure.message, /尚未开始排班搜索/)
