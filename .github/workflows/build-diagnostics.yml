@@ -38,11 +38,14 @@ jobs:
           const lines = text.split('\n');
           const selected = new Set();
           for (let index = 0; index < lines.length; index++) {
-            if (/error|fail(?:ed|ure|ures)|panicked|assertion|could not|Caused by:/i.test(lines[index])) {
-              for (let context = Math.max(0, index - 4); context <= Math.min(lines.length - 1, index + 12); context++) selected.add(context);
+            if (/\berror(?:\[|:| )|test .*FAILED|panicked|assertion.*failed|could not compile|Caused by:|failed to (?:bundle|build)/i.test(lines[index])) {
+              for (let context = Math.max(0, index - 2); context <= Math.min(lines.length - 1, index + 8); context++) selected.add(context);
             }
           }
-          const diagnostic = [...selected].sort((a, b) => a - b).map(index => lines[index]).join('\n').slice(-48000);
-          const escaped = diagnostic.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
-          console.log(`::notice title=Job ${process.env.JOB_ID} diagnostics::${escaped}`);
+          const diagnostic = [...selected].sort((a, b) => a - b).map(index => lines[index]).join('\n').slice(-8000);
+          // Check annotations truncate long messages, so keep each chunk below the API limit.
+          for (let offset = 0; offset < diagnostic.length; offset += 1000) {
+            const escaped = diagnostic.slice(offset, offset + 1000).replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+            console.log(`::notice title=Job ${process.env.JOB_ID} diagnostics ${offset / 1000 + 1}::${escaped}`);
+          }
           NODE

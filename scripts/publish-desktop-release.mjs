@@ -58,7 +58,7 @@ for (const file of manifest.files) {
   if (asset.digest) {
     assert.equal(asset.digest, `sha256:${file.sha256}`, `Attachment digest differs: ${file.name}`);
   } else {
-    const bytes = execFileSync('gh', ['api', `repos/${repository}/releases/assets/${asset.id}`, '-H', 'Accept: application/octet-stream'],
+    const bytes = execFileSync('gh', ['api', `repos/${repository}/releases/assets/${asset.id}`, '-H', 'Accept: application/octet-stream', '--allow-escape-sequences'],
       { timeout: 300_000, maxBuffer: Math.max(1024 * 1024, file.bytes + 1024), stdio: ['ignore', 'pipe', 'pipe'] });
     assert.equal(bytes.length, file.bytes);
     assert.equal(createHash('sha256').update(bytes).digest('hex'), file.sha256, `Attachment digest differs: ${file.name}`);
