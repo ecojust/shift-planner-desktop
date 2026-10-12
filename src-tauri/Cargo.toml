@@ -1,6 +1,6 @@
 [package]
 name = "shift-flow-desktop"
-version = "1.1.0"
+version = "1.1.1"
 description = "排班时光 — 本地约束求解排班"
 authors = ["Shift Flow"]
 edition = "2021"

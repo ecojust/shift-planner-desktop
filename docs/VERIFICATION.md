@@ -2,6 +2,12 @@
 
 验证日期：2026-10-12。现已完成 macOS 15 ARM64 原生安装包构建、包内求解器与资源审计；此前完成 Linux x86_64 窗口测试。Mac 图形界面交互、安装/卸载及文件对话框未实测，Windows 尚未原生验证。
 
+## 1.1.1：Mac 签名资源封印修复
+
+已发布 1.1.0 的原生下载诊断 [38281252565](https://github.com/ecojust/shift-planner-desktop/actions/runs/38281252565) 确认 DMG 完整、App 无隔离直接启动正常，但严格签名检查发现主程序和 Python.framework 两处缺少资源封印。此证据不代表 Gatekeeper 放行或用户 M5 实测。
+
+新流程为 Python.framework 和最终 App 完整签名，并将逐个原生代码的严格签名检查纳入发布门槛。源码版本更新为 1.1.1；新的原生构建与下载复验结果以对应 Actions 记录为准。JSON 签名报告只保存在 Actions Artifacts，公开附件仍为安装包、源码和校验文件。
+
 ## 2026-10-13 更新：三平台构建、开发启动与日历
 
 - `desktop-build.yml` 新增并固定 Windows x64、Intel Mac x64、Mac ARM64 三个原生任务，默认全部成功后自动发布；取消 `publish_release` 可只验证构建。三平台原生构建 [38277333420](https://github.com/ecojust/shift-planner-desktop/actions/runs/38277333420) 已全部通过并发布：Windows 通过 NSIS 静默安装验证；三个最终资源目录均生成 155 个班位、零缺员、独立规则检查零问题。

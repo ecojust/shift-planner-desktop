@@ -52,6 +52,13 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
       assert.equal(audit.summary.all_macho_objects_contain_target_architecture, true);
       assert.equal(audit.summary.all_symlinks_internal_and_resolvable, true);
       assert.equal(audit.minimum_system_assessment.declaration_understates_observed_minimum, false);
+      const signature = read(`${id}-macos-signature-validation.json`);
+      assert.equal(signature.commit, commit);
+      assert.equal(String(signature.buildRun), runId);
+      assert.equal(signature.passed, true);
+      assert.equal(signature.sealedResourcesVerified, true);
+      assert.equal(signature.allNativeObjectsVerified, true);
+      assert.equal(signature.checks.pythonFramework.strictDeepVerified, true);
     }
     const installer = `shift-flow-${id}.${extension}`;
     const bytes = readFileSync(join(directory, installer));
@@ -85,7 +92,7 @@ Windows 在 Windows Server 2022 x64 云端构建机上完成 NSIS 静默安装�
 
 安装包自带 Python 和 OR-Tools，本地求解无需另外安装 Python。Windows 使用系统 WebView2，缺少时安装程序可能需要联网补装。
 
-测试包未配置 Windows 发行代码签名、Apple Developer ID 签名或 Apple 公证。Mac 依赖最低版本已审计为不高于应用声明的 macOS 14。
+Mac App 和内置 Python 框架已完成 ad-hoc 签名及资源封印，并逐一严格验证原生代码。ad-hoc 不等于 Apple Developer ID 签名或 Apple 公证；首次运行仍可能需要在「系统设置 → 隐私与安全性」中对本应用选择「仍要打开」。Windows 未配置发行代码签名。Mac 依赖最低版本已审计为不高于应用声明的 macOS 14。
 
 shift-planner-source.zip 是本次构建的精确源码；SHA256SUMS 用于校验下载文件。JSON 验证报告保留在下方构建记录的 Actions Artifacts 中，按平台归档，保留 14 天。
 

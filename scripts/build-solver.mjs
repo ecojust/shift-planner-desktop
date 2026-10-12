@@ -2,6 +2,7 @@ import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSy
 import { join, relative } from 'node:path';
 import { capture, captureFrozen, parseFrozenInfo, main, projectRoot, pyinstallerVersion, pythonDetails, requireVenv, run, solverRoot, venvPython } from './solver-tools.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
+import { MAC_SIGNATURE_FORMAT, sealMacSolverRuntime } from './seal-macos-runtime.mjs';
 
 main(async () => {
   requireVenv();
@@ -39,6 +40,8 @@ main(async () => {
     writeFileSync(join(staging, '.gitkeep'), '');
     const frozen = join(staging, `shiftflow-solver${extension}`);
     if (process.platform !== 'win32') chmodSync(frozen, 0o755);
+    if (process.platform === 'darwin') console.log('正在完整封印 Python framework，并严格校验全部原生组件签名…');
+    const macSignatures = sealMacSolverRuntime(staging);
     console.log('\n目录打包完成，正在校验启动（最多等待 120 秒）…');
     const startup = await captureFrozen(frozen, ['--info', '--hosted'], { cwd: staging });
     const solverInfo = parseFrozenInfo(startup);
@@ -57,6 +60,7 @@ main(async () => {
     const manifest = {
       generatedAt: new Date().toISOString(), format: 'onedir', target: host,
       python: python.version.join('.'), pyinstaller: pyinstallerVersion, solverInfo, selfTest,
+      ...(macSignatures ? { macSignatureFormat: MAC_SIGNATURE_FORMAT, macSignatures } : {}),
       runtime: { ...runtime, directory: relative(projectRoot, destination).replaceAll('\\', '/') }, sources,
     };
     writeFileSync(join(work, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);

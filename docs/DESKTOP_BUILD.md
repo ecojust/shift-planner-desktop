@@ -170,3 +170,11 @@ PyInstaller 在 macOS 收集原生组件时进行 ad-hoc 签名。将来使用 D
 旧版本残留的 `src-tauri/binaries/shiftflow-solver-*` 同样不应混入源码 ZIP；它们已不是当前打包输入。不要把源码 ZIP 的排除规则理解为升级时要删除用户本机的有效虚拟环境：分发源码时不带构建机环境，覆盖更新现有项目时保留本机环境，是两回事。
 
 接收源码的开发者可在目标系统准备本机虚拟环境进行开发，发行时重新生成完整运行目录。安装后的最终用户使用包内运行时，不需要额外下载求解依赖。
+
+## Mac 提示“应用已损坏”
+
+1.1.0 的下载包诊断确认：DMG 的 SHA-256 和磁盘映像校验通过，但主程序只有 linker ad-hoc 签名，App 和内置 Python.framework 缺少资源封印，严格验签返回 `code has no resources but signature indicates they must be present`。这不同于文件下载中断，也不能仅归因于未公证。
+
+1.1.1 的打包流程先对冻结运行目录中的 Python.framework 完整签名，再计算来源清单；Tauri 使用 `signingIdentity: "-"` 签整个 App。发布前要求 App、主程序、求解器、Python.framework 以及全部实际 Mach-O 严格验签成功，再执行实际排班。签名检查不会通过删除 quarantine 或关闭系统安全检查来绕过错误。
+
+该签名用于保证包内内容完整，不包含 Apple Developer ID 身份或公证。将新版本拖入“应用程序”并替换旧版后，首次启动如提示开发者未验证，可到“系统设置 → 隐私与安全性”找到该应用，选择“仍要打开”。不要清除应用数据；已有排班仍保存在原应用标识下。

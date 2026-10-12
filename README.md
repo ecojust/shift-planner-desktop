@@ -33,11 +33,13 @@ npm run desktop:build
 
 桌面版通过 Tauri 调用随包分发的本地求解进程，网页仍使用浏览器 Worker 中的启发式排班。桌面引擎不可用时会显示错误，不会悄悄换成网页算法。求解支持取消，未完成或失败时保留原表；桌面 Excel、CSV 和 JSON 导出使用系统文件保存对话框。
 
-Windows x64、Intel Mac 和 M 芯片 Mac 已完成原生构建及最终资源目录内的求解验证：[下载安装包和源码](https://github.com/ecojust/shift-planner-desktop/releases/tag/desktop-v1.1.0-38277333420)。三个平台均完成 12 人整月排班：155 个班位、零缺员、独立规则检查零问题。Windows 已验证 NSIS 静默安装；桌面图形界面交互、Mac 人工安装/卸载及文件对话框尚未实测，完整范围见 [验证记录](docs/VERIFICATION.md)。Mac 要求 macOS 14+，未进行 Apple Developer ID 签名或公证。
+Windows x64、Intel Mac 和 M 芯片 Mac 已完成原生构建及最终资源目录内的求解验证：[下载安装包和源码](https://github.com/ecojust/shift-planner-desktop/releases)。三个平台均完成 12 人整月排班：155 个班位、零缺员、独立规则检查零问题。Windows 已验证 NSIS 静默安装；桌面图形界面交互、Mac 人工安装/卸载及文件对话框尚未实测，完整范围见 [验证记录](docs/VERIFICATION.md)。Mac 要求 macOS 14+，未进行 Apple Developer ID 签名或公证。
 
 在 GitHub Actions 手动运行 **Build desktop installers**，会并行构建 Windows x64、Intel Mac 和 M 芯片 Mac；三个平台全部测试和包内求解验证通过后，自动发布包含三个安装包、对应源码和 SHA256SUMS 的 GitHub prerelease。JSON 验证报告留在 Actions Artifacts 中，保留 14 天。只需要 M 芯片时，也可运行 **Build macOS Apple Silicon installer**。各平台最新验证范围见下方构建说明。
 
 若遇到引擎启动问题，可运行 `npm run solver:doctor`，报告保存到 `solver/build/diagnostics-latest.json`。它对比项目 Python 与已打包运行目录的加载及小型求解，不读写员工数据，也不联网。升级时请同步覆盖 `scripts/`、`src-tauri/` 的源码与配置、`src/`、`solver/` 源码以及项目清单，保留正确架构的 `solver/.venv` 和应用本地数据；详见 [更新与诊断](docs/DESKTOP_BUILD.md)。
+
+1.1.1 补齐 Mac App 和内置 Python 框架的签名资源封印，修复旧包严格验签失败。仍未进行 Apple 公证，首次启动可能需要在“系统设置 → 隐私与安全性”对本应用选择“仍要打开”。细节见 [Mac 打包说明](docs/DESKTOP_BUILD.md#mac-提示应用已损坏)。
 
 ## 功能与数据
 

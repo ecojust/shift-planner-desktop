@@ -59,18 +59,20 @@ jobs:
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib frozen_sidecar_solves_real_schedule -- --ignored --nocapture
       - name: Build app and DMG
         run: npm run desktop:build -- --bundles app,dmg
-      - name: Verify solver inside the actual app bundle
+      - name: Verify sealed app signature and bundled solver
         run: |
           node --input-type=module <<'NODE'
           import { readdirSync, mkdirSync, writeFileSync } from 'node:fs';
           import { resolve, join } from 'node:path';
           import { execFileSync } from 'node:child_process';
           import { captureFrozen, parseFrozenInfo } from './scripts/frozen-process.mjs';
+          import { verifyMacSignature } from './scripts/verify-macos-signature.mjs';
 
           const bundleDirectory = resolve('src-tauri/target/release/bundle/macos');
           const apps = readdirSync(bundleDirectory).filter(name => name.endsWith('.app'));
           if (apps.length !== 1) throw new Error(`Expected one app bundle, found ${apps.length}`);
           const app = join(bundleDirectory, apps[0]);
+          const signature = verifyMacSignature(app);
           const runtime = join(app, 'Contents', 'Resources', 'solver-runtime');
           const solver = join(runtime, 'shiftflow-solver');
           const main = join(app, 'Contents', 'MacOS', 'shift-flow-desktop');
@@ -91,9 +93,10 @@ jobs:
             mainArchitecture, solverArchitecture, info, selfTest,
             startupSeconds: infoRun.elapsedSeconds, selfTestSeconds: testRun.elapsedSeconds,
             checkedInstalledResourceLayout: true,
-            developerIdSigned: false, notarized: false,
+            signature, adHocSigned: true, developerIdSigned: false, notarized: false,
           };
           mkdirSync('artifacts', { recursive: true });
+          writeFileSync('artifacts/macos-signature-validation.json', `${JSON.stringify(signature, null, 2)}\n`);
           writeFileSync('artifacts/native-validation.json', `${JSON.stringify(report, null, 2)}\n`);
           console.log(JSON.stringify(report, null, 2));
           NODE
@@ -211,6 +214,7 @@ jobs:
 
           适用于 M 系列芯片的 Mac，要求 macOS 14 或更新系统；在 macOS 15 ARM64 原生构建并验证。
           本版本未进行 Apple Developer ID 签名或 Apple 公证。
+          已进行 ad-hoc 签名并验证完整 App 的资源封印；首次运行仍可能需要在 macOS「隐私与安全性」中为此应用单独批准打开。
 
           下载 shift-flow-macos-arm64.dmg 即可安装，内含 Python 和 OR-Tools，无需另装算法环境。
           shift-planner-source.zip 为本次构建提交的精确源码；无需重复下载 Actions 中的 App ZIP。

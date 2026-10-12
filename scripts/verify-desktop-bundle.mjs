@@ -8,6 +8,7 @@ import { makeDefaultState } from '../src/defaults.ts';
 import { validateSchedule } from '../src/scheduler.ts';
 import { captureFrozen, parseFrozenInfo } from './frozen-process.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
+import { verifyMacSignature } from './verify-macos-signature.mjs';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const platforms = {
@@ -185,9 +186,11 @@ async function main() {
   mkdirSync(artifacts, { recursive: true });
   const temp = mkdtempSync(join(tmpdir(), `shift-flow-${configuration.id}-validation-`));
   try {
-    let app, runtime, executable, mainExecutable, audit, mainArchitecture, solverArchitecture;
+    let app, runtime, executable, mainExecutable, audit, signature, mainArchitecture, solverArchitecture;
     if (configuration.os === 'darwin') {
       app = findMacApp(configuration.target);
+      signature = verifyMacSignature(app);
+      writeJson(join(artifacts, `${configuration.id}-macos-signature-validation.json`), signature);
       audit = auditMac(app, configuration, artifacts);
       const mainName = audit.bundle.CFBundleExecutable;
       assert.equal(typeof mainName, 'string');
@@ -246,8 +249,9 @@ async function main() {
       info, selfTest, startupSeconds: infoRun.elapsedSeconds, selfTestSeconds: selfTestRun.elapsedSeconds,
       checkedInstalledResourceLayout: true, checkedInstalledNSISLayout: configuration.os === 'win32',
       provenance: provenance.verification,
+      ...(signature ? { signature, adHocSigned: true, developerIdSigned: false, notarized: false } : {}),
       ...(audit ? { requiredMacOS: audit.minimum_system_assessment.effective_declared_minimum, observedNativeMinimumMacOS: audit.summary.macos_target_max_minos } : {}),
-      limitations: ['Main application GUI and manual installation were not exercised by this script.', 'Code signing and notarization are not certified by these checks.'],
+      limitations: ['Main application GUI and manual installation were not exercised by this script.', 'Apple Developer ID, notarization, Gatekeeper acceptance and Windows publisher trust are not certified by these checks.'],
     };
     const monthReport = {
       buildCommit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null,

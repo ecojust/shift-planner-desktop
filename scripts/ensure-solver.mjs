@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { capture, captureFrozen, parseFrozenInfo, findBuildPython, main, projectRoot, pyinstallerVersion, pythonDetails, run, solverRoot, venvPython } from './solver-tools.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
+import { hasCurrentMacSignatureFormat } from './seal-macos-runtime.mjs';
 
 main(async () => {
   const args = process.argv.slice(2);
@@ -27,8 +28,11 @@ main(async () => {
         && Object.entries(sources).every(([file, sha]) => manifest.sources[file] === sha);
       validCache = manifest.format === 'onedir' && manifest.target === host && manifest.pyinstaller === pyinstallerVersion
         && unchanged && manifest.selfTest?.selfTest === true && manifest.selfTest.status === 'OPTIMAL'
+        && hasCurrentMacSignatureFormat(manifest)
         && manifest.runtime?.sha256 === runtimeInventory(runtime).sha256;
-      reason = '求解器源码、目录格式或资源完整性已变化';
+      reason = !hasCurrentMacSignatureFormat(manifest)
+        ? 'macOS 求解器缺少完整 framework 签名或签名格式已更新'
+        : '求解器源码、目录格式或资源完整性已变化';
     } catch (error) { reason = `现有运行目录校验未通过：${error.message}`; }
   }
   if (validCache) {
