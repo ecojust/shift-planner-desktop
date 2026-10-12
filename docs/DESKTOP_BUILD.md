@@ -135,7 +135,7 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 ## GitHub Actions
 
-专用 `.github/workflows/macos-arm64.yml` 在 Actions 中手动执行 **Build macOS Apple Silicon installer**，使用固定 `macos-15` ARM64 运行器。所有前端、Python、Rust、最终 App 加载、资源审计及整月排班验证通过后，自动创建 GitHub prerelease。发行版要求 M 芯片和 macOS 14+，附件包含独立 DMG、精确构建提交的源码 ZIP、验证报告与校验和；完整 App ZIP 仅保留在 Actions artifact 中，使用者不需要重复下载。
+专用 `.github/workflows/macos-arm64.yml` 在 Actions 中手动执行 **Build macOS Apple Silicon installer**，使用固定 `macos-15` ARM64 运行器。所有前端、Python、Rust、最终 App 加载、资源审计及整月排班验证通过后，自动创建 GitHub prerelease。发行版要求 M 芯片和 macOS 14+，公开附件仅包含独立 DMG、精确构建提交的源码 ZIP 与校验和；JSON 验证报告和完整 App ZIP 保留在 Actions artifact 中，保留 14 天。
 
 自动发布标签包含项目版本与 run ID。同一次运行重跑时先核对已有发行版对应的源码提交，不覆盖已发布附件。历史 `.github/workflows/macos-delivery.yml` 保留为手动草稿恢复流程，不会自动公开发布。
 
@@ -149,9 +149,9 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 三个平台各自校验 Node/Python/Rust 架构，执行前端、Python、Rust 及真实求解集成测试，再构建原生安装包。Windows 在临时目录静默安装 NSIS，检查安装后的 x64 可执行文件、完整求解资源和实际整月求解；Mac 检查最终 App 的对应架构、内部链接、最低系统版本与整月求解。Mac 两种架构均要求 macOS 14+；Windows 包面向 Windows 10/11 x64，CI 验证环境为 Server 2022，不表示已逐一人工测试桌面系统。
 
-只有三个构建任务都成功，后续 Release 任务才运行：先聚合验证报告、核对提交与 run ID，再附上精确源码 ZIP、SHA256SUMS，上传完整后公开测试版。标签为 `desktop-v<版本>-<run ID>`。任一平台失败不会发布残缺版本；成功平台的产物仍保留在各自 Actions artifact，保留期为 14 天。两个 Mac 架构不会覆盖彼此的附件。此入口已包含 M 芯片构建，无需同时再运行专用 ARM64 工作流。
+只有三个构建任务都成功，后续 Release 任务才运行：先聚合验证报告、核对提交与 run ID，公开附件仅选择三个安装包、精确源码 ZIP、SHA256SUMS，上传完整后公开测试版。JSON 报告仍须全部通过验证，并保留在 Actions artifact。标签为 `desktop-v<版本>-<run ID>`。任一平台失败不会发布残缺版本；成功平台的产物仍保留在各自 Actions artifact，保留期为 14 天。两个 Mac 架构不会覆盖彼此的附件。此入口已包含 M 芯片构建，无需同时再运行专用 ARM64 工作流。
 
-Mac 原生构建 [38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)（源码 `e1e6df1`）及最终 App 审计/完整月求解 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 均成功，现有包已发布为 [测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0)。验证环境为 macOS 15 ARM64；依赖要求 macOS 14+，不代表已遍历测试所有兼容系统版本。Mac 图形界面交互、安装/卸载、文件对话框仍未实测，Windows 尚未原生验证。详细证据与此前 Linux 窗口测试见 [验证记录](VERIFICATION.md)。
+Mac 原生构建 [38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)（源码 `e1e6df1`）及最终 App 审计/完整月求解 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 均成功，现有包已发布为 [测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0)。验证环境为 macOS 15 ARM64；依赖要求 macOS 14+，不代表已遍历测试所有兼容系统版本。该历史记录仅针对 ARM64。后续三平台构建 [38277333420](https://github.com/ecojust/shift-planner-desktop/actions/runs/38277333420) 已全部通过并发布，包含 Windows NSIS 静默安装和三个最终运行目录的整月求解；桌面图形界面、Mac 人工安装/卸载及文件对话框仍未实测。详细证据与此前 Linux 窗口测试见 [验证记录](VERIFICATION.md)。
 
 本地构建同样需要匹配架构的 Python 与 Rust；不能在 M 芯片运行器上重命名文件冒充 Intel 版本。新三平台流程的实际运行结果应以对应 Actions 日志及 Release 附带报告为准。
 

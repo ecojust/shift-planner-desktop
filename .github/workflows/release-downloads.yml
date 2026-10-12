@@ -1,0 +1,37 @@
+name: Organize release downloads
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing three-platform release tag
+        required: true
+        default: desktop-v1.1.0-38277333420
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  organize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Verify and back up every diagnostic attachment
+        run: node scripts/maintain-release-downloads.mjs prepare
+      - name: Retain reports before changing the public release
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-diagnostics-${{ inputs.release_tag }}
+          path: release-diagnostics-backup/
+          retention-days: 90
+          if-no-files-found: error
+      - name: Keep installers, exact source and checksums on the release page
+        run: node scripts/maintain-release-downloads.mjs apply
