@@ -126,6 +126,11 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 日志中的 `Rewriting the executable's macOS SDK version ...` 和 `Re-signing the EXE` 属于 PyInstaller 正常信息，不能单凭这两行判断程序启动失败。
 
+若 `npm run desktop:dev` 在“依赖安装完成”后约 30 秒、`loading` 阶段退出，旧版本的源码前置检查使用了不同的短时限。当前 `setup`、开发 `ensure` 和 `doctor` 已统一为 120 秒；导入 NumPy、Pandas、OR-Tools 时会留下具体阶段，导入超过 20 秒只输出一次线程栈帮助定位，仍会有界终止。此修复消除了过早退出并改善诊断，不能据此断定某台 M5 电脑的底层加载问题已经解决。
+
+更新完整源码后运行 `npm ci`、`npm run desktop:dev`。如果仍停在依赖导入，请运行 `npm run solver:doctor`，查看 `solver/build/diagnostics-latest.json` 的 `sourceInfo` 及最后的 `SHIFTFLOW_IMPORT_V1` 记录；无需删除已有排班或整个 Python 虚拟环境。
+
+
 用户取消、求解超时或退出程序时，Tauri 回收整个求解进程树，防止计算进程继续占用资源。
 
 ## GitHub Actions
@@ -134,7 +139,7 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 自动发布标签包含项目版本与 run ID。同一次运行重跑时先核对已有发行版对应的源码提交，不覆盖已发布附件。历史 `.github/workflows/macos-delivery.yml` 保留为手动草稿恢复流程，不会自动公开发布。
 
-完整的三平台构建入口是 `.github/workflows/desktop-build.yml`：进入 GitHub Actions → **Build desktop installers** → **Run workflow**。固定使用以下原生运行器，避免 `macos-latest` 改变架构：
+完整的三平台构建入口是 `.github/workflows/desktop-build.yml`：进入 GitHub Actions → **Build desktop installers** → **Run workflow**。`publish_release` 默认勾选，取消勾选时仅构建和验证，不发布；默认全部验证成功后自动发布。固定使用以下原生运行器，避免 `macos-latest` 改变架构：
 
 | 平台 | 运行器 | Python 架构 | 输出安装包 |
 | --- | --- | --- | --- |

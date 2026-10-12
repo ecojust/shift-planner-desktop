@@ -67,3 +67,34 @@ test('working-day carried overnight hours and new shift are aggregated before ov
   const row = calculatePayroll(state,config()).rows[0]
   assert.equal(row.totalHours,16); assert.equal(row.ordinaryOvertimeHours,6); assert.equal(row.ordinaryAllowance,900)
 })
+test('Spring Festival eve is paid at 3x but its ordinary holiday extension stays at 2x', () => {
+  const state = fixture('2026-02'); add(state, '2026-02-16'); add(state, '2026-02-20'); add(state, '2026-02-28', 'long')
+  const row = calculatePayroll(state, config()).rows[0]
+  assert.equal(row.statutoryHours, 8); assert.equal(row.statutoryAllowance, 2400)
+  assert.equal(row.restdayHours, 8); assert.equal(row.restdayAllowance, 1600)
+  assert.equal(row.ordinaryOvertimeHours, 2); assert.equal(row.ordinaryAllowance, 300)
+})
+test('previous-year overnight tail uses the new year calendar without repeating the December hours', () => {
+  const state = fixture('2026-01'); add(state, '2025-12-31', 'night')
+  const january = calculatePayroll(state, config())
+  assert.equal(january.rows[0].totalHours, 6)
+  assert.equal(january.rows[0].statutoryHours, 6)
+  assert.equal(january.totalAllowance, 1800)
+  state.month = '2025-12'
+  const december = calculatePayroll(state, config())
+  assert.equal(december.rows[0].totalHours, 2)
+  assert.equal(december.rows[0].statutoryHours, 0)
+  assert.equal(december.totalAllowance, 0)
+  assert.doesNotMatch(december.warnings.join(' '), /未覆盖|历史年份|待核对/)
+})
+test('future dates stay provisional until manually confirmed, including year-crossing payroll', () => {
+  const state = fixture('2027-01'); add(state, '2026-12-31', 'night')
+  const cfg = config()
+  const preliminary = calculatePayroll(state, cfg)
+  assert.match(preliminary.warnings.join(' '), /未覆盖/)
+  assert.equal(preliminary.statutoryHours, 0)
+  cfg.calendar['2027-01-01'] = 'statutory'
+  const confirmed = calculatePayroll(state, cfg)
+  assert.equal(confirmed.statutoryHours, 6)
+  assert.equal(confirmed.totalAllowance, 1800)
+})

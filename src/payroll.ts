@@ -1,6 +1,9 @@
 import type { PlannerState } from './domain'
 
-export type DayKind = 'workday' | 'restday' | 'statutory'
+import { dayInfo, isCivilDate as validDate, calendarYearInfo } from './calendar.ts'
+import type { DayKind } from './calendar.ts'
+export { dayInfo, HOLIDAY_SOURCE } from './calendar.ts'
+export type { DayKind } from './calendar.ts'
 export interface PayrollSettings {
   monthlySalary: number
   monthlyWorkdays: number
@@ -22,46 +25,13 @@ export interface PayrollResult {
   rows: PayrollRow[]; totalAllowance: number; statutoryHours: number; restdayHours: number
   ordinaryOvertimeHours: number; warnings: string[]
 }
-export const HOLIDAY_SOURCE = 'https://www.gov.cn/zhengce/zhengceku/202511/content_7047091.htm'
 export const PAYROLL_NOTICE = '按标准工时制估算；金额为加班工资，不含月薪。实际结算需核对工资基数、实际出勤、补休及适用工时制度。'
-const statutory: Record<string, string> = {
-  '2026-01-01': '元旦', '2026-02-16': '春节·除夕', '2026-02-17': '春节·初一',
-  '2026-02-18': '春节·初二', '2026-02-19': '春节·初三', '2026-04-05': '清明节',
-  '2026-05-01': '劳动节', '2026-05-02': '劳动节', '2026-06-19': '端午节',
-  '2026-09-25': '中秋节', '2026-10-01': '国庆节', '2026-10-02': '国庆节', '2026-10-03': '国庆节',
-}
-const adjustedWorkdays = new Set(['2026-01-04', '2026-02-14', '2026-02-28', '2026-05-09', '2026-09-20', '2026-10-10'])
-const holidays = [
-  ['2026-01-01', '2026-01-03', '元旦'], ['2026-02-15', '2026-02-23', '春节'],
-  ['2026-04-04', '2026-04-06', '清明节'], ['2026-05-01', '2026-05-05', '劳动节'],
-  ['2026-06-19', '2026-06-21', '端午节'], ['2026-09-25', '2026-09-27', '中秋节'],
-  ['2026-10-01', '2026-10-07', '国庆节'],
-] as const
-const labels: Record<DayKind, string> = { workday: '工作日', restday: '休息日', statutory: '法定节假日' }
 const dayMs = 86400000
 const round = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100
-function validDate(date: string) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(date) && Number.isFinite(Date.parse(date + 'T00:00:00Z')) && new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) === date
-}
-
 export function createPayrollConfig(): PayrollConfig {
   return { payroll: { monthlySalary: 6000, monthlyWorkdays: 21.75, hoursPerDay: 8,
     statutoryMultiplier: 3, restdayMultiplier: 2, ordinaryMultiplier: 1.5,
     restdayCompensated: false, employeeSalaries: {} }, calendar: {} }
-}
-
-export function dayInfo(date: string, overrides: Record<string, DayKind> = {}): { kind: DayKind; label: string; source: string; verified: boolean } {
-  if (!validDate(date)) return { kind: 'workday', label: '日期无效', source: '', verified: false }
-  const custom = overrides[date]
-  if (custom && custom in labels) return { kind: custom, label: `${labels[custom]}·手动`, source: '用户自定义日历', verified: true }
-  const is2026 = date.startsWith('2026-')
-  if (is2026 && statutory[date]) return { kind: 'statutory', label: `${statutory[date]}·法定`, source: HOLIDAY_SOURCE, verified: true }
-  if (is2026 && adjustedWorkdays.has(date)) return { kind: 'workday', label: '调休上班', source: HOLIDAY_SOURCE, verified: true }
-  const holiday = is2026 && holidays.find(([start, end]) => date >= start && date <= end)
-  if (holiday) return { kind: 'restday', label: `${holiday[2]}·调休/连休`, source: HOLIDAY_SOURCE, verified: true }
-  const weekday = new Date(date + 'T00:00:00Z').getUTCDay()
-  const kind: DayKind = weekday === 0 || weekday === 6 ? 'restday' : 'workday'
-  return { kind, label: labels[kind] + (is2026 ? '' : '·待核对'), source: is2026 ? HOLIDAY_SOURCE : '仅按周一至周五/周末推算，尚未内建该年节假日与调休', verified: is2026 }
 }
 
 /** Natural-day accounting: split overnight shifts at midnight, then clip to the selected calendar month. */
@@ -69,7 +39,8 @@ export function calculatePayroll(state: PlannerState, config: PayrollConfig = cr
   const settings = config.payroll
   if (!Number.isFinite(settings.monthlyWorkdays) || settings.monthlyWorkdays <= 0 || !Number.isFinite(settings.hoursPerDay) || settings.hoursPerDay <= 0) throw new Error('月计薪天数和标准日工时必须大于 0')
   const warnings = new Set<string>([PAYROLL_NOTICE])
-  if (!state.month.startsWith('2026-')) warnings.add('当前年份未内建节假日与调休，请逐日核对或自定义日历。')
+  const calendarInfo = calendarYearInfo(Number(state.month.slice(0, 4)))
+  if (!calendarInfo.verified) warnings.add(`${calendarInfo.reason}未手动确认的日期暂按工作日和周末估算，请核对后再结算。`)
   warnings.add('按自然日归属本月工时；月初跨夜工时需保留上月最后一天的排班记录，月末跨出部分计入下月。班次时段视为全程计薪，未自动扣除休息时间。')
   const rows: PayrollRow[] = []
   for (const employee of state.employees) {

@@ -26,6 +26,7 @@
   "dependencies": {
     "@tauri-apps/api": "^2.12.3",
     "fflate": "^0.8.2",
+    "lunar-typescript": "1.8.6",
     "vue": "^3.5.22"
   },
   "devDependencies": {

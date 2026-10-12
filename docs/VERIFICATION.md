@@ -2,6 +2,14 @@
 
 验证日期：2026-10-12。现已完成 macOS 15 ARM64 原生安装包构建、包内求解器与资源审计；此前完成 Linux x86_64 窗口测试。Mac 图形界面交互、安装/卸载及文件对话框未实测，Windows 尚未原生验证。
 
+## 2026-10-13 更新：三平台构建、开发启动与日历
+
+- `desktop-build.yml` 新增并固定 Windows x64、Intel Mac x64、Mac ARM64 三个原生任务，默认全部成功后自动发布；取消 `publish_release` 可只验证构建。新增平台最终结果以当前 Actions 和发行报告为准。
+- 开发启动链路的 Python 依赖加载检查统一为 120 秒，加入模块导入位置及 20 秒一次性线程栈。源码加载与 CP-SAT 自检在本工作环境约 0.48 秒完成；这不代表已确认用户 M5 上的具体阻塞原因。
+- 日历接入 `lunar-typescript@1.8.6`，删除程序内的 2026 公历日期表，保留独立法定计薪规则与人工日历优先级。当前完整自动核算 2025/2026，未来未覆盖年度保持待核对。
+- 本地完整前端测试 65 项通过（包含 2026 全年 365 天独立官方日期对照与跨年津贴），类型检查和 Vite 构建通过；新增 3 项启动诊断、8 项 Mach-O 架构审计测试通过。
+- 发布脚本 10 个隔离模拟场景通过：正常发布、缺附件、错误标签、上传失败、错误长度/摘要、未完成上传及无远端摘要时的下载校验。模拟检查不能替代原生安装包运行验证。
+
 ## Mac 原生构建与最终 App 验证
 
 原始构建：[38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)，对应源码提交 `e1e6df1dac5134b6ea6bef69bcc58b7c52fcb095`。随后在同类 macOS 15 ARM64 运行器上完成 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 审计，没有重建或修改原始应用字节。
@@ -14,7 +22,7 @@
 
 审计发现 NumPy 扩展声明的最高最低系统版本为 macOS 14.0。该历史构建的 Info.plist 仍声明 11.0，不能据此承诺支持 macOS 11–13；现有包按 **macOS 14+** 交付。后续 Mac 构建配置已明确提高至 14.0，自动发布前也会校验应用声明和实际依赖最低版本。macOS 14 的运行兼容性尚未单独实测。
 
-当前包已作为 [macOS Apple Silicon 测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0) 公开，未进行 Apple Developer ID 签名或 Apple 公证。新的 `macos-arm64.yml` 由用户手动启动，在全部检查成功后自动发布 prerelease；通用 `desktop-build.yml` 仍只产出 Actions artifact。自动发布流程的新增步骤不等同于已经执行了下一次完整构建。
+当前包已作为 [macOS Apple Silicon 测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0) 公开，未进行 Apple Developer ID 签名或 Apple 公证。新的 `macos-arm64.yml` 由用户手动启动，在全部检查成功后自动发布 prerelease；当前三平台 `desktop-build.yml` 已扩展为 Windows x64、Intel Mac 与 Apple Silicon 原生构建，全部成功后可自动发布；新增平台的实际结果以本轮 Actions 记录为准。
 
 ## 定位与调整
 
