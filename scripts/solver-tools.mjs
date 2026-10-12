@@ -58,7 +58,7 @@ export function findBuildPython() {
 
 export async function main(task) {
   try { await task(); } catch (error) {
-    console.error(`\n排班时光：${error.message}`);
+    console.error(`\n排班 plus：${error.message}`);
     process.exitCode = 1;
   }
 }

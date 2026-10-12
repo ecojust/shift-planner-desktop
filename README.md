@@ -1,4 +1,4 @@
-# 排班时光 · 通用员工排班
+# 排班 plus · 通用员工排班
 
 独立的 Vue / TypeScript / Vite 排班应用，适合早晚班、请假安排和公平轮班。同一套界面支持静态网页和 Tauri 桌面版：桌面版内置 Python OR-Tools CP-SAT 求解器，在本机计算，不需要业务服务器，也不依赖其他游戏项目或 GameLink SDK。
 
@@ -76,3 +76,5 @@ Windows x64、Intel Mac 和 M 芯片 Mac 已完成原生构建及最终资源目
 另核对了 PerfectTablePlan 的官方遗传算法介绍，可参考其锁定、软偏好与限时优化的产品思路，详见 [PerfectTablePlan 参考记录](docs/PERFECTTABLEPLAN_REFERENCE.md)。本项目的桌面求解核心仍为 OR-Tools CP-SAT，没有改用遗传算法，也不声称复用了该软件的实现。
 
 本次桌面构建、真实求解及界面验证范围详见 [验证记录](docs/VERIFICATION.md)。
+
+右上角构建号采用北京时间 `YYYY.MMDD.HHmm`，在开发服务启动或编译时固定。同次 CI 的三个平台及失败重跑使用同一个构建号。可设置 `SHIFT_FLOW_BUILD_VERSION` 复现指定编号，格式或日期不合法会拒绝构建。安装包版本与构建号分别记录。

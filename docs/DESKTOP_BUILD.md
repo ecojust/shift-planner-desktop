@@ -1,4 +1,4 @@
-# 排班时光：Windows / macOS 桌面构建
+# 排班 plus：Windows / macOS 桌面构建
 
 桌面版由 Vue 界面、Tauri 2 本地宿主、Python OR-Tools CP-SAT 求解器组成。求解器通过标准输入输出交换 JSON，不监听 HTTP 端口，不需要在线算法服务。Python 和原生求解库一起打进安装包，**使用者不需要安装 Python、Rust 或 Node.js**。
 

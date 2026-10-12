@@ -9,6 +9,7 @@ import { validateSchedule } from '../src/scheduler.ts';
 import { captureFrozen, parseFrozenInfo } from './frozen-process.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
 import { verifyMacSignature } from './verify-macos-signature.mjs';
+import { validateBuildVersion } from './build-version.ts';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const platforms = {
@@ -180,6 +181,11 @@ async function main() {
     options[args[index]] = args[index + 1];
   }
   const configuration = targetConfiguration(options['--target'] || process.env.SHIFT_FLOW_TARGET, options['--platform-id'] || process.env.SHIFT_FLOW_PLATFORM_ID);
+  const compiledBuild = readJson(join(projectRoot, 'dist', 'build-info.json'));
+  const buildVersion = validateBuildVersion(compiledBuild.buildVersion);
+  if (process.env.SHIFT_FLOW_BUILD_VERSION !== undefined) {
+    assert.equal(buildVersion, validateBuildVersion(process.env.SHIFT_FLOW_BUILD_VERSION), 'Compiled UI build number differs from workflow');
+  }
   assert.equal(process.platform, configuration.os, 'Final bundles must be verified on their native OS');
   assert.equal(process.arch, configuration.nodeArch, 'Node must run on the requested native CPU architecture');
   const artifacts = join(projectRoot, 'artifacts');
@@ -244,7 +250,7 @@ async function main() {
     assert.deepEqual(independentRuleIssues, []);
     const nativeReport = {
       target: configuration.target, platformId: configuration.id, os: process.platform, nodeArchitecture: process.arch,
-      commit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null, generatedAt: new Date().toISOString(),
+      commit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null, buildVersion, generatedAt: new Date().toISOString(),
       app, mainExecutable, runtime, mainArchitecture, solverArchitecture,
       info, selfTest, startupSeconds: infoRun.elapsedSeconds, selfTestSeconds: selfTestRun.elapsedSeconds,
       checkedInstalledResourceLayout: true, checkedInstalledNSISLayout: configuration.os === 'win32',
@@ -254,7 +260,7 @@ async function main() {
       limitations: ['Main application GUI and manual installation were not exercised by this script.', 'Apple Developer ID, notarization, Gatekeeper acceptance and Windows publisher trust are not certified by these checks.'],
     };
     const monthReport = {
-      buildCommit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null,
+      buildCommit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null, buildVersion,
       target: configuration.target, platformId: configuration.id, fixture: 'Built-in demo; no user data',
       month: state.month, employeeCount: state.employees.length, shiftsPerDay: [2, 2, 1], searchLimitSeconds: 5,
       status: result.status, assignmentCount: result.assignments.length, shortageCount: result.stats.shortageCount,

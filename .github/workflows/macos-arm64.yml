@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
 
 concurrency:
   group: macos-arm64-release-${{ github.run_id }}
@@ -25,6 +26,10 @@ jobs:
         with:
           node-version: '24'
           cache: npm
+      - name: Set fixed Beijing build number
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/build-version.ts --github-env --github-run
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -62,12 +67,15 @@ jobs:
       - name: Verify sealed app signature and bundled solver
         run: |
           node --input-type=module <<'NODE'
-          import { readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+          import { readdirSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
           import { resolve, join } from 'node:path';
           import { execFileSync } from 'node:child_process';
           import { captureFrozen, parseFrozenInfo } from './scripts/frozen-process.mjs';
           import { verifyMacSignature } from './scripts/verify-macos-signature.mjs';
+          import { validateBuildVersion } from './scripts/build-version.ts';
 
+          const buildVersion = validateBuildVersion(process.env.SHIFT_FLOW_BUILD_VERSION);
+          if (JSON.parse(readFileSync('dist/build-info.json', 'utf8')).buildVersion !== buildVersion) throw new Error('Compiled UI build number differs from workflow');
           const bundleDirectory = resolve('src-tauri/target/release/bundle/macos');
           const apps = readdirSync(bundleDirectory).filter(name => name.endsWith('.app'));
           if (apps.length !== 1) throw new Error(`Expected one app bundle, found ${apps.length}`);
@@ -89,7 +97,7 @@ jobs:
           const selfTest = parseFrozenInfo(testRun, true);
           const report = {
             target: 'aarch64-apple-darwin', os: 'macos-15',
-            commit: process.env.GITHUB_SHA, generatedAt: new Date().toISOString(),
+            commit: process.env.GITHUB_SHA, buildVersion, generatedAt: new Date().toISOString(),
             mainArchitecture, solverArchitecture, info, selfTest,
             startupSeconds: infoRun.elapsedSeconds, selfTestSeconds: testRun.elapsedSeconds,
             checkedInstalledResourceLayout: true,
@@ -138,6 +146,7 @@ jobs:
           import { makeDefaultState } from './src/defaults.ts';
           import { validateSchedule } from './src/scheduler.ts';
           import { captureFrozen } from './scripts/frozen-process.mjs';
+          import { validateBuildVersion } from './scripts/build-version.ts';
           const directory = resolve('src-tauri/target/release/bundle/macos');
           const apps = readdirSync(directory).filter(name => name.endsWith('.app'));
           assert.equal(apps.length, 1);
@@ -163,6 +172,7 @@ jobs:
           assert.deepEqual(issues, []);
           const report = {
             buildCommit: process.env.GITHUB_SHA, buildRun: process.env.GITHUB_RUN_ID,
+            buildVersion: validateBuildVersion(process.env.SHIFT_FLOW_BUILD_VERSION),
             target: 'aarch64-apple-darwin', fixture: 'Built-in demo; no user data',
             month: state.month, employeeCount: 12, shiftsPerDay: [2, 2, 1], searchLimitSeconds: 5,
             status: result.status, assignmentCount: result.assignments.length,
@@ -210,7 +220,9 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
           tag="macos-arm64-v${version}-${GITHUB_RUN_ID}"
           cat > release-notes.md <<EOF
-          排班时光 ${version} · Apple Silicon 测试发行版
+          排班 plus ${version} · Apple Silicon 测试发行版
+
+          构建号：${SHIFT_FLOW_BUILD_VERSION}（北京时间）
 
           适用于 M 系列芯片的 Mac，要求 macOS 14 或更新系统；在 macOS 15 ARM64 原生构建并验证。
           本版本未进行 Apple Developer ID 签名或 Apple 公证。
@@ -245,7 +257,7 @@ jobs:
           NODE
           else
             # Upload while still a draft so a failed upload cannot publish an incomplete release.
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "排班时光 ${version} · M 芯片 · macOS 14+（未公证）" --notes-file release-notes.md artifacts/shift-flow-macos-arm64.dmg artifacts/shift-planner-source.zip artifacts/release-SHA256SUMS
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "排班 plus ${version} · M 芯片 · macOS 14+（未公证）" --notes-file release-notes.md artifacts/shift-flow-macos-arm64.dmg artifacts/shift-planner-source.zip artifacts/release-SHA256SUMS
           fi
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,assets > release-ready.json
           node --input-type=module <<'NODE'

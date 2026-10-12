@@ -3,10 +3,12 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { validateBuildVersion } from './build-version.ts';
 
 export function prepareRelease(root = process.cwd(), env = process.env) {
   const commit = env.GITHUB_SHA;
   const runId = env.GITHUB_RUN_ID;
+  const buildVersion = validateBuildVersion(env.SHIFT_FLOW_BUILD_VERSION);
   assert.match(commit || '', /^[a-f0-9]{40}$/);
   assert.match(runId || '', /^\d+$/);
   const { version } = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
@@ -28,6 +30,7 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
     const solver = read(manifestName);
     assert.equal(native.target, target);
     assert.equal(native.commit, commit, `${id}: different native build commit`);
+    assert.equal(native.buildVersion, buildVersion, `${id}: different UI build number`);
     assert.equal(native.checkedInstalledResourceLayout, true);
     assert.equal(native.info.engine, 'ortools-cp-sat');
     assert.equal(native.selfTest.status, 'OPTIMAL');
@@ -37,6 +40,7 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
     assert.equal(solver.solverInfo.version, native.info.version);
     assert.equal(month.buildCommit, commit, `${id}: different month test commit`);
     assert.equal(String(month.buildRun), runId, `${id}: different build run`);
+    assert.equal(month.buildVersion, buildVersion, `${id}: different month validation build number`);
     assert.equal(month.target, target);
     assert.equal(month.checkedAppRuntime, true);
     assert.ok(['OPTIMAL', 'FEASIBLE'].includes(month.status));
@@ -78,7 +82,9 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
   const files = names.sort().map(describe);
   writeFileSync(join(directory, 'SHA256SUMS'), files.map(file => `${file.sha256}  ${file.name}\n`).join(''));
   files.push(describe('SHA256SUMS'));
-  const notes = `排班时光 ${version} · Windows 与 macOS 测试发行版
+  const notes = `排班 plus ${version} · Windows 与 macOS 测试发行版
+
+本版更名为「排班 plus」，更新应用图标和简洁界面；右上角显示固定的北京时间构建号。沿用原应用标识与存储格式，已有本地排班可以继续使用。
 
 按电脑类型选择一个安装包，无需下载全部文件：
 
@@ -96,11 +102,12 @@ Mac App 和内置 Python 框架已完成 ad-hoc 签名及资源封印，并逐�
 
 shift-planner-source.zip 是本次构建的精确源码；SHA256SUMS 用于校验下载文件。JSON 验证报告保留在下方构建记录的 Actions Artifacts 中，按平台归档，保留 14 天。
 
+构建号：${buildVersion}（北京时间）
 源码提交：${commit}
 构建记录：https://github.com/${env.GITHUB_REPOSITORY}/actions/runs/${runId}
 `;
   writeFileSync(join(root, 'desktop-release-notes.md'), notes);
-  const result = { schemaVersion: 1, commit, runId, version, tag: `desktop-v${version}-${runId}`, files };
+  const result = { schemaVersion: 1, commit, runId, version, buildVersion, tag: `desktop-v${version}-${runId}`, files };
   writeFileSync(join(root, 'desktop-release-manifest.json'), `${JSON.stringify(result, null, 2)}\n`);
   return result;
 }

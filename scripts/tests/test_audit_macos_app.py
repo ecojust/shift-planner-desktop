@@ -44,7 +44,7 @@ class MacBundleAuditTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="shiftflow-audit-test-")
         self.addCleanup(self.temp.cleanup)
-        self.app = Path(self.temp.name) / "排班时光.app"
+        self.app = Path(self.temp.name) / "排班 plus.app"
         self.binary = self.app / "Contents" / "MacOS" / "main"
         self.binary.parent.mkdir(parents=True)
         self.write_info()

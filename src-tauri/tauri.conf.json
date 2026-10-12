@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "排班时光",
-  "version": "1.1.1",
+  "productName": "排班 plus",
+  "version": "1.2.0",
   "identifier": "com.shiftflow.planner",
   "build": {
     "beforeDevCommand": "npm run dev -- --port 5190 --strictPort",
@@ -13,12 +13,12 @@
     "windows": [
       {
         "label": "main",
-        "title": "排班时光 · 本地智能排班",
+        "title": "排班 plus · 本地智能排班",
         "width": 1380,
         "height": 900,
         "minWidth": 800,
         "minHeight": 600,
-        "backgroundColor": "#f4f7fb",
+        "backgroundColor": "#f4f6f5",
         "resizable": true
       }
     ],
@@ -33,12 +33,23 @@
     "category": "Productivity",
     "shortDescription": "本地离线员工排班与约束求解",
     "longDescription": "自定义班次、人员互斥、休假、公平轮班、法定节假日津贴及 Excel 导出。OR-Tools CP-SAT 求解器随桌面应用本地运行，无需另装 Python。",
-    "resources": {"solver-runtime/": "solver-runtime/"},
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "resources": {
+      "solver-runtime/": "solver-runtime/"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "windows": {
       "nsis": {
         "displayLanguageSelector": false,
-        "languages": ["SimpChinese", "English"]
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
       }
     },
     "macOS": {
