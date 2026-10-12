@@ -1,0 +1,42 @@
+name: Inspect failed build
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Completed Actions job ID in this repository
+        type: string
+        required: true
+
+permissions:
+  actions: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Read completed job log and surface bounded diagnostics
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFileSync } from 'node:child_process';
+          assert.match(process.env.JOB_ID, /^\d+$/);
+          const base = `repos/${process.env.GITHUB_REPOSITORY}/actions/jobs/${process.env.JOB_ID}`;
+          const job = JSON.parse(execFileSync('gh', ['api', base], { encoding: 'utf8' }));
+          assert.equal(job.status, 'completed');
+          const text = execFileSync('gh', ['api', `${base}/logs`], { encoding: 'utf8', timeout: 120000, maxBuffer: 32 * 1024 * 1024 });
+          const lines = text.split('\n');
+          const selected = new Set();
+          for (let index = 0; index < lines.length; index++) {
+            if (/error|fail(?:ed|ure|ures)|panicked|assertion|could not|Caused by:/i.test(lines[index])) {
+              for (let context = Math.max(0, index - 4); context <= Math.min(lines.length - 1, index + 12); context++) selected.add(context);
+            }
+          }
+          const diagnostic = [...selected].sort((a, b) => a - b).map(index => lines[index]).join('\n').slice(-48000);
+          const escaped = diagnostic.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+          console.log(`::notice title=Job ${process.env.JOB_ID} diagnostics::${escaped}`);
+          NODE
