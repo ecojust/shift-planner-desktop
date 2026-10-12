@@ -1,0 +1,45 @@
+name: Read native macOS diagnostic evidence
+
+# Read an existing artifact only; never download, execute or modify app code.
+on:
+  workflow_dispatch:
+    inputs:
+      diagnostic_run:
+        description: Run ID of Diagnose published macOS download
+        type: string
+        default: '38281252565'
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  read:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.diagnostic_run }}
+          name: macos-download-diagnostics-${{ inputs.diagnostic_run }}
+          path: diagnostic
+      - name: Expose exact native signature failure paths
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          files = list(Path('diagnostic').rglob('diagnostic-report.json'))
+          assert len(files) == 1, f'Expected one report, found {len(files)}'
+          report = json.loads(files[0].read_text())
+          result = {
+              'diagnosticRun': report.get('diagnosticRun'),
+              'source': report.get('source'),
+              'findings': report.get('findings'),
+              'nativeSignatureFailures': report.get('nativeObjects', {}).get('failed', []),
+          }
+          print(json.dumps(result, ensure_ascii=False, indent=2))
+          text = json.dumps(result, ensure_ascii=False).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::notice title=Exact native macOS signature failures::{text}')
+          PY

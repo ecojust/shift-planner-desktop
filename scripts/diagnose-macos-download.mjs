@@ -220,6 +220,7 @@ async function main() {
     writeFileSync(join(output, 'diagnostic-report.json'), `${JSON.stringify(report, null, 2)}\n`);
     const summary = { completed: report.completed, source: report.source, findings: report.findings,
       keyEvidence: {
+        nativeSignatureFailures: report.nativeObjects?.failed || [],
         appSignatureVerification: report.app?.copiedBundle.verify.stderr.slice(-2400) || null,
         appSignatureDescription: report.app?.copiedBundle.description.stderr.slice(-2400) || null,
         mainSignatureVerification: report.app?.main.verify.stderr.slice(-1200) || null,
