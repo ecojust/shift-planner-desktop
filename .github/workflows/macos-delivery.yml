@@ -1,0 +1,198 @@
+name: Prepare macOS delivery draft
+
+# Transfer an existing verified build into a DRAFT release. Never publish it.
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: macos-delivery-draft-1.1.0
+  cancel-in-progress: false
+
+jobs:
+  delivery:
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_RUN: '38271663345'
+      BUILD_COMMIT: e1e6df1dac5134b6ea6bef69bcc58b7c52fcb095
+      RELEASE_TAG: macos-arm64-1.1.0
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Verify source and original build provenance
+        run: |
+          test "$(uname -m)" = arm64
+          git cat-file -e "${BUILD_COMMIT}^{commit}"
+          # Delivery-only scripts may change; application, solver and build configuration must not.
+          git diff --exit-code "$BUILD_COMMIT" HEAD -- src/ solver/ src-tauri/ public/ package.json package-lock.json index.html tsconfig.json vite.config.ts scripts/frozen-process.mjs scripts/runtime-files.mjs
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${BUILD_RUN}" > original-build.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const run = JSON.parse(readFileSync('original-build.json', 'utf8'));
+          assert.equal(run.status, 'completed');
+          assert.equal(run.conclusion, 'success');
+          assert.equal(run.head_sha, process.env.BUILD_COMMIT);
+          assert.equal(String(run.id), process.env.BUILD_RUN);
+          console.log(`Verified original successful build ${run.id} at ${run.head_sha}`);
+          NODE
+      - name: Download the original verified artifact without rebuilding
+        uses: actions/download-artifact@v4
+        with:
+          name: shift-flow-macos-arm64
+          path: artifacts
+          github-token: ${{ github.token }}
+          run-id: '38271663345'
+      - name: Verify original installer bytes and metadata
+        run: |
+          shasum -a 256 -c artifacts/SHA256SUMS
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { readFileSync } from 'node:fs';
+          const validation = JSON.parse(readFileSync('artifacts/native-validation.json', 'utf8'));
+          const manifest = JSON.parse(readFileSync('artifacts/solver-manifest.json', 'utf8'));
+          assert.equal(validation.commit, process.env.BUILD_COMMIT);
+          assert.equal(validation.target, 'aarch64-apple-darwin');
+          assert.equal(validation.checkedInstalledResourceLayout, true);
+          assert.equal(validation.selfTest.status, 'OPTIMAL');
+          assert.equal(validation.selfTest.selfTest, true);
+          assert.equal(validation.info.version, '9.14.6206');
+          assert.match(validation.mainArchitecture, /arm64/);
+          assert.match(validation.solverArchitecture, /arm64/);
+          assert.equal(manifest.format, 'onedir');
+          assert.equal(manifest.target, 'aarch64-apple-darwin');
+          assert.equal(manifest.solverInfo.version, validation.info.version);
+          assert.equal(manifest.selfTest.status, 'OPTIMAL');
+          assert.ok(Object.keys(manifest.sources).length > 0);
+          for (const [file, expected] of Object.entries(manifest.sources)) {
+            assert.ok(file.startsWith('solver/') && !file.split('/').includes('..'), 'unexpected source path');
+            const actual = createHash('sha256').update(readFileSync(file)).digest('hex');
+            assert.equal(actual, expected, `Source mismatch: ${file}`);
+          }
+          console.log('Original installer checksums, build commit and solver source hashes match.');
+          NODE
+      - name: Extract app for read-only native audit
+        run: |
+          mkdir -p unpacked
+          ditto -x -k artifacts/shift-flow-macos-arm64.app.zip unpacked
+          apps=(unpacked/*.app)
+          test "${#apps[@]}" -eq 1
+          test -d "${apps[0]}"
+          python scripts/audit-macos-app.py "${apps[0]}" > artifacts/macos-app-audit.json
+      - name: Solve a complete demo month using the actual app runtime
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readdirSync, writeFileSync } from 'node:fs';
+          import { resolve, join } from 'node:path';
+          import { makeDefaultState } from './src/defaults.ts';
+          import { validateSchedule } from './src/scheduler.ts';
+          import { captureFrozen } from './scripts/frozen-process.mjs';
+
+          const apps = readdirSync('unpacked').filter(name => name.endsWith('.app'));
+          assert.equal(apps.length, 1);
+          const runtime = resolve('unpacked', apps[0], 'Contents', 'Resources', 'solver-runtime');
+          const state = makeDefaultState('2026-10');
+          state.assignments = [];
+          assert.equal(state.employees.length, 12);
+          assert.deepEqual(state.shifts.map(shift => shift.required), [2, 2, 1]);
+          const requestId = `macos-delivery-${process.env.GITHUB_RUN_ID}`;
+          const request = {
+            protocolVersion: 1, requestId, state,
+            options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010 },
+          };
+          const execution = await captureFrozen(join(runtime, 'shiftflow-solver'), ['--hosted'], {
+            cwd: runtime, input: JSON.stringify(request),
+            startupTimeoutMs: 120_000, solveTimeoutMs: 20_000, finishTimeoutMs: 5_000,
+          });
+          const result = JSON.parse(execution.stdout);
+          assert.equal(result.protocolVersion, 1);
+          assert.equal(result.requestId, requestId);
+          assert.equal(result.engine, 'ortools-cp-sat');
+          assert.ok(['OPTIMAL', 'FEASIBLE'].includes(result.status), result.message);
+          assert.equal(result.assignments.length, 155);
+          assert.equal(result.stats.shortageCount, 0);
+          const issues = validateSchedule({ ...state, assignments: result.assignments });
+          assert.deepEqual(issues, [], 'Actual app schedule must pass independent TypeScript rules');
+          const report = {
+            buildCommit: process.env.BUILD_COMMIT, originalBuildRun: process.env.BUILD_RUN,
+            deliveryRun: process.env.GITHUB_RUN_ID, target: 'aarch64-apple-darwin',
+            fixture: 'Built-in 12-person demo; no user data', month: state.month,
+            employeeCount: state.employees.length, shiftsPerDay: [2, 2, 1],
+            searchLimitSeconds: 5, status: result.status, assignmentCount: result.assignments.length,
+            shortageCount: result.stats.shortageCount, independentRuleIssues: issues,
+            solverStats: result.stats, elapsedSeconds: execution.elapsedSeconds,
+            stages: execution.stages, checkedAppRuntime: true,
+          };
+          writeFileSync('artifacts/macos-month-schedule-validation.json', `${JSON.stringify(report, null, 2)}\n`);
+          console.log(JSON.stringify(report, null, 2));
+          NODE
+      - name: Archive exact build source and preserve original checksums
+        run: |
+          git archive --format=zip --prefix=shift-planner/ --output=artifacts/shift-planner-source-e1e6df1.zip "$BUILD_COMMIT"
+          # Verify again after auditing: never mutate the original DMG or app archive.
+          shasum -a 256 -c artifacts/SHA256SUMS
+          shasum -a 256 artifacts/*.json artifacts/shift-planner-source-e1e6df1.zip > artifacts/delivery-SHA256SUMS
+          cat > delivery-notes.md <<'EOF'
+          排班时光 1.1.0 · macOS Apple Silicon 交付草稿
+
+          原始构建：38271663345
+          源码提交：e1e6df1dac5134b6ea6bef69bcc58b7c52fcb095
+
+          此草稿只转存已经生成并验证的原始 DMG 和 App ZIP，不重新构建或修改应用。
+          附带实际 App 结构审计、完整月份真实 CP-SAT 排班验证及精确构建提交的源码 ZIP。
+          未进行 Apple Developer ID 签名或公证。保持草稿状态，不公开发布此 Release。
+          EOF
+      - name: Create or reuse only a matching draft release
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish,tagName,url > existing-release.json; then
+            node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const release = JSON.parse(readFileSync('existing-release.json', 'utf8'));
+          assert.equal(release.isDraft, true, 'Refusing to modify a published release');
+          assert.equal(release.targetCommitish, process.env.BUILD_COMMIT, 'Draft targets a different commit');
+          assert.equal(release.tagName, process.env.RELEASE_TAG);
+          NODE
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$BUILD_COMMIT" --title '排班时光 1.1.0 · macOS Apple Silicon（交付草稿）' --notes-file delivery-notes.md
+          fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish,tagName,url > draft-before-upload.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const release = JSON.parse(readFileSync('draft-before-upload.json', 'utf8'));
+          assert.equal(release.isDraft, true);
+          assert.equal(release.targetCommitish, process.env.BUILD_COMMIT);
+          assert.equal(release.tagName, process.env.RELEASE_TAG);
+          NODE
+      - name: Attach delivery files without publishing
+        run: |
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber artifacts/shift-flow-macos-arm64.dmg artifacts/shift-flow-macos-arm64.app.zip artifacts/SHA256SUMS artifacts/native-validation.json artifacts/solver-manifest.json artifacts/macos-app-audit.json artifacts/macos-month-schedule-validation.json artifacts/shift-planner-source-e1e6df1.zip artifacts/delivery-SHA256SUMS
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,targetCommitish,tagName,url,assets > delivery-draft.json
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          const release = JSON.parse(readFileSync('delivery-draft.json', 'utf8'));
+          assert.equal(release.isDraft, true, 'Release must remain draft');
+          assert.equal(release.targetCommitish, process.env.BUILD_COMMIT);
+          assert.equal(release.assets.length, 9);
+          console.log(JSON.stringify({ draft: release.isDraft, target: release.targetCommitish, url: release.url, assets: release.assets.map(asset => ({ name: asset.name, size: asset.size })) }, null, 2));
+          NODE
