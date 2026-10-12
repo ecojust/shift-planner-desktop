@@ -826,9 +826,9 @@ mod tests {
             .contains("npm run solver:setup"));
         let solver = project.0.join("solver");
         let python = if cfg!(windows) {
-            solver.join(".venv/Scripts/python.exe")
+            solver.join(".venv").join("Scripts").join("python.exe")
         } else {
-            solver.join(".venv/bin/python")
+            solver.join(".venv").join("bin").join("python")
         };
         std::fs::create_dir_all(python.parent().unwrap()).unwrap();
         std::fs::write(&python, b"test executable placeholder").unwrap();

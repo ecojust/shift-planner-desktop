@@ -101,7 +101,24 @@ jobs:
       - name: Freeze and self-test native solver
         run: npm run solver:build
       - name: Test Rust process lifecycle
-        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+        run: |
+          node --input-type=module <<'NODE'
+          import { spawn } from 'node:child_process';
+          let tail = '';
+          const child = spawn('cargo', ['test', '--locked', '--manifest-path', 'src-tauri/Cargo.toml', '--lib'], { stdio: ['ignore', 'pipe', 'pipe'] });
+          for (const stream of [child.stdout, child.stderr]) stream.on('data', bytes => {
+            process.stdout.write(bytes);
+            tail = (tail + bytes.toString('utf8')).slice(-24000);
+          });
+          child.once('error', error => { console.error(error); process.exitCode = 1; });
+          child.once('close', code => {
+            if (code !== 0) {
+              const escaped = tail.replaceAll('%', '%25').replaceAll('\r', '%0D').replaceAll('\n', '%0A');
+              console.log(`::error title=Rust test diagnostics::${escaped}`);
+            }
+            process.exitCode = code ?? 1;
+          });
+          NODE
       - name: Verify development Python integration
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib python_source_solver_solves_real_schedule -- --ignored --nocapture
       - name: Verify native directory runtime integration
