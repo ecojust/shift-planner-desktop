@@ -1,0 +1,59 @@
+name: Build desktop installers
+
+# Native builds only. This workflow does not publish a release or deploy a site.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    name: Desktop (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Show native build platform
+        run: rustc -vV
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Prepare bundled solver
+        run: npm run solver:setup
+      - name: Test frontend rules
+        run: npm test
+      - name: Test CP-SAT solver
+        run: npm run solver:test
+      - name: Freeze native solver
+        run: npm run solver:build
+      - name: Test desktop process bridge
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - name: Verify development Python integration
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib python_source_solver_solves_real_schedule -- --ignored --nocapture
+      - name: Verify native frozen solver integration
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib frozen_sidecar_solves_real_schedule -- --ignored --nocapture
+      - name: Build desktop app
+        run: npm run desktop:build
+      - name: Upload installers and solver manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: shift-flow-${{ matrix.os }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.dmg
+            solver/build/*/manifest.json

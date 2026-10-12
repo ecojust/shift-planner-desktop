@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+test-results/
+
+solver/.venv/
+solver/build/
+**/__pycache__/
+src-tauri/target/
+src-tauri/binaries/shiftflow-solver-*
+src-tauri/solver-runtime/*
+!src-tauri/solver-runtime/.gitkeep

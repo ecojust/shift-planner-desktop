@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-window",
+  "description": "Main window core access only; solver and file pickers are limited Rust commands.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

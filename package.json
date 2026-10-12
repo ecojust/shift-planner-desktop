@@ -1,0 +1,39 @@
+{
+  "name": "shift-flow",
+  "private": true,
+  "version": "1.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "typecheck": "vue-tsc --noEmit",
+    "build": "npm run typecheck && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node --test --test-isolation=none src/tests/*.test.mjs",
+    "solver:setup": "node scripts/setup-solver.mjs",
+    "solver:build": "node scripts/build-solver.mjs",
+    "solver:test": "node scripts/test-solver.mjs",
+    "solver:ensure": "node scripts/ensure-solver.mjs",
+    "solver:doctor": "node scripts/doctor-solver.mjs",
+    "desktop:prepare": "npm run solver:setup && npm run solver:build",
+    "predesktop:dev": "npm run solver:ensure -- --dev",
+    "desktop:dev": "tauri dev",
+    "predesktop:build": "npm run solver:ensure",
+    "desktop:build": "tauri build"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.3",
+    "fflate": "^0.8.2",
+    "vue": "^3.5.22"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.2",
+    "@types/node": "^24.7.0",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.1.9",
+    "vue-tsc": "^3.1.0"
+  }
+}

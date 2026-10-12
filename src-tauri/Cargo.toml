@@ -1,0 +1,29 @@
+[package]
+name = "shift-flow-desktop"
+version = "1.1.0"
+description = "排班时光 — 本地约束求解排班"
+authors = ["Shift Flow"]
+edition = "2021"
+rust-version = "1.90"
+
+[lib]
+name = "shift_flow_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "macros"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true
+panic = "abort"

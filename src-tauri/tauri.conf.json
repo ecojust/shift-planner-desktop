@@ -1,0 +1,48 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "排班时光",
+  "version": "1.1.0",
+  "identifier": "com.shiftflow.planner",
+  "build": {
+    "beforeDevCommand": "npm run dev -- --port 5190 --strictPort",
+    "beforeBuildCommand": "npm run solver:ensure && npm run build",
+    "devUrl": "http://localhost:5190",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "排班时光 · 本地智能排班",
+        "width": 1380,
+        "height": 900,
+        "minWidth": 800,
+        "minHeight": 600,
+        "backgroundColor": "#f4f7fb",
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ipc: http://ipc.localhost; object-src 'none'; base-uri 'self'; frame-src 'none'",
+      "devCsp": "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src ipc: http://ipc.localhost http://localhost:5190 ws://localhost:5190; object-src 'none'; base-uri 'self'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Productivity",
+    "shortDescription": "本地离线员工排班与约束求解",
+    "longDescription": "自定义班次、人员互斥、休假、公平轮班、法定节假日津贴及 Excel 导出。OR-Tools CP-SAT 求解器随桌面应用本地运行，无需另装 Python。",
+    "resources": {"solver-runtime/": "solver-runtime/"},
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "windows": {
+      "nsis": {
+        "displayLanguageSelector": false,
+        "languages": ["SimpChinese", "English"]
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

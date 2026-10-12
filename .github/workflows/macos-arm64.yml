@@ -1,0 +1,114 @@
+name: Build macOS Apple Silicon installer
+
+# Manual, native Apple Silicon build. No release creation or deployment.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64:
+    name: macOS 15 · Apple Silicon
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Require native ARM64 build tools
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(rustc -vV | sed -n 's/^host: //p')" = aarch64-apple-darwin
+          python -c 'import platform, sys; assert sys.platform == "darwin" and platform.machine() == "arm64"; print(sys.version); print(platform.platform())'
+          rustc -vV
+          xcrun --show-sdk-path
+          # Reuse this exact setup-python interpreter when creating the venv.
+          printf 'SHIFT_FLOW_PYTHON=%s\n' "$(command -v python)" >> "$GITHUB_ENV"
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Prepare local Python solver
+        run: npm run solver:ensure -- --dev
+      - name: Test frontend rules and process helpers
+        run: npm test
+      - name: Type-check and build the Vue interface
+        run: npm run build
+      - name: Test real CP-SAT constraints
+        run: npm run solver:test
+      - name: Build and self-test complete ARM64 runtime
+        run: npm run solver:build
+      - name: Test Rust process lifecycle
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Verify development Python integration
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib python_source_solver_solves_real_schedule -- --ignored --nocapture
+      - name: Verify directory runtime integration
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib frozen_sidecar_solves_real_schedule -- --ignored --nocapture
+      - name: Build app and DMG
+        run: npm run desktop:build -- --bundles app,dmg
+      - name: Verify solver inside the actual app bundle
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdirSync, mkdirSync, writeFileSync } from 'node:fs';
+          import { resolve, join } from 'node:path';
+          import { execFileSync } from 'node:child_process';
+          import { captureFrozen, parseFrozenInfo } from './scripts/frozen-process.mjs';
+
+          const bundleDirectory = resolve('src-tauri/target/release/bundle/macos');
+          const apps = readdirSync(bundleDirectory).filter(name => name.endsWith('.app'));
+          if (apps.length !== 1) throw new Error(`Expected one app bundle, found ${apps.length}`);
+          const app = join(bundleDirectory, apps[0]);
+          const runtime = join(app, 'Contents', 'Resources', 'solver-runtime');
+          const solver = join(runtime, 'shiftflow-solver');
+          const main = join(app, 'Contents', 'MacOS', 'shift-flow-desktop');
+          const architecture = executable => {
+            const result = execFileSync('/usr/bin/file', ['-b', executable], { encoding: 'utf8' }).trim();
+            if (!result.includes('arm64')) throw new Error(`Not an ARM64 executable: ${executable}: ${result}`);
+            return result;
+          };
+          const mainArchitecture = architecture(main);
+          const solverArchitecture = architecture(solver);
+          const infoRun = await captureFrozen(solver, ['--info', '--hosted'], { cwd: runtime });
+          const info = parseFrozenInfo(infoRun);
+          const testRun = await captureFrozen(solver, ['--self-test', '--hosted'], { cwd: runtime });
+          const selfTest = parseFrozenInfo(testRun, true);
+          const report = {
+            target: 'aarch64-apple-darwin', os: 'macos-15',
+            commit: process.env.GITHUB_SHA, generatedAt: new Date().toISOString(),
+            mainArchitecture, solverArchitecture, info, selfTest,
+            startupSeconds: infoRun.elapsedSeconds, selfTestSeconds: testRun.elapsedSeconds,
+            checkedInstalledResourceLayout: true,
+            developerIdSigned: false, notarized: false,
+          };
+          mkdirSync('artifacts', { recursive: true });
+          writeFileSync('artifacts/native-validation.json', `${JSON.stringify(report, null, 2)}\n`);
+          console.log(JSON.stringify(report, null, 2));
+          NODE
+      - name: Archive app preserving links and copy installer
+        run: |
+          apps=(src-tauri/target/release/bundle/macos/*.app)
+          dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
+          test "${#apps[@]}" -eq 1
+          test "${#dmgs[@]}" -eq 1
+          # ditto preserves the app's links and metadata; upload the archive, not loose app files.
+          ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" artifacts/shift-flow-macos-arm64.app.zip
+          cp "${dmgs[0]}" artifacts/shift-flow-macos-arm64.dmg
+          cp solver/build/aarch64-apple-darwin/manifest.json artifacts/solver-manifest.json
+          shasum -a 256 artifacts/*.dmg artifacts/*.zip > artifacts/SHA256SUMS
+      - name: Upload verified ARM64 installer and app archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: shift-flow-macos-arm64
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          path: artifacts/
