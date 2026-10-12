@@ -3,6 +3,11 @@ name: Build desktop installers
 # Native builds for all three architectures, then publish one verified release.
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish a release after all platform checks pass
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -57,6 +62,10 @@ jobs:
           python-version: '3.12'
           architecture: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: ${{ matrix.id }}
       - name: Verify native Node, Python and Rust architecture
         run: |
           node --input-type=module <<'NODE'
@@ -148,6 +157,7 @@ jobs:
   release:
     name: Publish all verified desktop installers
     needs: desktop
+    if: ${{ inputs.publish_release }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
