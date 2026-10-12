@@ -1,0 +1,58 @@
+name: Diagnose published macOS download
+
+# Read-only diagnostics. No signing, notarization, repackaging or publishing.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Published release containing the ARM64 DMG
+        type: string
+        default: desktop-v1.1.0-38277333420
+      asset_name:
+        description: Exact published ARM64 disk image asset name
+        type: string
+        default: shift-flow-macos-arm64.dmg
+      attempt_launch:
+        description: Observe direct app startup for eight seconds if no quarantine is present
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    name: Read-only ARM64 disk-image and code-signing diagnosis
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Inspect exact published download and preserve all evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIAGNOSTIC_REPO: ${{ github.repository }}
+          DIAGNOSTIC_TAG: ${{ inputs.release_tag }}
+          DIAGNOSTIC_ASSET: ${{ inputs.asset_name }}
+          DIAGNOSTIC_LAUNCH: ${{ inputs.attempt_launch }}
+        run: |
+          node scripts/diagnose-macos-download.mjs \
+            --repo "$DIAGNOSTIC_REPO" \
+            --tag "$DIAGNOSTIC_TAG" \
+            --asset "$DIAGNOSTIC_ASSET" \
+            --launch "$DIAGNOSTIC_LAUNCH" \
+            --output artifacts/macos-download-diagnostics
+      - name: Upload full code-signing and disk-image diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-download-diagnostics-${{ github.run_id }}
+          path: artifacts/macos-download-diagnostics/
+          if-no-files-found: warn
+          retention-days: 14
