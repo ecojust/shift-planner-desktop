@@ -137,46 +137,33 @@ jobs:
           assert.equal(report.minimum_system_assessment.declaration_understates_observed_minimum, false);
           console.log(JSON.stringify(report.summary, null, 2));
           NODE
-      - name: Verify a complete demo month through the final app runtime
+      - name: Verify hour limits and weekday weights through the final app runtime
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
           import { readdirSync, writeFileSync } from 'node:fs';
           import { resolve, join } from 'node:path';
-          import { makeDefaultState } from './src/defaults.ts';
-          import { validateSchedule } from './src/scheduler.ts';
           import { captureFrozen } from './scripts/frozen-process.mjs';
+          import { verifyScheduleFixtures } from './scripts/verify-desktop-bundle.mjs';
           import { validateBuildVersion } from './scripts/build-version.ts';
           const directory = resolve('src-tauri/target/release/bundle/macos');
           const apps = readdirSync(directory).filter(name => name.endsWith('.app'));
           assert.equal(apps.length, 1);
           const runtime = join(directory, apps[0], 'Contents', 'Resources', 'solver-runtime');
-          const state = makeDefaultState('2026-10');
-          state.assignments = [];
-          assert.equal(state.employees.length, 12);
-          assert.deepEqual(state.shifts.map(shift => shift.required), [2, 2, 1]);
-          const requestId = `macos-release-${process.env.GITHUB_RUN_ID}`;
-          const request = { protocolVersion: 1, requestId, state, options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010 } };
-          const execution = await captureFrozen(join(runtime, 'shiftflow-solver'), ['--hosted'], {
-            cwd: runtime, input: JSON.stringify(request),
-            startupTimeoutMs: 120_000, solveTimeoutMs: 20_000, finishTimeoutMs: 5_000,
-          });
-          const result = JSON.parse(execution.stdout);
-          assert.equal(result.protocolVersion, 1);
-          assert.equal(result.requestId, requestId);
-          assert.equal(result.engine, 'ortools-cp-sat');
-          assert.ok(['OPTIMAL', 'FEASIBLE'].includes(result.status), result.message);
-          assert.equal(result.assignments.length, 155);
-          assert.equal(result.stats.shortageCount, 0);
-          const issues = validateSchedule({ ...state, assignments: result.assignments });
-          assert.deepEqual(issues, []);
+          const { state, result, execution, independentRuleIssues, constraintChecks } = await verifyScheduleFixtures(
+            request => captureFrozen(join(runtime, 'shiftflow-solver'), ['--hosted'], {
+              cwd: runtime, input: JSON.stringify(request),
+              startupTimeoutMs: 120_000, solveTimeoutMs: 20_000, finishTimeoutMs: 5_000,
+            }),
+            `macos-release-${process.env.GITHUB_RUN_ID}`,
+          );
           const report = {
             buildCommit: process.env.GITHUB_SHA, buildRun: process.env.GITHUB_RUN_ID,
             buildVersion: validateBuildVersion(process.env.SHIFT_FLOW_BUILD_VERSION),
-            target: 'aarch64-apple-darwin', fixture: 'Built-in demo; no user data',
+            target: 'aarch64-apple-darwin', fixture: '12-person staffing fixture with zero hour minimums; no user data',
             month: state.month, employeeCount: 12, shiftsPerDay: [2, 2, 1], searchLimitSeconds: 5,
             status: result.status, assignmentCount: result.assignments.length,
-            shortageCount: result.stats.shortageCount, independentRuleIssues: issues,
+            shortageCount: result.stats.shortageCount, independentRuleIssues, constraintChecks,
             solverStats: result.stats, elapsedSeconds: execution.elapsedSeconds,
             stages: execution.stages, checkedAppRuntime: true,
           };

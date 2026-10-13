@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { checkDesktopResult } from '../DesktopSolver.ts'
+import { generateSchedule } from '../scheduler.ts'
 
 function fixture(allowPartial = true) {
   return { protocolVersion: 1, requestId: 'test-request', options: { timeLimitSeconds: 5, allowPartial, seed: 1 }, state: {
@@ -114,4 +115,41 @@ test('valid results survive a host exit-cleanup timeout with a precise notice', 
   assert.equal(checked.success, true)
   assert.match(checked.message, /有效结果已保存/)
   assert.match(checked.message, /退出清理超时/)
+})
+
+test('native claimed success cannot bypass monthly or prorated weekly minimums, even with shortage allowed', () => {
+  for (const field of ['minHoursPerMonth', 'minHoursPerWeek']) {
+    const request = fixture(true)
+    request.state.employees[0][field] = 8
+    const checked = checkDesktopResult(request, result(request))
+    assert.equal(checked.success, false)
+    assert.equal(checked.assignments, undefined)
+    assert.ok(checked.issues.some(issue => issue.type === (field === 'minHoursPerMonth' ? 'monthly-min-hours' : 'weekly-min-hours')))
+  }
+})
+
+test('unresolved reference-based minimum is independently enforced against forged native output', () => {
+  const request = fixture(true)
+  request.state.employees[0].minHoursPerMonth = null
+  request.state.monthlyReferenceHours = { '2026-10': 16 }
+  const checked = checkDesktopResult(request, result(request, { assignments: [{ employeeId: 'e1', date: '2026-10-01', shiftId: 'day', locked: false }] }))
+  assert.equal(checked.success, false)
+  assert.match(checked.message, /月最低工时 16/)
+})
+
+test('native weekday quotas are independently checked even when partial staffing is allowed', () => {
+  const request = fixture(true)
+  request.state.month = '2027-02'
+  request.state.rules = { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [1, 6], percent: 40 } }
+  request.state.employees = Array.from({ length: 3 }, (_, i) => ({ ...request.state.employees[0], id: `e${i}`, unavailableDates: [], maxHoursPerWeek: 168 }))
+  const generated = generateSchedule(request.state, 17)
+  assert.equal(generated.success, true)
+  assert.equal(checkDesktopResult(request, result(request, { assignments: generated.assignments })).success, true)
+  for (const allowPartial of [false, true]) {
+    request.options.allowPartial = allowPartial
+    const checked = checkDesktopResult(request, result(request, { assignments: generated.assignments.slice(1) }))
+    assert.equal(checked.success, false)
+    assert.equal(checked.assignments, undefined)
+    assert.ok(checked.issues.some(issue => issue.type === 'weekday-quota'))
+  }
 })
