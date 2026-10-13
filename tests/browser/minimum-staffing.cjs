@@ -113,7 +113,7 @@ async function main() {
   async function generate() {
     await navigate('排班日历')
     await page.getByRole('button', { name: '自动排班', exact: true }).click()
-    assert.match(await page.locator('.sp-generation-summary').innerText(), /至少需要/)
+    assert.match(await page.locator('.sp-generation-summary').innerText(), /需求 \d+ 个班位/)
     await page.getByRole('button', { name: '开始生成', exact: true }).click()
     await page.locator('.sp-solve-result').waitFor({ timeout: 45000 })
     const text = await page.locator('.sp-solve-result').innerText()

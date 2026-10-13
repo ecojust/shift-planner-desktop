@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { checkDesktopResult } from '../DesktopSolver.ts'
-import { generateSchedule } from '../scheduler.ts'
+import { datesOfMonth, generateSchedule } from '../scheduler.ts'
 
 function fixture(allowPartial = true) {
   return { protocolVersion: 1, requestId: 'test-request', options: { timeLimitSeconds: 5, allowPartial, seed: 1 }, state: {
@@ -48,6 +48,79 @@ test('short staffing can only be accepted when explicitly allowed', () => {
   assert.match(decision.message, /31 个班次存在缺编/)
   assert.match(decision.message, /尚未证明最优/)
 })
+
+function fixedStaffingFixture(allowPartial = false, required = 1) {
+  const request = fixture(allowPartial)
+  request.state.shifts[0] = { ...request.state.shifts[0], required, staffingMode: 'fixed' }
+  request.state.employees = ['e1', 'e2'].map(id => ({ ...request.state.employees[0], id, name: id, unavailableDates: [], maxHoursPerWeek: 168 }))
+  request.state.rules = { minRestHours: 0, maxConsecutiveDays: 31 }
+  return request
+}
+function exactFixedRoster(request) {
+  return request.state.shifts[0].required === 0 ? [] : datesOfMonth(request.state.month).map(date => ({ employeeId: 'e1', date, shiftId: 'day', locked: false }))
+}
+
+test('forged native FEASIBLE output cannot exceed fixed staffing even when shortages are allowed', () => {
+  for (const allowPartial of [false, true]) for (const required of [0, 1]) {
+    const request = fixedStaffingFixture(allowPartial, required)
+    const assignments = [...exactFixedRoster(request), { employeeId: required ? 'e2' : 'e1', date: '2026-10-01', shiftId: 'day', locked: false }]
+    const checked = checkDesktopResult(request, result(request, {
+      assignments, issues: [], stats: { wallTimeSeconds: 1, shortageCount: 0, optimal: false },
+    }))
+    assert.equal(checked.success, false, `fixed=${required}, allowPartial=${allowPartial}`)
+    assert.equal(checked.assignments, undefined)
+    assert.ok(checked.issues.some(issue => issue.type === 'overstaffed' && issue.severity === 'error' && issue.date === '2026-10-01'))
+    assert.match(checked.message, /超出固定人数/)
+    assert.deepEqual(request.state.assignments, [], 'checking a forged response must not write into the original state')
+  }
+})
+
+test('a fixed-staffing shortage requires explicit allowPartial rather than trusting native shortage stats', () => {
+  for (const allowPartial of [false, true]) {
+    const request = fixedStaffingFixture(allowPartial)
+    const assignments = exactFixedRoster(request).filter(item => item.date !== '2026-10-15')
+    const checked = checkDesktopResult(request, result(request, {
+      assignments, issues: [], stats: { wallTimeSeconds: 1, shortageCount: 0, optimal: false },
+    }))
+    assert.equal(checked.success, allowPartial)
+    assert.deepEqual(checked.issues.map(issue => [issue.type, issue.severity]), [['coverage', 'warning']])
+    if (allowPartial) {
+      assert.deepEqual(checked.assignments, assignments)
+      assert.match(checked.message, /1 个班次存在缺编/)
+    } else {
+      assert.equal(checked.assignments, undefined)
+      assert.match(checked.message, /岗位缺口/)
+    }
+  }
+})
+
+test('independently valid exact fixed staffing is accepted including fixed zero', () => {
+  for (const allowPartial of [false, true]) for (const required of [0, 1]) {
+    const request = fixedStaffingFixture(allowPartial, required)
+    const assignments = exactFixedRoster(request)
+    const checked = checkDesktopResult(request, result(request, { assignments }))
+    assert.equal(checked.success, true, `fixed=${required}, allowPartial=${allowPartial}`)
+    assert.deepEqual(checked.issues, [])
+    assert.deepEqual(checked.assignments, assignments)
+    assert.match(checked.message, /所有岗位已覆盖/)
+  }
+})
+
+test('preserved other-month staffing is not retroactively capped by the current fixed limit', () => {
+  for (const allowPartial of [false, true]) {
+    const request = fixedStaffingFixture(allowPartial)
+    request.state.assignments = ['2026-09-28', '2026-11-03'].flatMap(date => ['e1', 'e2'].map(employeeId => ({ employeeId, date, shiftId: 'day', locked: employeeId === 'e2' })))
+    const historical = structuredClone(request.state.assignments)
+    const assignments = [...historical, ...exactFixedRoster(request)]
+    const checked = checkDesktopResult(request, result(request, { assignments }))
+    assert.equal(checked.success, true)
+    assert.deepEqual(checked.issues, [])
+    assert.deepEqual(checked.assignments, assignments)
+    assert.deepEqual(request.state.assignments, historical)
+    assert.equal(checked.assignments.filter(item => item.date === '2026-09-28').length, 2, 'two historical staff remain valid despite the current fixed one-person limit')
+  }
+})
+
 test('locked days off and other months must remain intact', () => {
   const request = fixture()
   request.state.assignments.push({ employeeId: 'e1', date: '2026-10-03', shiftId: 'off', locked: true })

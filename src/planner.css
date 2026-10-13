@@ -27,7 +27,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-help { display: flex; align-items: center; width: 100%; min-height: 42px; gap: 10px; padding: 10px 13px; border: 0; border-radius: 8px; background: none; font-size: 12px; color: #667b6e !important; }
 .sp-help:hover { background: #edf2ed; }
 .sp-main { margin-left: 218px; min-width: 0; }
-.sp-topbar { min-height: 64px; display: flex; justify-content: space-between; align-items: center; gap: 14px; padding: 0 28px; border-bottom: 1px solid #e3e9e4; background: #fff; }
+.sp-topbar { position: sticky; top: 0; z-index: 20; min-height: 68px; display: grid; grid-template-columns: minmax(80px, 1fr) auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 6px 28px; border-bottom: 1px solid #e3e9e4; background: #fff; }
+.sp-global-month { display: flex; align-items: center; gap: 3px; min-width: 0; }
+.sp-global-month label { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px; color: #65786e; white-space: nowrap; }
+.sp-global-month input { min-width: 0; width: 145px; min-height: 40px; padding: 7px 8px; border: 1px solid #d9e2da; border-radius: 6px; background: #f8faf8; color: #245b4e; font-weight: 600; font-size: 13px; }
+.sp-global-month .sp-icon-button { width: 40px; height: 40px; flex-shrink: 0; }
+.sp-current-month { flex-shrink: 0; min-height: 40px; border: 0; border-radius: 6px; padding: 0 9px; background: transparent; font-size: 12px; }
+.sp-current-month:hover { background: #edf4f0; }
+.sp-generation-advanced { margin: 16px 0; padding: 12px 0; border-block: 1px solid #e4eae5; }
+.sp-generation-advanced summary { cursor: pointer; font-weight: 600; }
+.sp-generation-advanced summary span { display: inline-block; margin-left: 12px; color: #6c8074; font-weight: 400; font-size: 11px; }
+.sp-generation-advanced .sp-solver-options { margin-bottom: 0; }
+summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-breadcrumb { display: flex; align-items: center; gap: 12px; font-size: 12px; color: #809086; white-space: nowrap; }
 .sp-breadcrumb strong { font-weight: 500; color: #53675b; }
 .sp-top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 20px; min-width: 0; }
@@ -56,13 +67,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-calendar-card { border: 1px solid #e3eae5; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 3px 10px #314b3d03; }
 .sp-calendar-toolbar { display: flex; justify-content: space-between; align-items: center; min-height: 68px; padding: 14px 18px; gap: 10px; }
 .sp-date-controls { display: flex; align-items: center; gap: 15px; }
-.sp-month-label { position: relative; display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 650; cursor: pointer; }
+.sp-month-label { display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 650; white-space: nowrap; }
 .sp-month-label svg { color: #7c8e81; }
-.sp-month-label input { position: absolute; inset: 0; opacity: 0; width: 100%; cursor: pointer; }
-.sp-month-label input::-webkit-calendar-picker-indicator { width: 100%; position: absolute; inset: 0; cursor: pointer; }
 .sp-arrows { display: flex; gap: 1px; }
 .sp-flip { transform: rotate(180deg); }
-.sp-today { border: 1px solid #e3eae5; background: #fff; border-radius: 5px; height: 26px; padding: 0 9px; font-size: 10px; }
 .sp-period { color: #a2aea5; font-size: 10px; }
 .sp-view-toggle { display: flex; background: #f2f5f3; border: 1px solid #ecf0ed; padding: 3px; border-radius: 7px; }
 .sp-view-toggle button { border: none; background: none; font-size: 10px; color: #94a098; padding: 6px 13px; border-radius: 4px; white-space: nowrap; }
@@ -242,12 +250,15 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .sp-sidebar { width: 198px; padding-left: 12px; padding-right: 12px; }
   .sp-main { margin-left: 198px; }
   .sp-brand { font-size: 21px; gap: 8px; padding: 0 4px; }
-  .sp-content { padding: 22px; }.sp-topbar { padding: 0 22px; }
+  .sp-content { padding: 22px; }.sp-topbar { padding: 6px 22px; }.sp-save-indicator { display: none; }
   .sp-overview > div { gap: 6px; padding: 14px; }.sp-overview > div > span { flex-basis: 100%; }
   .sp-period { display: none; }.sp-legend { gap: 10px; }
   .sp-toast { left: calc(50% + 99px); }
 }
 @media (max-width: 1020px) {
+  .sp-topbar { grid-template-columns: minmax(0, 1fr) auto; padding-block: 8px; gap: 6px 12px; }
+  .sp-global-month { grid-column: 1 / -1; grid-row: 2; justify-content: center; }
+  .sp-top-actions { grid-column: 2; grid-row: 1; }
   .sp-top-actions { gap: 12px; }.sp-save-indicator { display: none; }
   .sp-filterbar { flex-wrap: wrap; }.sp-schedule-table { min-width: 820px; }
   .sp-overview dt { flex-basis: 100%; }.sp-overview > div > span { white-space: normal; }
@@ -255,20 +266,27 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media (max-width: 760px) {
   .sp-sidebar { transform: translateX(-100%); transition: transform .2s; width: 235px; z-index: 60; }.sp-sidebar.is-open { transform: translateX(0); }
   .sp-main { margin-left: 0; }.sp-nav-scrim { display: block; position: fixed; inset: 0; z-index: 55; border: 0; background: #16312766; backdrop-filter: blur(2px); }
-  .sp-mobile-toggle { display: inline-flex; }.sp-topbar { min-height: 58px; padding: 0 12px; gap: 8px; }
+  .sp-topbar .sp-mobile-toggle { display: inline-flex; width: 44px; height: 44px; }.sp-topbar { min-height: 104px; padding: 4px 12px 8px; gap: 2px 8px; grid-template-columns: minmax(0, 1fr) auto; }
+  .sp-global-month { grid-column: 1 / -1; grid-row: 2; justify-content: center; }
+  .sp-global-month label { gap: 6px; }.sp-global-month label > span { font-size: 10px; }
+  .sp-global-month input { width: 155px; min-height: 44px; }
+  .sp-global-month .sp-icon-button { width: 44px; height: 44px; }
+  .sp-current-month { min-height: 44px; padding: 0 7px; }
+  .sp-top-actions { grid-column: 2; grid-row: 1; }
   .sp-breadcrumb { gap: 6px; font-size: 12px; }.sp-breadcrumb > span, .sp-breadcrumb > svg { display: none; }
   .sp-top-actions { gap: 0; }.sp-build-version { gap: 5px; }.sp-build-version > span { display: none; }.sp-build-version code { font-size: 10px; padding: 5px 6px; }
   .sp-content { padding: 18px 12px; }.sp-page-heading { gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }.sp-page-heading h1 { font-size: 23px; }
   .sp-heading-actions { width: 100%; }.sp-heading-actions .sp-button { flex: 1; min-height: 42px; }
   .sp-overview { margin-bottom: 16px; }.sp-overview > div { padding: 12px 10px; gap: 5px; }.sp-overview dt { font-size: 11px; }.sp-overview dd { font-size: 22px; }.sp-overview > div > span { font-size: 10px; }
   .sp-calendar-toolbar { padding: 12px; flex-wrap: wrap; }.sp-date-controls { gap: 6px; }.sp-month-label { font-size: 14px; }.sp-view-toggle { margin-left: auto; }.sp-view-toggle button { min-height: 32px; }
-  .sp-icon-button { width: 36px; height: 36px; }.sp-today { height: 34px; }.sp-calendar-card { border-radius: 10px; }
+  .sp-icon-button { width: 36px; height: 36px; }.sp-calendar-card { border-radius: 10px; }
   .sp-filterbar { padding: 0 12px 10px; gap: 8px; }.sp-filters { gap: 6px; flex: 1; min-width: 0; }.sp-search { flex: 1; min-width: 0; min-height: 38px; }.sp-search input { width: 100%; min-width: 0; font-size: 12px; }.sp-filters select { max-width: 130px; min-height: 38px; font-size: 12px; }
   .sp-legend { width: 100%; justify-content: flex-end; gap: 12px; }.sp-schedule-table { min-width: 820px; }.sp-schedule-table .sp-person-col { width: 142px; padding-left: 12px; padding-right: 8px; }.sp-person { gap: 6px; }.sp-person-avatar { height: 28px; width: 28px; }.sp-person strong { font-size: 12px; }.sp-person small { font-size: 9px; }
   .sp-calendar-bottom { padding: 8px 12px; font-size: 10px; }.sp-check-status { min-height: 36px; }
   .sp-toast { left: 50%; bottom: 15px; width: max-content; max-width: 92vw; }.sp-modal { padding: 22px 19px; border-radius: 14px; max-height: calc(100dvh - 30px); }.sp-overlay { padding: 15px 12px; }
   .sp-subheading { padding: 18px 14px; flex-wrap: wrap; }.sp-subheading p { font-size: 11px; }.sp-payroll-note { padding: 12px 14px; font-size: 11px; }.sp-issues small { display: none; }.sp-issues > button { align-items: flex-start; }
 }
+@media (max-width: 400px) { .sp-global-month label > span { display: none; } }
 @media print { .sp-main { margin: 0; }.sp-content { padding: 0; }.sp-check-status { display: none; } }
 
 /* Amounts stay readable over every shift colour; the gold glow is static. */

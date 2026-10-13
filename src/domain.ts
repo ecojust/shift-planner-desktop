@@ -19,7 +19,9 @@ export interface Shift {
   start: string
   end: string
   color: string
-  /** Daily minimum staffing, never a cap; zero still permits additional work. */
+  /** Missing in legacy data means minimum; fixed retains an upper bound even with shortages allowed. */
+  staffingMode?: 'minimum' | 'fixed'
+  /** Daily minimum or exact headcount according to staffingMode. */
   required: number
   /** Fixed yuan per person per shift, paid once on the start date; missing means 0. */
   normalAllowance?: number

@@ -15,8 +15,11 @@ def employee(eid, eligible=None, cap=48, leave=None, minimum_month=0, minimum_we
     return dict(id=eid, name=eid, role='', group='', color='#123456', minHoursPerMonth=minimum_month, minHoursPerWeek=minimum_week, maxHoursPerWeek=cap, eligibleShiftIds=eligible or ['early'], unavailableDates=leave or [])
 
 
-def shift(sid='early', start='08:00', end='16:00', required=1):
-    return dict(id=sid, name=sid, shortName=sid, color='#123456', start=start, end=end, required=required)
+def shift(sid='early', start='08:00', end='16:00', required=1, mode=None):
+    value = dict(id=sid, name=sid, shortName=sid, color='#123456', start=start, end=end, required=required)
+    if mode is not None:
+        value['staffingMode'] = mode
+    return value
 
 
 def state(employees=None, shifts=None, month='2026-10', assignments=None, **rules):
@@ -233,6 +236,144 @@ class SolverTest(unittest.TestCase):
         self.assertFeasible(result)
         self.assertEqual(result['assignments'], locked)
 
+    def test_fixed_staffing_has_exact_daily_coverage(self):
+        s = state(shifts=[shift(mode='fixed')])
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(len(result['assignments']), 31)
+        self.assert_daily_minimum(s, result['assignments'])
+
+    def test_fixed_and_minimum_shifts_can_mix_to_meet_employee_minimum_hours(self):
+        s = state(employees=[employee(str(i), ['early', 'late'], minimum_month=80) for i in range(4)],
+                  shifts=[shift(mode='fixed'), shift('late', '14:00', '22:00', 0, mode='minimum')])
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assertEqual(sum(a['shiftId'] == 'early' for a in result['assignments']), 31)
+        self.assertGreaterEqual(sum(a['shiftId'] == 'late' for a in result['assignments']), 9)
+        for eid in map(str, range(4)):
+            self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], eid)[0], 80 * 60)
+
+    def test_fixed_zero_never_generates_work_and_cannot_supply_minimum_hours(self):
+        old = assignment('a', '2026-10-01', locked=False)
+        s = state(employees=[employee('a')], shifts=[shift(required=0, mode='fixed')], assignments=[old])
+        original = copy.deepcopy(s)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(result['assignments'], [])
+        self.assertEqual(s, original)
+        s['employees'][0]['minHoursPerMonth'] = 8
+        for allow_partial in (False, True):
+            r = request(s); r['options']['allowPartial'] = allow_partial
+            result = solve(r)
+            self.assertEqual(result['status'], 'INFEASIBLE')
+            self.assertNotIn('assignments', result)
+        s['shifts'][0]['staffingMode'] = 'minimum'
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(len(result['assignments']), 1)
+
+    def test_fixed_zero_locked_work_is_a_hard_conflict_even_when_shortage_is_allowed(self):
+        locked = assignment('a', '2026-10-01')
+        s = state(shifts=[shift(required=0, mode='fixed')], assignments=[locked])
+        original = copy.deepcopy(s)
+        for allow_partial in (False, True):
+            r = request(s); r['options']['allowPartial'] = allow_partial
+            result = solve(r)
+            self.assertEqual(result['status'], 'INFEASIBLE')
+            self.assertNotIn('assignments', result)
+            self.assertTrue(any(item['type'] == 'overstaffed' for item in result['issues']))
+        self.assertEqual(s, original)
+
+    def test_fixed_locked_overstaffing_rejects_instead_of_removing_a_locked_employee(self):
+        locked = [assignment('a', '2026-10-01'), assignment('b', '2026-10-01')]
+        s = state(shifts=[shift(mode='fixed')], assignments=locked)
+        for allow_partial in (False, True):
+            r = request(s); r['options']['allowPartial'] = allow_partial
+            result = solve(r)
+            self.assertEqual(result['status'], 'INFEASIBLE')
+            self.assertNotIn('assignments', result)
+            self.assertTrue(any(item['type'] == 'overstaffed' for item in result['issues']))
+
+    def test_fixed_daily_count_cannot_expand_to_bypass_month_or_week_minimum_conflicts(self):
+        for minimum_month, minimum_week in ((160, 0), (0, 40)):
+            s = state(employees=[employee('a', minimum_month=minimum_month, minimum_week=minimum_week), employee('b', minimum_month=minimum_month, minimum_week=minimum_week)],
+                      shifts=[shift(mode='fixed')])
+            for allow_partial in (False, True):
+                r = request(s); r['options']['allowPartial'] = allow_partial
+                result = solve(r)
+                self.assertEqual(result['status'], 'INFEASIBLE')
+                self.assertNotIn('assignments', result)
+                if minimum_month:
+                    self.assertIn('320', result['issues'][0]['message'])
+                    self.assertIn('248', result['issues'][0]['message'])
+                    self.assertLess(result['stats']['wallTimeSeconds'], 1)
+
+    def test_all_fixed_zero_still_counts_actual_previous_month_night_carry_for_monthly_minimum(self):
+        history = assignment('a', '2026-09-30', 'night', False)
+        s = state(employees=[employee('a', ['night'], minimum_month=6)], shifts=[shift('night', '22:00', '06:00', 0, mode='fixed')], assignments=[history])
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(result['assignments'], [history])
+        self.assertEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 6 * 60)
+        s['employees'][0]['minHoursPerMonth'] = 7
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE')
+        self.assertIn('最多提供 6 小时', result['issues'][0]['message'])
+
+    def test_all_fixed_capacity_clips_outgoing_nights_and_adds_only_real_carry_in(self):
+        s = state(employees=[employee('a', ['night'], cap=168, minimum_month=243), employee('b', ['night'], cap=168)],
+                  shifts=[shift('night', '22:00', '06:00', 1, mode='fixed')])
+        s['rules']['maxConsecutiveDays'] = 32
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE')
+        self.assertIn('最多提供 242 小时', result['issues'][0]['message'])
+        s['assignments'] = [assignment('a', '2026-09-30', 'night', False)]
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 243 * 60)
+
+    def test_fixed_partial_allows_understaffing_but_preserves_the_daily_ceiling(self):
+        s = state(employees=[employee('a', cap=168), employee('b', cap=168)], shifts=[shift(required=3, mode='fixed')])
+        s['rules']['maxConsecutiveDays'] = 31
+        self.assertEqual(solve(request(s))['status'], 'INFEASIBLE')
+        r = request(s); r['options']['allowPartial'] = True
+        result = solve(r)
+        self.assertFeasible(result)
+        self.assertEqual(len(result['assignments']), 62)
+        self.assertEqual(result['stats']['shortageCount'], 31)
+        counts = {}
+        for a in result['assignments']:
+            counts[a['date']] = counts.get(a['date'], 0) + 1
+        self.assertEqual(set(counts.values()), {2})
+        self.assertTrue(all('固定人数' in item['message'] for item in result['issues']))
+
+    def test_legacy_missing_mode_and_explicit_minimum_both_allow_extra_assignments(self):
+        for mode in (None, 'minimum'):
+            s = state(employees=[employee('a', minimum_month=16)], shifts=[shift(required=0, mode=mode)])
+            result = solve(request(s))
+            self.assertFeasible(result)
+            self.assertEqual(len(result['assignments']), 2)
+
+    def test_invalid_staffing_modes_are_rejected_without_a_replacement(self):
+        for mode in (None, 0, 1, True, False, {}, [], '', 'Fixed', 'minimum ', 'maximum'):
+            with self.subTest(mode=mode):
+                s = state()
+                s['shifts'][0]['staffingMode'] = mode
+                result = solve(request(s))
+                self.assertEqual(result['status'], 'MODEL_INVALID')
+                self.assertNotIn('assignments', result)
+                self.assertIn('人数模式', result['message'])
+
+    def test_current_fixed_count_does_not_rewrite_outside_month_history(self):
+        history = [assignment('a', '2026-09-30', locked=False), assignment('b', '2026-09-30', locked=False)]
+        s = state(shifts=[shift(mode='fixed')], assignments=history)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertTrue(all(item in result['assignments'] for item in history))
+        self.assert_daily_minimum(s, result['assignments'])
+
     def test_extra_staffing_preserves_separation_and_cannot_relax_weekly_maxima(self):
         s = state(employees=[employee('a', minimum_month=160), employee('b', minimum_month=160)])
         s['rules']['separationGroups'] = [dict(id='g', name='分开', employeeIds=['a', 'b'], shiftIds=[])]
@@ -341,7 +482,11 @@ class SolverTest(unittest.TestCase):
         date = first
         while date.month == first.month:
             for item in s['shifts']:
-                self.assertGreaterEqual(counts.get((date.isoformat(), item['id']), 0), item['required'])
+                actual = counts.get((date.isoformat(), item['id']), 0)
+                if item.get('staffingMode', 'minimum') == 'fixed':
+                    self.assertEqual(actual, item['required'])
+                else:
+                    self.assertGreaterEqual(actual, item['required'])
             date += dt.timedelta(days=1)
 
     def assert_weighted_actual(self, s, assignments):
@@ -386,6 +531,43 @@ class SolverTest(unittest.TestCase):
         self.assertGreater(total, 14)  # 14 cannot cover both shifts on both selected weekdays.
         self.assertEqual(days.get('2026-02-02', 0) + days.get('2026-02-03', 0), (total * 20 + 99) // 100)
         self.assertTrue(all(count >= 7 for count in by_shift.values()))
+
+    def test_fixed_daily_capacity_cannot_be_exceeded_to_satisfy_hard_weekday_weights(self):
+        s = state(month='2026-06', employees=[employee('a', cap=168), employee('b', cap=168)], shifts=[shift(mode='fixed')])
+        s['rules'].update(weekdayWeights={'days': [1, 2], 'percent': 50}, minRestHours=0, maxConsecutiveDays=31)
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE')
+        self.assertNotIn('assignments', result)
+        r = request(s); r['options']['allowPartial'] = True
+        result = solve(r)
+        self.assertFeasible(result)
+        self.assert_weighted_actual(s, result['assignments'])
+        self.assertGreater(result['stats']['shortageCount'], 0)
+        counts = {}
+        for a in result['assignments']:
+            counts[a['date']] = counts.get(a['date'], 0) + 1
+        self.assertTrue(all(count <= 1 for count in counts.values()))
+
+    def test_mixed_staffing_modes_let_only_minimum_shift_expand_under_weekday_weights(self):
+        s = state(month='2026-06', employees=[employee(str(i), ['early', 'late'], cap=168) for i in range(4)],
+                  shifts=[shift(mode='fixed'), shift('late', '14:00', '22:00', 0, mode='minimum')])
+        s['rules'].update(weekdayWeights={'days': [1, 2], 'percent': 50}, minRestHours=0, maxConsecutiveDays=31)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+        self.assertEqual(sum(a['shiftId'] == 'early' for a in result['assignments']), 30)
+        self.assertTrue(any(a['shiftId'] == 'late' for a in result['assignments']))
+
+    @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
+    def test_mixed_staffing_mode_solution_matches_frontend_validator(self):
+        s = state(employees=[employee(str(i), ['early', 'late'], minimum_month=80) for i in range(4)],
+                  shifts=[shift(mode='fixed'), shift('late', '14:00', '22:00', 0, mode='minimum')])
+        result = solve(request(s))
+        self.assertFeasible(result)
+        check = Path(__file__).resolve().parent / 'crosscheck.mjs'
+        validation = subprocess.run(['node', str(check)], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        self.assertEqual(json.loads(validation.stdout), [])
 
     def test_partial_targets_preserve_user_example_shares_for_a_given_full_week_total(self):
         config = {'days': [1, 6], 'percent': 40}

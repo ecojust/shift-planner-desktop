@@ -143,6 +143,7 @@ function configurationIssues(state: PlannerState): Issue[] {
     shiftIds.add(shift.id)
     if (shiftHours(shift) <= 0) error(`${shift.name}的时间无效，开始和结束时间不能相同。`)
     if (!Number.isInteger(shift.required) || shift.required < 0) error(`${shift.name}的每日需求人数必须为非负整数。`)
+    if (shift.staffingMode !== undefined && shift.staffingMode !== 'minimum' && shift.staffingMode !== 'fixed') error(`${shift.name}的人数模式必须为“最少人数”或“固定人数”。`)
   }
   for (const employee of state.employees) {
     for (const id of employee.eligibleShiftIds) if (!shiftIds.has(id)) error(`${employee.name}关联了不存在的班次 ${id}。`)
@@ -190,6 +191,17 @@ export function validateSchedule(state: PlannerState): Issue[] {
     const staff = coverage.get(key) || new Set<string>()
     staff.add(employee.id)
     coverage.set(key, staff)
+  }
+  // Fixed staffing caps starts in the selected month; retained history is not
+  // retroactively capped, but still participates in rest and weekly-hour checks.
+  for (const [key, staff] of coverage) {
+    const separator = key.indexOf('|')
+    const date = key.slice(0, separator), shift = shifts.get(key.slice(separator + 1))!
+    if (!date.startsWith(`${state.month}-`)) continue
+    if (shift.staffingMode === 'fixed' && staff.size > shift.required) {
+      add('overstaffed', `${date} ${shift.name}超出固定人数 ${staff.size - shift.required} 人（已排 ${staff.size} / 每日固定 ${shift.required}），请调整手动或锁定排班。`)
+      issues[issues.length - 1]!.date = date
+    }
   }
   for (const group of state.rules.separationGroups || []) {
     for (const [key, staff] of coverage) {
@@ -255,12 +267,12 @@ export function validateSchedule(state: PlannerState): Issue[] {
       if (counts.length && Math.max(...counts) - Math.min(...counts) > 1) quotaIssue('weekday-balance', `${week.id} 起的一周，${label}应平摊排班人次；当前每天为 ${counts.join('、')} 人次，最多相差 1 人次。`)
     }
   }
-  // A shift's required headcount is a daily floor, including weighted weeks.
+  // Both staffing modes retain their daily floor, including weighted weeks.
   for (const date of datesOfMonth(state.month)) {
     for (const shift of state.shifts) {
       const count = coverage.get(`${date}|${shift.id}`)?.size || 0
       if (count < shift.required) {
-        add('coverage', `${date} ${shift.name}缺 ${shift.required - count} 人（已排 ${count} / 每日最少 ${shift.required}）。`, undefined, 'warning')
+        add('coverage', `${date} ${shift.name}缺 ${shift.required - count} 人（已排 ${count} / 每日${shift.staffingMode === 'fixed' ? '固定' : '最少'} ${shift.required}）。`, undefined, 'warning')
         issues[issues.length - 1]!.date = date
       }
     }
@@ -368,6 +380,7 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
   const weightExamples = weightedWeeks(state)
   const employeeIds = new Set(state.employees.map(employee => employee.id))
   const dailyMinimum = state.shifts.reduce((sum, shift) => sum + shift.required, 0)
+  const dailyMaximum = state.shifts.every(shift => shift.staffingMode === 'fixed') ? Math.min(dailyMinimum, state.employees.length) : state.employees.length
   let best = fixed, bestRank = [Infinity, Infinity, Infinity, Infinity]
   for (let attempt = 0; attempt < 32; attempt++) {
     const random = randomSource(seed + attempt * 7919)
@@ -385,7 +398,7 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
     // increasing legal budgets and validates the final actual counts independently.
     const weighted = weightExamples.map(example => {
       const requiredSlots = plans.reduce((sum, plan) => {
-        const longest = Math.max(0, ...state.shifts.filter(shift => plan.employee.eligibleShiftIds.includes(shift.id)).map(shift => shiftHours(shift) * 60))
+        const longest = Math.max(0, ...state.shifts.filter(shift => plan.employee.eligibleShiftIds.includes(shift.id) && (shift.staffingMode !== 'fixed' || shift.required > 0)).map(shift => shiftHours(shift) * 60))
         const needed = Math.max(minimumWeekMinutes(plan.employee, example.dates.length), monthMinimums.get(plan.employee.id)! * example.dates.length / dates.length)
         return sum + (longest ? Math.ceil(needed / longest) : 0)
       }, 0)
@@ -397,7 +410,7 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
           const group = rawDates as string[], total = rawTotal as number
           if (!group.length) return total === 0
           const low = Math.floor(total / group.length), high = Math.ceil(total / group.length)
-          if (low < dailyMinimum || high > state.employees.length) return false
+          if (low < dailyMinimum || high > dailyMaximum) return false
           let floor = 0, ceiling = 0
           for (const date of group) {
             const lockedWork = new Set(fixed.filter(item => item.date === date && shifts.has(item.shiftId)).map(item => item.employeeId)).size
@@ -445,6 +458,7 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
     const candidatesOn = (date: string, shiftList: Shift[], onlyPlan?: EmployeePlan) => {
       if (weighted.length && countOn(date) >= (dayTargets.get(date) ?? 0)) return []
       return shiftList.flatMap(shift => {
+        if (shift.staffingMode === 'fixed' && countOn(date, shift.id) >= shift.required) return []
         const prototype = workFor({ employeeId: '', date, shiftId: shift.id, locked: false }, shifts)!
         return (onlyPlan ? [onlyPlan] : plans).filter(plan => allowed(plan, prototype, state, assignments)).map(plan => ({ plan, prototype }))
       })
@@ -499,6 +513,6 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
   const issues = validateSchedule({ ...state, assignments: best })
   // A heuristic failing to meet a minimum is not proof the model is infeasible.
   // Keep the user's schedule; the local CP-SAT solver may still find a solution.
-  const success = !issues.some(issue => issue.type === 'monthly-min-hours' || issue.type === 'weekly-min-hours' || issue.type.startsWith('weekday-'))
+  const success = !issues.some(issue => issue.severity === 'error')
   return { assignments: success ? best : state.assignments.map(item => ({ ...item })), issues, success }
 }

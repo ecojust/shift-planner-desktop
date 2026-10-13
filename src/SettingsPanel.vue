@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import type { Employee, PlannerState, Rules, Shift } from './domain.ts'
 import type { PayrollSettings } from './payroll.ts'
 import type { DayKind } from './calendar.ts'
@@ -15,6 +15,8 @@ const limits = { employees: 200, shifts: 24, separationGroups: 200, monthlyRefer
 const feedback = ref('')
 const error = ref('')
 const editor = ref<'employee' | 'shift' | 'separation' | null>(null)
+const editorElement = ref<HTMLFormElement | null>(null)
+let editorTrigger: HTMLElement | null = null
 const allowanceShiftId = ref('')
 const allowanceDraft = ref<number | string>(0)
 const pendingDelete = ref<{ type: 'employee' | 'shift' | 'separation'; id: string; name: string } | null>(null)
@@ -25,7 +27,7 @@ const monthReference = computed(() => monthlyHoursReference(props.state))
 const referenceDraft = ref<number | string>(monthReference.value.hours)
 watch([() => props.state.month, () => monthReference.value.hours, () => monthReference.value.custom], () => {
   referenceDraft.value = monthReference.value.hours
-})
+}, { flush: 'sync' })
 type HoursDraft = { followReference: boolean; month: number | string; weekMin: number | string; weekMax: number | string; eligibleShiftIds: string[]; source: string; error: string }
 const hoursDrafts = reactive<Record<string, HoursDraft>>(Object.create(null))
 function hoursSource(employee: Employee) { return JSON.stringify([employee.minHoursPerMonth ?? null, employee.minHoursPerWeek ?? 0, employee.maxHoursPerWeek, [...employee.eligibleShiftIds].sort()]) }
@@ -86,7 +88,8 @@ function saveLeave(dates: string[]) {
   leaveEmployeeId.value = ''
   notice(`${employee.name}的请假已保存；已有排班（含锁定安排）保持不变，请检查请假冲突。`)
 }
-const shiftDraft = reactive<Shift>({ id: '', name: '', shortName: '', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, normalAllowance: 0 })
+const shiftDraft = reactive<Shift>({ id: '', name: '', shortName: '', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, staffingMode: 'minimum', normalAllowance: 0 })
+const shiftStaffingLabel = computed(() => shiftDraft.staffingMode === 'fixed' ? '每日固定人数' : '每日最少人数')
 const rulesDraft = reactive<Rules>({ ...props.state.rules })
 const weekdayOptions = [
   { value: 1, label: '星期一', short: '周一' }, { value: 2, label: '星期二', short: '周二' },
@@ -107,6 +110,7 @@ const weekdayExampleError = computed(() => String(weekdayExampleTotal.value).tri
 const weekdayPreviewWeeks = computed(() => weekdayExampleError.value ? [] : weightedWeeks(weekdayPreviewState.value, Number(weekdayExampleTotal.value)))
 const weekdayCapacity = computed(() => weekdayWeightCapacity(weekdayPreviewState.value))
 const weekdayMinimum = computed(() => props.state.shifts.reduce((sum, shift) => sum + shift.required, 0) * 7)
+const weekdayMaximum = computed(() => props.state.shifts.some(shift => shift.staffingMode !== 'fixed') ? props.state.employees.length * 7 : Math.min(props.state.employees.length * 7, weekdayMinimum.value))
 const weekdayExampleBelowMinimum = computed(() => weekdayPreviewWeeks.value.some(week => week.dates.some(date => weightedDayRange(week, date)[0] < weekdayMinimum.value / 7)))
 const weekdayFullSelected = computed(() => Math.ceil(Number(weekdayExampleTotal.value) * Number(weekdayPercent.value) / 100))
 const weekdaySelectedLabel = computed(() => weekdayOptions.filter(day => weekdayDays.value.includes(day.value)).map(day => day.short).join('、'))
@@ -136,7 +140,7 @@ const shiftDuration = computed(() => {
   return Number((minutes / 60).toFixed(2))
 })
 watch([() => props.section, () => props.state, () => props.payroll], () => {
-  editor.value = null; allowanceShiftId.value = ''; leaveEmployeeId.value = ''; pendingDelete.value = null; feedback.value = ''; error.value = ''
+  editor.value = null; editorTrigger = null; allowanceShiftId.value = ''; leaveEmployeeId.value = ''; pendingDelete.value = null; feedback.value = ''; error.value = ''
   resetRules()
 })
 function notice(message: string) { feedback.value = message; error.value = ''; emit('change') }
@@ -156,14 +160,6 @@ function validHours(value: unknown, max: number, label: string) {
   }
   return true
 }
-function changeReferenceMonth(event: Event) {
-  const input = event.target as HTMLInputElement
-  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(input.value) || Number(input.value.slice(0, 4)) < 1) {
-    input.value = props.state.month; error.value = '请选择有效的月份，年份为 0001–9999。'; return
-  }
-  props.state.month = input.value
-  error.value = ''; feedback.value = ''; emit('change')
-}
 function saveReferenceHours() {
   if (!validHours(referenceDraft.value, 744, '月参考工时')) return
   const overrides = props.state.monthlyReferenceHours ?? {}
@@ -177,10 +173,26 @@ function resetReferenceHours() {
   props.state.monthlyReferenceHours = overrides
   notice(`${props.state.month} 已恢复按月工作日 × 8 小时计算参考工时。`)
 }
-function openEmployee(employee?: Employee) {
+function openInlineEditor(kind: 'employee' | 'shift' | 'separation', event?: Event) {
+  editorTrigger = event?.currentTarget instanceof HTMLElement ? event.currentTarget : document.activeElement instanceof HTMLElement ? document.activeElement : null
+  editor.value = kind
+  void nextTick(() => {
+    if (editor.value !== kind || !editorElement.value) return
+    editorElement.value.scrollIntoView({ block: 'start', behavior: 'auto' })
+    editorElement.value.querySelector<HTMLInputElement>('input:not([disabled]):not([type="hidden"])')?.focus({ preventScroll: true })
+  })
+}
+function closeEditor() {
+  const trigger = editorTrigger
+  editor.value = null; editorTrigger = null; error.value = ''
+  void nextTick(() => {
+    if (trigger?.isConnected && !trigger.matches(':disabled')) trigger.focus()
+  })
+}
+function openEmployee(employee?: Employee, event?: Event) {
   if (!employee && props.state.employees.length >= limits.employees) { error.value = `最多支持 ${limits.employees} 位员工，请先删除不再使用的人员。`; return }
   Object.assign(employeeDraft, employee ? { ...employee, minHoursPerMonth: employee.minHoursPerMonth ?? null, minHoursPerWeek: employee.minHoursPerWeek ?? 0, eligibleShiftIds: [...employee.eligibleShiftIds], unavailableDates: [...employee.unavailableDates] } : { id: '', name: '', role: '', group: '', color: '#d7e8f8', minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: props.state.shifts.map(shift => shift.id), unavailableDates: [] })
-  editor.value = 'employee'; error.value = ''; feedback.value = ''; pendingDelete.value = null
+  openInlineEditor('employee', event); error.value = ''; feedback.value = ''; pendingDelete.value = null
 }
 function saveEmployee() {
   if (!employeeDraft.id && props.state.employees.length >= limits.employees) { error.value = `最多支持 ${limits.employees} 位员工。`; return }
@@ -194,27 +206,28 @@ function saveEmployee() {
   const employee: Employee = { ...current, name: employeeDraft.name.trim(), role: employeeDraft.role.trim(), group: employeeDraft.group.trim(), color: employeeDraft.color, eligibleShiftIds: [...current.eligibleShiftIds], unavailableDates: [...current.unavailableDates] }
   if (existing >= 0) props.state.employees.splice(existing, 1, employee)
   else props.state.employees.push(employee)
-  editor.value = null; notice(existing >= 0 ? '成员基本资料已保存，工时、可上班次与请假日期保持不变。' : '成员已添加。可直接在成员卡片设置工时、可上班次，并打开日历设置请假。')
+  closeEditor(); notice(existing >= 0 ? '成员基本资料已保存，工时、可上班次与请假日期保持不变。' : '成员已添加。可直接在成员卡片设置工时、可上班次，并打开日历设置请假。')
 }
-function openShift(shift?: Shift) {
+function openShift(shift?: Shift, event?: Event) {
   if (!shift && props.state.shifts.length >= limits.shifts) { error.value = `最多支持 ${limits.shifts} 个班次，请先删除不再使用的班次。`; return }
-  Object.assign(shiftDraft, shift ? { ...shift, normalAllowance: shift.normalAllowance ?? 0 } : { id: '', name: '', shortName: '', start: '08:00', end: '16:00', color: colors[props.state.shifts.length % colors.length], required: 1, normalAllowance: 0 })
-  editor.value = 'shift'; error.value = ''; feedback.value = ''; pendingDelete.value = null
+  Object.assign(shiftDraft, shift ? { ...shift, staffingMode: shift.staffingMode ?? 'minimum', normalAllowance: shift.normalAllowance ?? 0 } : { id: '', name: '', shortName: '', start: '08:00', end: '16:00', color: colors[props.state.shifts.length % colors.length], required: 1, staffingMode: 'minimum', normalAllowance: 0 })
+  openInlineEditor('shift', event); error.value = ''; feedback.value = ''; pendingDelete.value = null
 }
 function saveShift() {
   if (!shiftDraft.id && props.state.shifts.length >= limits.shifts) { error.value = `最多支持 ${limits.shifts} 个班次。`; return }
   if (!validText(shiftDraft.name, limits.shiftName, '班次名称') || !validText(shiftDraft.shortName, limits.shortName, '日历简称')) return
   if (props.state.shifts.some(shift => shift.id !== shiftDraft.id && shift.name === shiftDraft.name.trim())) { error.value = '班次名称已存在，请使用不同名称。'; return }
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftDraft.start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(shiftDraft.end) || shiftDraft.start === shiftDraft.end) { error.value = '请填写有效的起止时间，开始和结束不能相同。'; return }
-  if (!Number.isInteger(Number(shiftDraft.required)) || Number(shiftDraft.required) < 0 || Number(shiftDraft.required) > limits.required) { error.value = `每日最少人数需要为 0–${limits.required} 的整数。`; return }
+  if (shiftDraft.staffingMode !== 'minimum' && shiftDraft.staffingMode !== 'fixed') { error.value = '请选择每日最少人数或每日固定人数。'; return }
+  if (!Number.isInteger(Number(shiftDraft.required)) || Number(shiftDraft.required) < 0 || Number(shiftDraft.required) > limits.required) { error.value = `${shiftStaffingLabel.value}需要为 0–${limits.required} 的整数。`; return }
   const allowance = shiftDraft.normalAllowance
   if (!validAllowance(allowance)) return
   if (!/^#(?:[\da-fA-F]{3}|[\da-fA-F]{6})$/.test(shiftDraft.color)) { error.value = '请选择有效的班次颜色。'; return }
-  const shift: Shift = { ...shiftDraft, id: shiftDraft.id || `shift-${crypto.randomUUID()}`, name: shiftDraft.name.trim(), shortName: shiftDraft.shortName.trim(), required: Number(shiftDraft.required), normalAllowance: Number(allowance) }
+  const shift: Shift = { ...shiftDraft, id: shiftDraft.id || `shift-${crypto.randomUUID()}`, name: shiftDraft.name.trim(), shortName: shiftDraft.shortName.trim(), required: Number(shiftDraft.required), staffingMode: shiftDraft.staffingMode, normalAllowance: Number(allowance) }
   const existing = props.state.shifts.findIndex(item => item.id === shift.id)
   if (existing >= 0) props.state.shifts.splice(existing, 1, shift)
   else { props.state.shifts.push(shift); for (const employee of props.state.employees) employee.eligibleShiftIds.push(shift.id) }
-  editor.value = null; notice(existing >= 0 ? '班次已更新。已有排班将使用新的班次时间，请检查规则冲突。' : '班次已添加，默认所有员工可排此班；可在人员管理中调整。')
+  closeEditor(); notice(existing >= 0 ? '班次已更新。已有排班将使用新的班次时间，请检查规则冲突。' : '班次已添加，默认所有员工可排此班；可在人员管理中调整。')
 }
 function validAllowance(value: unknown) {
   if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > limits.allowance || Number(Number(value).toFixed(2)) !== Number(value)) { error.value = `班次津贴需为 0–${limits.allowance} 元，最多保留两位小数。`; return false }
@@ -282,11 +295,11 @@ function saveRules() {
   else delete props.state.rules.weekdayWeights
   notice('排班规则已保存。重新生成排班时生效，现有排班会重新检查冲突。')
 }
-function openSeparation(group?: SeparationGroup) {
+function openSeparation(group?: SeparationGroup, event?: Event) {
   if (!group && separationGroups.value.length >= limits.separationGroups) { error.value = `最多支持 ${limits.separationGroups} 个互斥组，请先删除不再使用的规则。`; return }
   Object.assign(separationDraft, group ? { ...group, employeeIds: [...group.employeeIds], shiftIds: [...group.shiftIds] } : { id: '', name: '', employeeIds: [], shiftIds: [] })
   separationAllShifts.value = !group?.shiftIds.length
-  editor.value = 'separation'; pendingDelete.value = null; error.value = ''; feedback.value = ''
+  openInlineEditor('separation', event); pendingDelete.value = null; error.value = ''; feedback.value = ''
 }
 function saveSeparation() {
   if (!separationDraft.id && separationGroups.value.length >= limits.separationGroups) { error.value = `最多支持 ${limits.separationGroups} 个互斥组。`; return }
@@ -299,7 +312,7 @@ function saveSeparation() {
   const group: SeparationGroup = { id: separationDraft.id || `separation-${crypto.randomUUID()}`, name: separationDraft.name.trim(), employeeIds, shiftIds }
   const existing = separationGroups.value.findIndex(item => item.id === group.id)
   props.state.rules.separationGroups = existing < 0 ? [...separationGroups.value, group] : separationGroups.value.map(item => item.id === group.id ? group : item)
-  editor.value = null; notice('互斥规则已保存。同一天的同一个适用班次，组内最多安排 1 人；现有排班会检查冲突。')
+  closeEditor(); notice('互斥规则已保存。同一天的同一个适用班次，组内最多安排 1 人；现有排班会检查冲突。')
 }
 function separationMembers(group: SeparationGroup) { return props.state.employees.filter(employee => group.employeeIds.includes(employee.id)).map(employee => employee.name).join('、') }
 function separationShifts(group: SeparationGroup) { return group.shiftIds.length ? props.state.shifts.filter(shift => group.shiftIds.includes(shift.id)).map(shift => shift.name).join('、') : '全部班次（含以后新增的班次）' }
@@ -315,42 +328,38 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
     </div>
 
     <template v-if="section === 'team'">
-      <header class="sp-settings-heading"><div><p>设置人员的班次资格、月 / 周工时与请假。</p></div><button class="sp-settings-button sp-settings-primary" :disabled="state.employees.length >= limits.employees" @click="openEmployee()"><span aria-hidden="true">＋</span> 添加员工</button></header>
+      <header class="sp-settings-heading"><div><p>设置人员的班次资格、月 / 周工时与请假。</p></div><button class="sp-settings-button sp-settings-primary" :disabled="state.employees.length >= limits.employees" @click="openEmployee(undefined, $event)"><span aria-hidden="true">＋</span> 添加员工</button></header>
       <section class="sp-settings-config-card sp-settings-month-reference" aria-labelledby="sp-reference-heading">
-        <div class="sp-settings-reference-heading">
-          <div><h3 id="sp-reference-heading">月参考工时</h3><p>未单独设置的成员，月最低工时跟随此值。</p></div>
-          <label class="sp-settings-field">排班月份<input :value="state.month" type="month" min="0001-01" max="9999-12" required aria-label="月参考工时的排班月份" @change="changeReferenceMonth" /></label>
-        </div>
         <div class="sp-settings-reference-body">
           <div class="sp-settings-reference-summary">
+            <h3 id="sp-reference-heading">月参考工时 <small aria-label="月参考工时当前月份">{{ state.month }}</small></h3>
             <div><strong>{{ monthReference.hours }}</strong><span>小时 / 月</span><span class="sp-settings-label">{{ monthReference.custom ? '手动设置' : '自动计算' }}</span></div>
-            <p>建议 {{ monthReference.workdays }} 个工作日 × 8 小时 = {{ monthReference.suggestedHours }} 小时</p>
-            <p>按本月工作日、法定节假日、调休补班及手动日历标记计算。</p>
+            <p>{{ monthReference.workdays }} 个工作日 × 8 小时 = {{ monthReference.suggestedHours }} 小时</p>
           </div>
           <form class="sp-settings-reference-form" @submit.prevent="saveReferenceHours">
-            <label class="sp-settings-field">手动设置本月参考工时<span class="sp-settings-input-unit"><input v-model.number="referenceDraft" type="number" min="0" max="744" step="any" required aria-label="手动月参考工时" /><span>小时</span></span></label>
+            <label class="sp-settings-field">本月参考工时<span class="sp-settings-input-unit"><input v-model.number="referenceDraft" type="number" min="0" max="744" step="any" required aria-label="手动月参考工时" /><span>小时</span></span></label>
             <div class="sp-settings-actions"><button type="submit" class="sp-settings-button">保存本月</button><button type="button" class="sp-settings-button" :disabled="!monthReference.custom" @click="resetReferenceHours">恢复自动</button></div>
           </form>
         </div>
-        <p v-if="!monthReference.verified" class="sp-settings-calendar-warning" role="status">本月日历尚未核对，自动建议值为估算。请核对节假日和补班安排，或手动设置本月参考工时。</p>
-        <p class="sp-settings-hint">月最低与周最低是排班必须满足的条件。人手、班次需求或休假使最低工时无法满足时，会提示无法生成；可为兼职或休假成员自定义最低工时，设为 0 可关闭对应最低限制。</p>
+        <p v-if="!monthReference.verified" class="sp-settings-calendar-warning" role="status">日历待核对，当前建议值为估算，可手动设置。</p>
+        <details class="sp-settings-help-details sp-settings-reference-details"><summary>参考工时说明</summary><p>月参考值按本月工作日 × 8 小时计算，包含法定节假日、调休补班及手动日历标记。未单独设置的成员，月最低工时跟随参考值；月份在顶部切换。</p><p>月最低和周最低都是必须满足的条件，设为 0 可关闭对应最低限制。周工时按周一至周日计算；月初、月末周最低按当月所占天数折算，周最高计入已知跨月排班。排班精确到分钟，最低向上、最高向下取整。</p></details>
       </section>
       <div class="sp-settings-toolbar"><label class="sp-settings-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input v-model="employeeSearch" type="search" placeholder="搜索姓名、岗位或分组" aria-label="搜索员工" /></label><span>{{ state.employees.length }} / {{ limits.employees }} 位团队成员</span></div>
       <p v-if="state.employees.length >= limits.employees" class="sp-settings-hint">已达到 {{ limits.employees }} 人上限，可以编辑现有人员，或删除不再使用的人员后新增。</p>
-      <form v-if="editor === 'employee'" class="sp-settings-editor" @submit.prevent="saveEmployee">
-        <div class="sp-settings-card-heading"><h3>{{ employeeDraft.id ? '编辑员工' : '新成员资料' }}</h3><button type="button" class="sp-settings-icon-button" aria-label="关闭人员编辑" @click="editor = null; error = ''">×</button></div>
+      <form v-if="editor === 'employee'" ref="editorElement" class="sp-settings-editor" @submit.prevent="saveEmployee">
+        <div class="sp-settings-card-heading"><h3>{{ employeeDraft.id ? '编辑员工' : '新成员资料' }}</h3><button type="button" class="sp-settings-icon-button" aria-label="关闭人员编辑" @click="closeEditor">×</button></div>
         <div class="sp-settings-form-grid sp-settings-employee-form-grid">
           <label class="sp-settings-field">员工姓名<input v-model="employeeDraft.name" :maxlength="limits.employeeText" required placeholder="例如：陈晨" /></label>
           <label class="sp-settings-field">岗位<input v-model="employeeDraft.role" :maxlength="limits.employeeText" placeholder="例如：值班主管" /></label>
           <label class="sp-settings-field">所属分组<input v-model="employeeDraft.group" :maxlength="limits.employeeText" placeholder="例如：一组" /></label>
         </div>
-        <p class="sp-settings-soft-note">{{ employeeDraft.id ? '这里修改基本资料。工时和可上班次直接在成员卡片设置，请假日期通过卡片上的日历按钮设置。' : '新成员默认跟随月参考工时、每周最低 0 小时 / 最高 40 小时，默认可上全部班次。保存后可在成员卡片直接调整，并设置请假。' }}</p>
-        <div class="sp-settings-form-footer"><p>保存后检查已有排班，锁定安排不会自动删除。</p><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="editor = null">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存人员</button></div></div>
+        <p class="sp-settings-soft-note">{{ employeeDraft.id ? '工时、可上班次和请假在成员卡片设置。' : '新成员默认月工时跟随参考值、每周 0–40 小时，可上全部班次；保存后可直接调整。' }}</p>
+        <div class="sp-settings-form-footer"><p>保存后检查已有排班，锁定安排不会自动删除。</p><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="closeEditor">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存人员</button></div></div>
       </form>
-      <p class="sp-settings-inline-guide">直接调整卡片里的工时或可上班次，点击「保存设置」生效。周工时按周一至周日计算；月初、月末周最低按当月所占天数折算，周最高计入已知跨月排班。最低工时设为 0 时不限制。</p>
+      <p class="sp-settings-inline-guide">直接调整工时或可上班次，点击「保存设置」生效。</p>
       <div class="sp-settings-employee-grid">
         <article v-for="employee in displayedEmployees" :key="employee.id" class="sp-settings-employee-card">
-          <div class="sp-settings-person"><span class="sp-settings-avatar" :style="{ background: employee.color }">{{ employee.name.slice(-2) }}</span><div><h3>{{ employee.name }}</h3><p>{{ employee.role || '未设岗位' }}<span v-if="employee.group"> · {{ employee.group }}</span></p></div><button class="sp-settings-edit" :aria-label="`编辑${employee.name}`" @click="openEmployee(employee)">编辑</button></div>
+          <div class="sp-settings-person"><span class="sp-settings-avatar" :style="{ background: employee.color }">{{ employee.name.slice(-2) }}</span><div><h3>{{ employee.name }}</h3><p>{{ employee.role || '未设岗位' }}<span v-if="employee.group"> · {{ employee.group }}</span></p></div><button class="sp-settings-edit" :aria-label="`编辑${employee.name}`" @click="openEmployee(employee, $event)">编辑</button></div>
           <form class="sp-settings-inline-hours" :aria-label="`${employee.name}工时与班次设置`" novalidate @submit.prevent="saveEmployeeHours(employee)">
             <fieldset class="sp-settings-inline-shifts"><legend>可上班次</legend><div class="sp-settings-inline-shift-options"><button v-for="shift in state.shifts" :key="shift.id" type="button" :class="{ selected: hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id) }" :style="{ '--shift-color': shift.color }" :aria-label="`${employee.name}可上${shift.name}`" :aria-pressed="hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id)" @click="toggleEmployeeShift(employee, shift.id)"><span aria-hidden="true">{{ hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id) ? '✓' : '＋' }}</span>{{ shift.name }}</button></div><p v-if="!hoursDrafts[employee.id]!.eligibleShiftIds.length" class="sp-settings-inline-hint">未选择班次，保存后不参与自动排班。</p></fieldset>
             <div class="sp-settings-inline-month">
@@ -371,11 +380,11 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
     </template>
 
     <template v-else-if="section === 'shifts'">
-      <header class="sp-settings-heading"><div><p>设置时间、每日最少人数及每班固定津贴，支持跨午夜。{{ state.shifts.length }} / {{ limits.shifts }} 个班次。</p></div><button class="sp-settings-button sp-settings-primary" :disabled="state.shifts.length >= limits.shifts" @click="openShift()"><span aria-hidden="true">＋</span> 新建班次</button></header>
+      <header class="sp-settings-heading"><div><p>设置时间、每日人数规则及每班固定津贴，支持跨午夜。{{ state.shifts.length }} / {{ limits.shifts }} 个班次。</p></div><button class="sp-settings-button sp-settings-primary" :disabled="state.shifts.length >= limits.shifts" @click="openShift(undefined, $event)"><span aria-hidden="true">＋</span> 新建班次</button></header>
       <p v-if="state.shifts.length >= limits.shifts" class="sp-settings-hint">已达到 {{ limits.shifts }} 个班次上限，可以编辑或删除现有班次。</p>
-      <form v-if="editor === 'shift'" class="sp-settings-editor" @submit.prevent="saveShift"><div class="sp-settings-card-heading"><h3>{{ shiftDraft.id ? '编辑班次' : '新建班次' }}</h3><button type="button" class="sp-settings-icon-button" aria-label="关闭班次编辑" @click="editor = null; error = ''">×</button></div><div class="sp-settings-form-grid"><label class="sp-settings-field">班次名称<input v-model="shiftDraft.name" :maxlength="limits.shiftName" placeholder="例如：早班" required /></label><label class="sp-settings-field">日历简称<input v-model="shiftDraft.shortName" :maxlength="limits.shortName" placeholder="例如：早" required /></label><label class="sp-settings-field">开始时间<input v-model="shiftDraft.start" type="time" required /></label><label class="sp-settings-field">结束时间<input v-model="shiftDraft.end" type="time" required /></label><label class="sp-settings-field">每日最少人数<span class="sp-settings-input-unit"><input v-model.number="shiftDraft.required" type="number" min="0" :max="limits.required" step="1" required aria-label="每日最少人数" /><span>人</span></span></label><label class="sp-settings-field">班次津贴<span class="sp-settings-input-unit"><input v-model.number="shiftDraft.normalAllowance" type="number" min="0" :max="limits.allowance" step="0.01" required aria-label="班次津贴" /><span>元 / 人 / 班</span></span></label><div class="sp-settings-field">标记颜色<div class="sp-settings-colors"><button v-for="color in colors" :key="color" type="button" :style="{ background: color }" :class="{ active: shiftDraft.color === color }" :aria-label="`选择颜色 ${color}`" :aria-pressed="shiftDraft.color === color" @click="shiftDraft.color = color">{{ shiftDraft.color === color ? '✓' : '' }}</button><label class="sp-settings-custom-color"><input v-model="shiftDraft.color" type="color" aria-label="自定义班次颜色" /></label></div></div></div><p class="sp-settings-soft-note">本班次 {{ shiftDuration }} 小时<span v-if="shiftDraft.end < shiftDraft.start"> · 次日结束；整班津贴归入开始日期，跨月不拆金额</span>。每日最少人数是覆盖下限，算法可增派人员以满足成员最低工时。设为 0 表示不设人数下限，仍可自动增派该班。津贴按每人每班固定金额发放，每排一次该班领取一次，不按工时折算。设为 0 表示该班没有津贴。</p><div class="sp-settings-form-footer"><span/><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="editor = null">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存班次</button></div></div></form>
-      <div class="sp-settings-shift-grid"><article v-for="shift in state.shifts" :key="shift.id" class="sp-settings-shift-card"><div class="sp-settings-shift-top"><span class="sp-settings-shift-mark" :style="{ background: shift.color }">{{ shift.shortName }}</span><div><h3>{{ shift.name }}</h3><p>{{ shift.end < shift.start ? '跨夜班次' : '当日班次' }}</p></div><button class="sp-settings-edit" :aria-label="`编辑${shift.name}`" @click="openShift(shift)">编辑</button></div><div class="sp-settings-shift-time">{{ shift.start }} <span>—</span> {{ shift.end }}<small v-if="shift.end < shift.start">次日</small></div><p class="sp-settings-shift-allowance">班次津贴 <strong>¥ {{ (shift.normalAllowance ?? 0).toFixed(2) }}</strong><span> / 人 / 班</span></p><div class="sp-settings-card-bottom"><span>每日最少 <strong>{{ shift.required }}</strong> 人</span><button class="sp-settings-remove" :disabled="state.shifts.length <= 1" :aria-label="`删除${shift.name}`" @click="requestDelete('shift', shift.id, shift.name)">删除</button></div></article></div>
-      <p class="sp-settings-footnote">新增班次默认适用于所有员工。更细的人员限制，请前往「人员管理」设置。<span v-if="state.rules.weekdayWeights">已启用上班权重：每天仍保障各班最低人数，并可增派人员；星期占比按团队实际总班数计算。</span></p>
+      <form v-if="editor === 'shift'" ref="editorElement" class="sp-settings-editor" @submit.prevent="saveShift"><div class="sp-settings-card-heading"><h3>{{ shiftDraft.id ? '编辑班次' : '新建班次' }}</h3><button type="button" class="sp-settings-icon-button" aria-label="关闭班次编辑" @click="closeEditor">×</button></div><div class="sp-settings-form-grid"><label class="sp-settings-field">班次名称<input v-model="shiftDraft.name" :maxlength="limits.shiftName" placeholder="例如：早班" required /></label><label class="sp-settings-field">日历简称<input v-model="shiftDraft.shortName" :maxlength="limits.shortName" placeholder="例如：早" required /></label><label class="sp-settings-field">开始时间<input v-model="shiftDraft.start" type="time" required /></label><label class="sp-settings-field">结束时间<input v-model="shiftDraft.end" type="time" required /></label><fieldset class="sp-settings-staffing-mode"><legend>每日人数规则</legend><div class="sp-settings-staffing-options"><label :class="{ selected: shiftDraft.staffingMode === 'minimum' }"><input v-model="shiftDraft.staffingMode" type="radio" name="shift-staffing-mode" value="minimum" aria-label="人数模式：每日最少人数" /><span><strong>每日最少人数</strong><small>达到下限后，可以增派</small></span></label><label :class="{ selected: shiftDraft.staffingMode === 'fixed' }"><input v-model="shiftDraft.staffingMode" type="radio" name="shift-staffing-mode" value="fixed" aria-label="人数模式：每日固定人数" /><span><strong>每日固定人数</strong><small>按指定人数安排，不增派</small></span></label></div></fieldset><label class="sp-settings-field">{{ shiftStaffingLabel }}<span class="sp-settings-input-unit"><input v-model.number="shiftDraft.required" type="number" min="0" :max="limits.required" step="1" required :aria-label="shiftStaffingLabel" /><span>人</span></span></label><label class="sp-settings-field">班次津贴<span class="sp-settings-input-unit"><input v-model.number="shiftDraft.normalAllowance" type="number" min="0" :max="limits.allowance" step="0.01" required aria-label="班次津贴" /><span>元 / 人 / 班</span></span></label><div class="sp-settings-field">标记颜色<div class="sp-settings-colors"><button v-for="color in colors" :key="color" type="button" :style="{ background: color }" :class="{ active: shiftDraft.color === color }" :aria-label="`选择颜色 ${color}`" :aria-pressed="shiftDraft.color === color" @click="shiftDraft.color = color">{{ shiftDraft.color === color ? '✓' : '' }}</button><label class="sp-settings-custom-color"><input v-model="shiftDraft.color" type="color" aria-label="自定义班次颜色" /></label></div></div></div><p class="sp-settings-soft-note">本班次 {{ shiftDuration }} 小时<span v-if="shiftDraft.end < shiftDraft.start"> · 次日结束；整班津贴归入开始日期，跨月不拆金额</span>。<template v-if="shiftDraft.staffingMode === 'fixed'">严格模式下每天恰好安排 {{ shiftDraft.required || 0 }} 人，不额外增派；允许岗位缺编时可少排，但不超过此人数。固定人数设为 0 时，不安排该班。</template><template v-else>每日最少人数是覆盖下限，算法可为满足成员最低工时增派。最少人数设为 0 表示不设下限，仍可自动增派该班。</template>津贴按每人每班固定金额发放，每排一次该班领取一次，不按工时折算；津贴设为 0 表示该班没有津贴。</p><div class="sp-settings-form-footer"><span/><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="closeEditor">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存班次</button></div></div></form>
+      <div class="sp-settings-shift-grid"><article v-for="shift in state.shifts" :key="shift.id" class="sp-settings-shift-card"><div class="sp-settings-shift-top"><span class="sp-settings-shift-mark" :style="{ background: shift.color }">{{ shift.shortName }}</span><div><h3>{{ shift.name }}</h3><p>{{ shift.end < shift.start ? '跨夜班次' : '当日班次' }}</p></div><button class="sp-settings-edit" :aria-label="`编辑${shift.name}`" @click="openShift(shift, $event)">编辑</button></div><div class="sp-settings-shift-time">{{ shift.start }} <span>—</span> {{ shift.end }}<small v-if="shift.end < shift.start">次日</small></div><p class="sp-settings-shift-allowance">班次津贴 <strong>¥ {{ (shift.normalAllowance ?? 0).toFixed(2) }}</strong><span> / 人 / 班</span></p><div class="sp-settings-card-bottom"><span>{{ shift.staffingMode === 'fixed' ? '每日固定' : '每日最少' }} <strong>{{ shift.required }}</strong> 人</span><button class="sp-settings-remove" :disabled="state.shifts.length <= 1" :aria-label="`删除${shift.name}`" @click="requestDelete('shift', shift.id, shift.name)">删除</button></div></article></div>
+      <details class="sp-settings-help-details sp-settings-bottom-help"><summary>班次设置说明</summary><p class="sp-settings-footnote">新增班次默认适用于所有员工。更细的人员限制，请前往「人员管理」设置。<span v-if="state.rules.weekdayWeights">已启用上班权重：每天同时遵守各班的最少 / 固定人数规则；星期占比按团队实际总班数计算。只有最少人数模式允许增派。</span></p></details>
     </template>
 
     <template v-else-if="section === 'rules'">
@@ -384,7 +393,7 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
         <div class="sp-settings-rule"><div><span class="sp-settings-rule-number">01</span><h3>班间充分休息</h3><p>上个班结束到下个班开始，至少保留这段休息时间。</p></div><label class="sp-settings-input-unit"><input v-model.number="rulesDraft.minRestHours" type="number" min="0" :max="limits.minRestHours" step="any" required aria-label="班间最短休息小时数" /><span>小时</span></label></div>
         <div class="sp-settings-rule"><div><span class="sp-settings-rule-number">02</span><h3>控制连续工作</h3><p>达到连续工作上限后，应安排休息或请假日。</p></div><label class="sp-settings-input-unit"><input v-model.number="rulesDraft.maxConsecutiveDays" type="number" min="1" max="31" step="1" required aria-label="最大连续工作天数" /><span>天</span></label></div>
         <section class="sp-settings-weekday-rule" aria-labelledby="sp-weekday-heading">
-          <div class="sp-settings-rule"><div><span class="sp-settings-rule-number">03</span><h3 id="sp-weekday-heading">上班权重</h3><p>选择星期，按团队实际总班次数分配指定比例；其余班次在其他星期均分，每天仍须满足各班最低人数。</p></div><label class="sp-settings-switch"><input v-model="weekdayWeightsEnabled" type="checkbox" aria-label="启用上班权重" /><span/><small>{{ weekdayWeightsEnabled ? '已开启' : '已关闭' }}</small></label></div>
+          <div class="sp-settings-rule"><div><span class="sp-settings-rule-number">03</span><h3 id="sp-weekday-heading">上班权重</h3><p>选择星期，按团队实际总班次数分配指定比例；其余班次在其他星期均分，同时遵守各班最少 / 固定人数规则。</p></div><label class="sp-settings-switch"><input v-model="weekdayWeightsEnabled" type="checkbox" aria-label="启用上班权重" /><span/><small>{{ weekdayWeightsEnabled ? '已开启' : '已关闭' }}</small></label></div>
           <div v-if="weekdayWeightsEnabled" class="sp-settings-weight-options">
             <fieldset class="sp-settings-fieldset sp-settings-weight-days"><legend>选择分配星期 · 可多选</legend><div class="sp-settings-weekday-options"><label v-for="day in weekdayOptions" :key="day.value" class="sp-settings-weekday-option" :class="{ selected: weekdayDays.includes(day.value) }"><input v-model="weekdayDays" type="checkbox" :value="day.value" :aria-label="`上班权重${day.label}`" /><span>{{ day.short }}</span></label></div></fieldset>
             <div class="sp-settings-weight-percent-row">
@@ -393,16 +402,17 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
             </div>
             <p v-if="weekdayDraftError" class="sp-settings-calendar-warning sp-settings-weight-validation" role="alert">{{ weekdayDraftError }}</p>
             <template v-else>
-              <div class="sp-settings-weight-formula">
-                <div class="sp-settings-weight-example-heading"><div><strong>计算示例 · 不作为固定排班数量</strong><p>算法根据每日最低覆盖与成员工时决定实际总班数，允许在最低人数之上增派。</p></div><label class="sp-settings-field">完整周演示总班数<span class="sp-settings-input-unit"><input v-model.number="weekdayExampleTotal" type="text" inputmode="numeric" maxlength="7" aria-label="完整周演示总班数" :aria-invalid="!!weekdayExampleError" /><span>班</span></span></label></div>
-                <p v-if="weekdayExampleError" class="sp-settings-weight-capacity-warning" role="alert">{{ weekdayExampleError }}</p>
-                <template v-else><p>假设完整周排 {{ weekdayExampleTotal }} 班，{{ weekdaySelectedLabel }}合计应排 ⌈{{ weekdayExampleTotal }} × {{ weekdayPercent }}%⌉ = {{ weekdayFullSelected }} 班，其余星期共 {{ Number(weekdayExampleTotal) - weekdayFullSelected }} 班。</p><p>每日最低覆盖对应完整周至少 {{ weekdayMinimum }} 班；实际还需满足所有人的工时与休息规则。</p><p v-if="Number(weekdayExampleTotal) < weekdayMinimum || Number(weekdayExampleTotal) > state.employees.length * 7" class="sp-settings-weight-capacity-warning">此演示班数超出当前每日最低覆盖或每人每天一班的容量范围，仅用于说明比例计算。</p><p v-else-if="weekdayExampleBelowMinimum" class="sp-settings-weight-capacity-warning">此示例分配后，有些日期低于每日最少人数，需增加总班数或调整占比后再求解。</p></template>
-              </div>
               <div class="sp-settings-weight-capacity" role="status">
                 <strong v-if="weekdayCapacity.maxPercent !== null">占比容量参考上限：{{ weekdayCapacity.maxPercent }}%</strong>
-                <strong v-else>按每日最低覆盖与当前人数容量，未找到可满足的整数比例</strong>
+                <strong v-else>按班次人数规则与当前人员容量，未找到可满足的整数比例</strong>
                 <p>{{ weekdayCapacity.explanation }}</p>
                 <p v-if="weekdayCapacity.maxPercent !== null && Number(weekdayPercent) > weekdayCapacity.maxPercent" class="sp-settings-weight-capacity-warning">当前占比超过容量参考上限，请调整比例或人员配置。保存不会自动降低占比。</p>
+              </div>
+              <details class="sp-settings-help-details sp-settings-calculation-details"><summary>查看比例计算示例</summary>
+              <div class="sp-settings-weight-formula">
+                <div class="sp-settings-weight-example-heading"><div><strong>计算示例 · 不作为固定排班数量</strong><p>算法根据每日人数规则与成员工时决定实际总班数；最少人数班次可增派，固定人数班次不可超过设定值。</p></div><label class="sp-settings-field">完整周演示总班数<span class="sp-settings-input-unit"><input v-model.number="weekdayExampleTotal" type="text" inputmode="numeric" maxlength="7" aria-label="完整周演示总班数" :aria-invalid="!!weekdayExampleError" /><span>班</span></span></label></div>
+                <p v-if="weekdayExampleError" class="sp-settings-weight-capacity-warning" role="alert">{{ weekdayExampleError }}</p>
+                <template v-else><p>假设完整周排 {{ weekdayExampleTotal }} 班，{{ weekdaySelectedLabel }}合计应排 ⌈{{ weekdayExampleTotal }} × {{ weekdayPercent }}%⌉ = {{ weekdayFullSelected }} 班，其余星期共 {{ Number(weekdayExampleTotal) - weekdayFullSelected }} 班。</p><p>严格覆盖下，完整周至少需要 {{ weekdayMinimum }} 班；固定人数班次不能增派，实际还需满足成员工时与休息规则。</p><p v-if="Number(weekdayExampleTotal) < weekdayMinimum || Number(weekdayExampleTotal) > weekdayMaximum" class="sp-settings-weight-capacity-warning">此演示班数超出当前人数规则或每人每天一班的容量范围，仅用于说明比例计算。</p><p v-else-if="weekdayExampleBelowMinimum" class="sp-settings-weight-capacity-warning">此示例分配后，有些日期未达到严格覆盖所需人数，需调整班次人数模式、总班数或占比后再求解。</p></template>
               </div>
               <section v-if="!weekdayExampleError" class="sp-settings-weight-preview" aria-label="本月上班权重计算示例">
                 <div class="sp-settings-weight-preview-heading"><h4>{{ state.month }} · 按演示总班数分段计算</h4><span>本月示例共 <strong class="sp-settings-weight-month-total">{{ weekdayMonthlyTotal }}</strong> 班</span></div>
@@ -410,38 +420,40 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
                   <article v-for="week in weekdayPreviewWeeks" :key="week.id" class="sp-settings-weight-week" :data-week="week.id">
                     <header><strong>{{ week.dates[0]!.slice(5) }} — {{ week.dates[week.dates.length - 1]!.slice(5) }}</strong><span>{{ week.dates.length === 7 ? '完整周' : '部分周' }}</span></header>
                     <dl><div><dt>已选星期</dt><dd><strong class="sp-settings-weight-selected">{{ week.selectedTarget }}</strong> 班</dd></div><div><dt>其余星期</dt><dd><strong class="sp-settings-weight-other">{{ week.otherTarget }}</strong> 班</dd></div><div><dt>合计</dt><dd><strong class="sp-settings-weight-total">{{ week.totalTarget }}</strong> 班</dd></div></dl>
-                    <details><summary>示例逐日人数范围</summary><ul><li v-for="date in week.dates" :key="date" :class="{ selected: week.selectedDates.includes(date) }"><span>{{ date.slice(5) }} {{ dayWeightLabel(date) }}</span><strong>{{ dayWeightRange(week, date) }} 班</strong></li></ul><p>按上方演示总班数计算，同组内各天相差最多 1 班。实际增派后将按新的总班数重新计算，此示例不代表已满足工时和每日最低覆盖。</p></details>
+                    <details><summary>示例逐日人数范围</summary><ul><li v-for="date in week.dates" :key="date" :class="{ selected: week.selectedDates.includes(date) }"><span>{{ date.slice(5) }} {{ dayWeightLabel(date) }}</span><strong>{{ dayWeightRange(week, date) }} 班</strong></li></ul><p>按上方演示总班数计算，同组内各天相差最多 1 班。实际增派后将按新的总班数重新计算，此示例不代表已满足工时和各班最少 / 固定人数规则。</p></details>
                   </article>
                 </div>
               </section>
+              </details>
             </template>
-            <p class="sp-settings-soft-note"><strong>占比是硬性规则，总班数可以增加。</strong>完整周以实际总班数计算，所选星期合计向上取整，组内各天均摊。月初、月末只保留当月出现的星期份额，缺失星期的份额不重新分配。算法可为满足每日各班最低人数和成员最低工时增派；占比与每日最低覆盖、工时、请假或锁定安排冲突时，会提示无法排班。</p>
+            <p class="sp-settings-hint">比例是硬性规则，同时遵守各班人数模式与工时限制。</p>
+            <details class="sp-settings-help-details"><summary>权重与人数规则说明</summary><p class="sp-settings-soft-note"><strong>占比是硬性规则，人数模式同时生效。</strong>完整周以实际总班数计算，所选星期合计向上取整，组内各天均摊。月初、月末只保留当月出现的星期份额，缺失星期的份额不重新分配。算法仅可向最少人数班次增派以满足工时；固定人数班次不能超过设定人数。严格模式下，固定班次恰好满足人数，最少班次达到下限。允许岗位缺编只放宽覆盖人数，不放宽星期占比、固定人数上限及其他硬性规则。规则冲突时会提示无法排班。</p></details>
           </div>
-          <p v-else class="sp-settings-hint">关闭时按班次设置保障每日最低人数，并可为满足成员最低工时增派，不额外限制星期占比。</p>
+          <p v-else class="sp-settings-hint">关闭时按各班最少 / 固定人数规则安排。最少人数班次可为满足成员最低工时增派，固定人数班次不增派；不额外限制星期占比。</p>
         </section>
         <div class="sp-settings-form-footer"><p>本页更改保存后生效。月 / 周工时、班次资格与请假，在人员管理中设置。</p><button type="submit" class="sp-settings-button sp-settings-primary">保存规则</button></div>
       </form>
       <section class="sp-settings-config-card sp-settings-separation">
-        <div class="sp-settings-card-heading"><div><h3>同日同班互斥</h3><p>指定人员互相错开，每个适用班次中，组内最多安排 1 人。当前 {{ separationGroups.length }} / {{ limits.separationGroups }} 组。</p></div><button type="button" class="sp-settings-button" :disabled="state.employees.length < 2 || separationGroups.length >= limits.separationGroups" @click="openSeparation()">＋ 添加互斥组</button></div>
+        <div class="sp-settings-card-heading"><div><h3>同日同班互斥</h3><p>指定人员互相错开，每个适用班次中，组内最多安排 1 人。当前 {{ separationGroups.length }} / {{ limits.separationGroups }} 组。</p></div><button type="button" class="sp-settings-button" :disabled="state.employees.length < 2 || separationGroups.length >= limits.separationGroups" @click="openSeparation(undefined, $event)">＋ 添加互斥组</button></div>
         <p v-if="separationGroups.length >= limits.separationGroups" class="sp-settings-hint">已达到 {{ limits.separationGroups }} 个互斥组上限，可以编辑或删除已有规则。</p>
-        <form v-if="editor === 'separation'" class="sp-settings-separation-editor" @submit.prevent="saveSeparation">
-          <div class="sp-settings-card-heading"><h3>{{ separationDraft.id ? '编辑互斥组' : '新增互斥组' }}</h3><button type="button" class="sp-settings-icon-button" aria-label="关闭互斥组编辑" @click="editor = null; error = ''">×</button></div>
+        <form v-if="editor === 'separation'" ref="editorElement" class="sp-settings-separation-editor" @submit.prevent="saveSeparation">
+          <div class="sp-settings-card-heading"><h3>{{ separationDraft.id ? '编辑互斥组' : '新增互斥组' }}</h3><button type="button" class="sp-settings-icon-button" aria-label="关闭互斥组编辑" @click="closeEditor">×</button></div>
           <label class="sp-settings-field">规则名称<input v-model="separationDraft.name" :maxlength="limits.groupName" required placeholder="例如：主管轮值错开" /></label>
           <fieldset class="sp-settings-fieldset"><legend>选择互斥人员 · 至少 2 人<span class="sp-settings-selection-count">已选 {{ separationDraft.employeeIds.length }} 人</span></legend><div class="sp-settings-member-options"><label v-for="employee in state.employees" :key="employee.id" class="sp-settings-checkbox sp-settings-member-option" :class="{ selected: separationDraft.employeeIds.includes(employee.id) }"><input v-model="separationDraft.employeeIds" type="checkbox" :value="employee.id"/><span>{{ employee.name }}<small>{{ employee.role || employee.group || '团队成员' }}</small></span></label></div></fieldset>
           <fieldset class="sp-settings-fieldset"><legend>适用班次</legend><label class="sp-settings-checkbox"><input v-model="separationAllShifts" type="checkbox"/><span>适用于全部班次（包括以后新增的班次）</span></label><div v-if="!separationAllShifts" class="sp-settings-choice-row sp-settings-specific-shifts"><label v-for="shift in state.shifts" :key="shift.id" class="sp-settings-checkbox"><input v-model="separationDraft.shiftIds" type="checkbox" :value="shift.id"/><span class="sp-settings-dot" :style="{ background: shift.color }"/>{{ shift.name }}</label></div></fieldset>
           <p class="sp-settings-soft-note">例如选择甲、乙、丙三人后，任意两人都不能在同一天上同一个适用班次；可以分别上早班、晚班，或安排休息。</p>
-          <div class="sp-settings-form-footer"><p>保存后立即检查现有排班，重新生成时自动遵守。</p><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="editor = null">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存互斥组</button></div></div>
+          <div class="sp-settings-form-footer"><p>保存后立即检查现有排班，重新生成时自动遵守。</p><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="closeEditor">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存互斥组</button></div></div>
         </form>
-        <div v-if="separationGroups.length" class="sp-settings-separation-list"><article v-for="group in separationGroups" :key="group.id" class="sp-settings-separation-group"><div class="sp-settings-separation-title"><h3>{{ group.name }}</h3><span class="sp-settings-label">{{ group.employeeIds.length }} 人互斥</span><div class="sp-settings-actions"><button type="button" class="sp-settings-edit" :aria-label="`编辑互斥组${group.name}`" @click="openSeparation(group)">编辑</button><button type="button" class="sp-settings-remove" :aria-label="`删除互斥组${group.name}`" @click="requestDelete('separation', group.id, group.name)">删除</button></div></div><p class="sp-settings-separation-names">{{ separationMembers(group) }}</p><p class="sp-settings-separation-scope">适用：{{ separationShifts(group) }}<span>同日同班，组内最多 1 人</span></p></article></div>
+        <div v-if="separationGroups.length" class="sp-settings-separation-list"><article v-for="group in separationGroups" :key="group.id" class="sp-settings-separation-group"><div class="sp-settings-separation-title"><h3>{{ group.name }}</h3><span class="sp-settings-label">{{ group.employeeIds.length }} 人互斥</span><div class="sp-settings-actions"><button type="button" class="sp-settings-edit" :aria-label="`编辑互斥组${group.name}`" @click="openSeparation(group, $event)">编辑</button><button type="button" class="sp-settings-remove" :aria-label="`删除互斥组${group.name}`" @click="requestDelete('separation', group.id, group.name)">删除</button></div></div><p class="sp-settings-separation-names">{{ separationMembers(group) }}</p><p class="sp-settings-separation-scope">适用：{{ separationShifts(group) }}<span>同日同班，组内最多 1 人</span></p></article></div>
         <p v-else-if="editor !== 'separation'" class="sp-settings-hint">{{ state.employees.length < 2 ? '先添加至少 2 位员工，即可设置人员互斥。' : '暂无互斥规则。可添加多组，同一位员工也可以属于多个组。' }}</p>
       </section>
-      <aside class="sp-settings-explanation"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/></svg><div><h3>先遵守限制，再尽量均衡</h3><p>自动排班综合考虑已排工时、班次分配与人员互斥。启用上班权重后必须满足按实际班数计算的星期占比；与其他限制冲突时会提示原因，保留原排班。锁定安排保持不变。</p></div></aside>
+      <details class="sp-settings-help-details sp-settings-bottom-help"><summary>排班规则说明</summary><p>自动排班综合考虑已排工时、班次分配与人员互斥。启用权重后，按实际班数核对星期占比。与其他限制冲突时会提示原因并保留原排班，锁定安排保持不变。</p></details>
     </template>
 
     <template v-else>
-      <header class="sp-settings-heading sp-settings-allowance-heading">
-        <div><h2>班次津贴</h2><p>按最终排班，每人每班领取一次固定金额；跨夜和跨月津贴均归入开始日期。</p></div>
-        <label class="sp-settings-field">汇总月份<input :value="state.month" type="month" min="0001-01" max="9999-12" required aria-label="津贴汇总月份" @change="changeReferenceMonth" /></label>
+      <details class="sp-settings-help-details sp-settings-allowance-details"><summary>调整班次津贴</summary>
+        <header class="sp-settings-heading sp-settings-allowance-heading">
+        <div><p>与「班次设置」共用金额，每人每班领取一次。</p></div>
       </header>
       <div class="sp-settings-shift-grid">
         <article v-for="shift in state.shifts" :key="shift.id" class="sp-settings-shift-card sp-settings-allowance-card">
@@ -457,6 +469,7 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
         </article>
       </div>
       <p class="sp-settings-footnote">津贴金额与「班次设置」共用，修改后会更新已有排班的金额。未排班或排为休息时不领取；月末跨夜班的整笔津贴计入本月，不拆到下月。</p>
+      </details>
     </template>
     <LeaveCalendarDialog v-if="leaveEmployee" :key="leaveEmployee.id" :employee="leaveEmployee" :initial-month="state.month" @save="saveLeave" @close="leaveEmployeeId = ''" />
   </section>
@@ -485,4 +498,8 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
 .sp-settings-inline-guide{font-size:12px;color:#788d88;line-height:1.85;margin:0 0 18px!important}.sp-settings-inline-hours{margin-top:20px}.sp-settings-inline-shifts{border:0;padding:0;margin:0 0 18px;min-width:0}.sp-settings-inline-shifts legend{font-size:11px;font-weight:600;color:#6b8278;margin-bottom:10px}.sp-settings-inline-shift-options{display:flex;flex-wrap:wrap;gap:6px}.sp-settings-inline-shift-options>button{display:inline-flex;align-items:center;gap:5px;border:1px solid #dce7e1;border-radius:6px;background:#f8fbf9;color:#809389;font-size:11px;padding:7px 9px;min-height:34px;max-width:100%;overflow-wrap:anywhere;text-align:left}.sp-settings-inline-shift-options>button.selected{background:var(--shift-color);border-color:#a8c5b8;color:#3f6c58}.sp-settings-inline-shift-options>button>span{font-size:12px;flex-shrink:0}.sp-settings-inline-hint{font-size:10px;line-height:1.8;color:#8a9a91;margin-top:8px!important}.sp-settings-inline-month{padding-top:15px;border-top:1px solid #edf1ee}.sp-settings-inline-reference{font-size:11px;line-height:1.6;margin-bottom:13px}.sp-settings-inline-reference input{width:15px;height:15px}.sp-settings-inline-hours .sp-settings-field{font-size:11px;gap:7px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:38px;padding-right:9px}.sp-settings-inline-hours .sp-settings-input-unit input{padding:9px 10px;font-size:13px}.sp-settings-inline-hours input:disabled{color:#8f9f98;background:#f0f5f2;cursor:default}.sp-settings-inline-hours .sp-settings-input-unit>span{font-size:10px}.sp-settings-inline-week{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.sp-settings-inline-error{font-size:11px;line-height:1.75;color:#ab5745;background:#fff3ee;border:1px solid #f2d9cc;border-radius:6px;padding:9px 10px;margin-top:12px!important}.sp-settings-inline-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:14px;padding-top:12px;border-top:1px dashed #dce6df}.sp-settings-inline-actions>span{font-size:10px;color:#967549}.sp-settings-inline-actions>div{display:flex;gap:6px;margin-left:auto}.sp-settings-inline-actions .sp-settings-button{padding:7px 10px;font-size:11px!important;min-height:34px}.sp-settings-member-bottom{margin-top:18px}.sp-settings-leave-trigger{display:inline-flex;align-items:center;gap:7px;border:0;padding:5px 0;background:none;color:#5c8a74;font-size:11px!important;min-height:30px;text-align:left}.sp-settings-leave-trigger svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.6;fill:none;flex-shrink:0}.sp-settings-leave-trigger:hover{color:#245b4e}
 @media(max-width:720px){.sp-settings-inline-hours .sp-settings-input-unit input{font-size:16px}.sp-settings-inline-hours{margin-top:18px}.sp-settings-inline-shift-options>button{min-height:38px;padding:8px 10px}.sp-settings-inline-actions .sp-settings-button{min-height:38px}.sp-settings-leave-trigger{min-height:36px;font-size:12px!important}.sp-settings-inline-guide{font-size:11px}.sp-settings-inline-week{gap:12px}}
 .sp-settings-weight-example-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap}.sp-settings-weight-example-heading>div{flex:1;min-width:180px}.sp-settings-weight-example-heading>.sp-settings-field{width:185px;flex-shrink:0}.sp-settings-weight-example-heading>.sp-settings-field input{font-variant-numeric:tabular-nums}@media(max-width:720px){.sp-settings-weight-example-heading{gap:13px}.sp-settings-weight-example-heading>.sp-settings-field{width:100%}}
+.sp-settings-staffing-mode{grid-column:1/-1;border:0;padding:0;margin:0;min-width:0}.sp-settings-staffing-mode legend{font-size:12px;color:#657982;font-weight:600;margin-bottom:10px}.sp-settings-staffing-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.sp-settings-staffing-options>label{display:flex;align-items:flex-start;gap:10px;padding:13px 14px;border:1px solid #dfe8e4;border-radius:9px;background:#fbfdfc;color:#728a80;cursor:pointer;min-width:0}.sp-settings-staffing-options>label.selected{border-color:#83b5a2;background:#edf6f1;color:#2c654e}.sp-settings-staffing-options input{accent-color:#245b4e;width:16px;height:16px;flex-shrink:0;margin:1px 0 0}.sp-settings-staffing-options strong{display:block;font-size:12px;font-weight:600;line-height:1.5}.sp-settings-staffing-options small{display:block;margin-top:5px;font-size:11px;line-height:1.7;color:#83998f}.sp-settings-staffing-options>label:focus-within{outline:3px solid #99ddd4;outline-offset:2px}@media(max-width:720px){.sp-settings-staffing-options{gap:8px}.sp-settings-staffing-options>label{padding:12px 9px;gap:7px}.sp-settings-staffing-options strong{font-size:11px}.sp-settings-staffing-options small{font-size:10px}.sp-settings-staffing-mode legend{font-size:11px}}
+.sp-settings-current-month{display:flex;flex-direction:column;gap:5px;flex-shrink:0;padding:9px 12px;border-radius:7px;background:#f1f7f3;color:#56776b;line-height:1.5;margin:0!important}.sp-settings-current-month strong{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}.sp-settings-current-month>span{font-size:10px;color:#8ba095}@media(max-width:720px){.sp-settings-current-month{flex-basis:100%;flex-direction:row;justify-content:space-between;align-items:center;padding:9px 10px}}
+.sp-settings-month-reference{padding:18px 20px}.sp-settings-month-reference>.sp-settings-reference-body{margin-top:0;align-items:center;gap:20px}.sp-settings-reference-summary h3{font-size:13px;font-weight:600;margin-bottom:7px}.sp-settings-reference-summary h3 small{font-size:11px;font-weight:400;color:#95a49e;margin-left:9px}.sp-settings-month-reference .sp-settings-reference-summary strong{font-size:28px}.sp-settings-month-reference .sp-settings-reference-summary p{font-size:11px;margin-top:5px}.sp-settings-month-reference .sp-settings-reference-form>.sp-settings-field{width:155px}.sp-settings-month-reference .sp-settings-reference-form{gap:10px}.sp-settings-month-reference .sp-settings-calendar-warning{font-size:11px;padding:8px 10px;margin-top:12px!important}.sp-settings-help-details{font-size:11px;line-height:1.85;color:#809389;margin-top:14px;padding-top:12px;border-top:1px solid #e7ede8}.sp-settings-help-details>summary{cursor:pointer;color:#587d6c;font-size:12px;line-height:1.6;padding:4px 0;min-height:27px;width:fit-content;max-width:100%}.sp-settings-help-details>summary:focus-visible{outline:3px solid #99ddd4;outline-offset:3px;border-radius:3px}.sp-settings-help-details>p{margin-top:10px!important;font-size:11px;line-height:1.9}.sp-settings-help-details>.sp-settings-soft-note{margin-top:10px!important;padding:12px 14px;background:#f8fbf9;border-color:#e5eee8}.sp-settings-reference-details{margin-top:13px;padding-top:9px}.sp-settings-calculation-details{margin-top:16px}.sp-settings-calculation-details>.sp-settings-weight-formula{margin-top:13px}.sp-settings-bottom-help{padding:0;border:0;margin-top:15px}.sp-settings-bottom-help .sp-settings-footnote{margin-top:8px!important}@media(max-width:720px){.sp-settings-month-reference{padding:15px}.sp-settings-month-reference>.sp-settings-reference-body{gap:13px}.sp-settings-month-reference .sp-settings-reference-summary{flex-basis:100%}.sp-settings-reference-form>.sp-settings-field{flex-basis:100%!important}.sp-settings-reference-form>.sp-settings-actions{width:100%}.sp-settings-reference-form>.sp-settings-actions>.sp-settings-button{flex:1}.sp-settings-reference-details{margin-top:12px}.sp-settings-help-details>summary{min-height:32px}.sp-settings-help-details>.sp-settings-soft-note{padding:11px}}
+.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:110px}.sp-settings-allowance-details{margin-top:20px;padding:16px 20px;border:1px solid #e1e9eb;border-radius:10px;background:#fff}.sp-settings-allowance-details>summary{font-size:13px;font-weight:600}.sp-settings-allowance-details .sp-settings-allowance-heading{margin-top:15px;margin-bottom:16px}.sp-settings-allowance-details .sp-settings-footnote{font-size:11px;margin-top:16px!important}.sp-settings-allowance-details .sp-settings-shift-grid{margin-top:0}@media(max-width:720px){.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:150px}.sp-settings-allowance-details{padding:13px 14px}}
 </style>

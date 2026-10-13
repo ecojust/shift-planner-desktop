@@ -27,13 +27,15 @@ function weightedFixture() {
   state.assignments.push({ employeeId: 'e3', date: '2026-10-05', shiftId: 'off', locked: true }, { employeeId: 'e3', date: '2026-09-30', shiftId: 'night', locked: true })
   return state
 }
-function exportedWeek(state, weekStart) {
+function explanationRows(state) {
   const sheet = strFromU8(unzipSync(scheduleXLSX(state))['xl/worksheets/sheet2.xml'])
-  const rows = [...sheet.matchAll(/<row\b[^>]*>(.*?)<\/row>/gs)].map(row => [...row[1].matchAll(/<c\b[^>]*>(.*?)<\/c>/gs)].map(cell => {
+  return [...sheet.matchAll(/<row\b[^>]*>(.*?)<\/row>/gs)].map(row => [...row[1].matchAll(/<c\b[^>]*>(.*?)<\/c>/gs)].map(cell => {
     const number = cell[1].match(/<v>(.*?)<\/v>/s)
     return number ? Number(number[1]) : cell[1].match(/<t\b[^>]*>(.*?)<\/t>/s)?.[1]
   }))
-  const row = rows.find(row => row[0] === weekStart)
+}
+function exportedWeek(state, weekStart) {
+  const row = explanationRows(state).find(row => row[0] === weekStart)
   assert.ok(row, `Missing exported week ${weekStart}`)
   return row
 }
@@ -42,6 +44,31 @@ test('backup roundtrip preserves cross-month assignments and locked days off', (
   const state = fixture()
   assert.deepEqual(parseBackup(backupJSON(state)), state)
   assert.deepEqual(parseBackup('\uFEFF' + JSON.stringify(state)), state)
+})
+test('legacy staffing modes remain omitted and export with minimum semantics', () => {
+  const legacy = weightedFixture()
+  const restored = parseBackup(backupJSON(legacy))
+  assert.deepEqual(restored.shifts, legacy.shifts)
+  assert.ok(restored.shifts.every(shift => !Object.hasOwn(shift, 'staffingMode')))
+  const explicit = structuredClone(restored)
+  explicit.shifts.forEach(shift => { shift.staffingMode = 'minimum' })
+  assert.deepEqual(explanationRows(restored), explanationRows(explicit))
+  assert.deepEqual(exportedWeek(restored, '2026-10-05').slice(3), [10, 4, 6, 10, 0, 0, '通过', 7, 3])
+})
+test('explicit minimum and fixed staffing modes survive complete JSON roundtrips', () => {
+  const state = fixture()
+  state.shifts[0].staffingMode = 'minimum'
+  state.shifts[1].staffingMode = 'fixed'
+  assert.deepEqual(JSON.parse(backupJSON(state)), state)
+  assert.deepEqual(parseBackup(backupJSON(state)), state)
+})
+test('backups reject unknown, null and nonstring staffing modes on import and export', () => {
+  for (const mode of [null, '', 'exact', 'MINIMUM', 'minimum ', 0, false, [], {}]) {
+    const state = fixture()
+    state.shifts[0].staffingMode = mode
+    assert.throws(() => parseBackup(JSON.stringify(state)), /班次人数模式/)
+    assert.throws(() => backupJSON(state), /班次人数模式/)
+  }
 })
 test('dates are real calendar dates including leap years', () => {
   const state = fixture(); state.employees[0].unavailableDates.push('2028-02-29')
@@ -211,7 +238,7 @@ test('weekday weights survive backup, reject malformed rules, and export actual 
   state.rules.weekdayWeights = { days: [1, 6], percent: 40 }
   assert.deepEqual(parseBackup(backupJSON(state)).rules, state.rules)
   const excel = strFromU8(unzipSync(scheduleXLSX(state))['xl/worksheets/sheet2.xml'])
-  for (const label of ['每天最低人数', '上班权重', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '最低班位缺口', '权重分布检查', '40%']) assert.ok(excel.includes(label))
+  for (const label of ['人数模式', '每日人数', '每日最少', '上班权重', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', '40%']) assert.ok(excel.includes(label))
   assert.doesNotMatch(excel, /基准每日人数|周配额|选中星期配额|其余星期配额/)
   for (const bad of [null, {}, { days: [], percent: 40 }, { days: [1, 1], percent: 40 }, { days: [1], percent: 101 }, { days: [1], percent: 0.5 }, { days: [1, 2, 3, 4, 5, 6, 7], percent: 50 }]) {
     state.rules.weekdayWeights = bad
@@ -220,33 +247,86 @@ test('weekday weights survive backup, reject malformed rules, and export actual 
 })
 
 test('Excel matches weighted actual totals with extra staff and optional shifts instead of fixed shift quotas', () => {
-  assert.deepEqual(exportedWeek(weightedFixture(), '2026-10-05'), ['2026-10-05', '2026-10-05', '2026-10-11', 10, 4, 6, 10, 0, '通过', 7, 3])
+  assert.deepEqual(exportedWeek(weightedFixture(), '2026-10-05'), ['2026-10-05', '2026-10-05', '2026-10-11', 10, 4, 6, 10, 0, 0, '通过', 7, 3])
 })
 
 test('Excel partial weeks show their actual counts and a matching complete-week baseline', () => {
   const state = weightedFixture()
   state.assignments = ['01', '02', '03', '04'].map(day => ({ employeeId: 'e1', date: `2026-10-${day}`, shiftId: 'early', locked: false }))
   state.assignments.push(...['02', '03', '04'].map(day => ({ employeeId: 'e2', date: `2026-10-${day}`, shiftId: 'night', locked: false })))
-  assert.deepEqual(exportedWeek(state, '2026-09-28'), ['2026-09-28', '2026-10-01', '2026-10-04', 7, 4, 3, 10, 0, '通过', 4, 3])
+  assert.deepEqual(exportedWeek(state, '2026-09-28'), ['2026-09-28', '2026-10-01', '2026-10-04', 7, 4, 3, 10, 0, 0, '通过', 4, 3])
 })
 
 test('Excel minimum coverage checks each date and shift even when weighted totals match', () => {
   const state = weightedFixture()
   state.assignments.find(item => item.date === '2026-10-07' && item.shiftId === 'early').shiftId = 'night'
-  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 1, '最低覆盖不足', 6, 4])
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 1, 0, '最低覆盖不足', 6, 4])
 })
 
 test('Excel flags unmatched actual proportions despite complete minimum coverage', () => {
   const state = weightedFixture()
   state.assignments = state.assignments.filter(item => !(item.date === '2026-10-10' && item.shiftId === 'night'))
-  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [9, 3, 6, '未匹配', 0, '星期比例未匹配', 7, 2])
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [9, 3, 6, '未匹配', 0, 0, '星期比例未匹配', 7, 2])
 })
 
 test('Excel independently flags uneven daily group distribution despite matched weekly totals', () => {
   const state = weightedFixture()
   const moved = state.assignments.find(item => item.date === '2026-10-07' && item.shiftId === 'early')
   Object.assign(moved, { employeeId: 'e3', date: '2026-10-06' })
-  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 1, '最低覆盖不足；同组日期分布不均', 7, 3])
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 1, 0, '最低覆盖不足；同组日期分布不均', 7, 3])
+})
+
+test('Excel explains minimum and fixed daily staffing and their distinct zero semantics', () => {
+  const state = fixture()
+  state.shifts[0].staffingMode = 'minimum'
+  state.shifts[1].staffingMode = 'fixed'
+  const rows = explanationRows(state)
+  assert.deepEqual(rows[0], ['班次', '简称', '开始时间', '结束时间', '人数模式', '每日人数', '单班工时', '固定班次津贴（元/人/班）'])
+  assert.deepEqual(rows.find(row => row[0] === '早班'), ['早班', '早', '08:00', '16:00', '每日最少', 1, 8, 0])
+  assert.deepEqual(rows.find(row => row[0] === '晚班'), ['晚班', '晚', '22:00', '06:00', '每日固定', 0, 8, 0])
+  const explanation = rows.find(row => row[0] === '说明')[1]
+  assert.match(explanation, /每日最少.*设为 0 仍可排班/)
+  assert.match(explanation, /每日固定.*设为 0 不得安排/)
+})
+
+test('Excel accepts exact fixed staffing alongside additional minimum-zero shifts', () => {
+  const state = weightedFixture()
+  state.shifts[0].staffingMode = 'fixed'
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 0, 0, '通过', 7, 3])
+})
+
+test('Excel flags fixed shortages and excess per date despite unchanged weekly shift totals and valid weights', () => {
+  const state = weightedFixture()
+  state.shifts[0].staffingMode = 'fixed'
+  state.assignments.find(item => item.date === '2026-10-07' && item.shiftId === 'early').shiftId = 'night'
+  state.assignments.find(item => item.date === '2026-10-06' && item.shiftId === 'night').shiftId = 'early'
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 1, 1, '固定人数不足；固定人数超额', 7, 3])
+})
+
+test('Excel rejects scheduled fixed-zero shifts while allowing the same minimum-zero assignments', () => {
+  const state = weightedFixture()
+  state.shifts[1].staffingMode = 'minimum'
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 0, 0, '通过', 7, 3])
+  state.shifts[1].staffingMode = 'fixed'
+  assert.deepEqual(exportedWeek(state, '2026-10-05').slice(3), [10, 4, 6, 10, 0, 3, '固定人数超额', 7, 3])
+})
+
+test('staffing modes preserve saved assignments and do not change actual shift allowances or CSV values', () => {
+  const state = { ...fixture(), ...createPayrollConfig() }
+  state.shifts[0].normalAllowance = 20
+  state.shifts[1].normalAllowance = 50
+  const csv = scheduleCSV(state)
+  const excel = unzipSync(scheduleXLSX(state))
+  for (const mode of ['minimum', 'fixed']) {
+    const changed = structuredClone(state)
+    changed.shifts.forEach(shift => { shift.staffingMode = mode })
+    const restored = parseBackup(backupJSON(changed))
+    assert.deepEqual(restored.assignments, state.assignments)
+    assert.equal(calculatePayroll(restored, restored).totalAllowance, 70)
+    assert.equal(scheduleCSV(restored), csv)
+    const archive = unzipSync(scheduleXLSX(restored))
+    for (const name of ['xl/worksheets/sheet1.xml', 'xl/worksheets/sheet3.xml']) assert.deepEqual(archive[name], excel[name])
+  }
 })
 
 test('fixed shift allowances roundtrip, with legacy zero defaults and ignored old multipliers', () => {

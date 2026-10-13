@@ -70,6 +70,10 @@ async function main() {
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     return persisted(s => s.teamName === document.teamName && s.month === document.month)
   }
+  async function showAllowanceSettings() {
+    const details = page.locator('.sp-settings-allowance-details')
+    if (await details.getAttribute('open') === null) await details.locator(':scope > summary').click()
+  }
   async function widthCheck(name) {
     const size = await page.evaluate(() => ({ viewport: innerWidth, html: document.documentElement.scrollWidth, body: document.body.scrollWidth }))
     assert.ok(size.html <= size.viewport && size.body <= size.viewport, `${name}: ${JSON.stringify(size)}`)
@@ -77,8 +81,8 @@ async function main() {
   }
   async function closeNotice() { const close = page.getByRole('button', { name: '关闭提示', exact: true }); if (await close.isVisible()) await close.click() }
   async function month(value) {
-    await page.getByLabel('选择排班月份', { exact: true }).fill(value)
-    await page.getByLabel('选择排班月份', { exact: true }).dispatchEvent('change')
+    await page.getByLabel('全局排班月份', { exact: true }).fill(value)
+    await page.getByLabel('全局排班月份', { exact: true }).dispatchEvent('change')
     await persisted(s => s.month === value)
   }
   async function amount(employeeId, expected) {
@@ -199,6 +203,8 @@ async function main() {
     await page.screenshot({ path: path.join(output, '02-fixed-allowance-panel-desktop.png') })
     record('date-allowance-editor-and-salary-controls-are-removed')
 
+    assert.equal(await page.locator('.sp-settings-allowance-details').getAttribute('open'), null)
+    await showAllowanceSettings()
     await page.getByRole('button', { name: '设置夜班津贴', exact: true }).click()
     await page.getByLabel('夜班班次津贴', { exact: true }).fill('80')
     await page.getByRole('button', { name: '取消津贴编辑', exact: true }).click()
@@ -210,6 +216,7 @@ async function main() {
     await navigate('排班日历')
     await amount('qa-2', 165)
     await navigate('班次津贴')
+    await showAllowanceSettings()
     await page.getByRole('button', { name: '设置夜班津贴', exact: true }).click()
     await page.getByLabel('夜班班次津贴', { exact: true }).fill('50')
     await page.getByRole('button', { name: '保存班次津贴', exact: true }).click()
@@ -280,6 +287,7 @@ async function main() {
     record('mobile-three-column-member-summary-shows-amounts-without-horizontal-scroll', summaryGeometry)
     await page.screenshot({ path: path.join(output, '05-fixed-allowance-panel-mobile.png') })
 
+    await showAllowanceSettings()
     await page.getByRole('button', { name: '设置夜班津贴', exact: true }).click()
     await page.getByLabel('夜班班次津贴', { exact: true }).scrollIntoViewIfNeeded()
     await widthCheck('mobile-fixed-allowance-editor-no-overflow')

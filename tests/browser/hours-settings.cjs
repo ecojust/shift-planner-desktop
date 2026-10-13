@@ -36,7 +36,7 @@ async function main() {
     await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: label }).click()
     if (compact) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
-  async function month(value) { const input = page.getByRole('textbox', { name: '月参考工时的排班月份' }); await input.fill(value); await input.dispatchEvent('change'); await persisted(s => s.month === value) }
+  async function month(value) { const input = page.getByLabel('全局排班月份', { exact: true }); await input.fill(value); await input.dispatchEvent('change'); await persisted(s => s.month === value) }
   async function reference(value) { await page.getByLabel('手动月参考工时', { exact: true }).fill(String(value)); await page.getByRole('button', { name: '保存本月', exact: true }).click(); await persisted(s => s.monthlyReferenceHours?.[s.month] === value) }
   const employee = name => page.locator('.sp-settings-employee-card').filter({ has: page.getByRole('heading', { name, exact: true }) })
   const follow = name => page.getByLabel(`${name}月最低工时跟随月参考值`, { exact: true })

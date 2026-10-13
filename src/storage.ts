@@ -1,6 +1,7 @@
 import { strToU8, zipSync } from 'fflate'
 import { dayInfo, calculatePayroll, createPayrollConfig, payrollRows as makePayrollRows } from './payroll.ts'
 import type { DayKind, PlannerDocument, PayrollSettings, PayrollResult } from './payroll'
+import type { Shift } from './domain.ts'
 import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
 import { findWeightedWeek, weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
 
@@ -76,13 +77,15 @@ export function parseBackup(text: string): PlannerDocument {
   try { decoded = JSON.parse(text.replace(/^\uFEFF/, '')) } catch { fail('无法读取 JSON 文件') }
   const root = object(decoded, '备份')
   if (root.version !== 1) fail('不支持此备份版本')
-  const shifts = list(root.shifts, 24, '班次').map((entry, index) => {
+  const shifts = list(root.shifts, 24, '班次').map((entry, index): Shift => {
     const s = object(entry, `班次 ${index + 1}`)
     const shiftId = id(s.id, '班次 ID')
     if (shiftId === 'off') fail('off 为休息专用标识')
     const start = time(s.start, '开始时间'), end = time(s.end, '结束时间')
     if (start === end) fail('班次开始和结束时间不能相同')
-    return { id: shiftId, name: string(s.name, 60, '班次名称'), shortName: string(s.shortName, 8, '班次简称'), start, end, color: color(s.color, '班次颜色'), required: number(s.required, 0, 200, '每日需求人数', true), ...(s.normalAllowance === undefined ? {} : { normalAllowance: currency(s.normalAllowance, '班次普通津贴') }) }
+    const staffingMode = s.staffingMode
+    if (staffingMode !== undefined && staffingMode !== 'minimum' && staffingMode !== 'fixed') fail('班次人数模式必须为 minimum 或 fixed')
+    return { id: shiftId, name: string(s.name, 60, '班次名称'), shortName: string(s.shortName, 8, '班次简称'), start, end, color: color(s.color, '班次颜色'), required: number(s.required, 0, 200, '每日需求人数', true), ...(staffingMode === undefined ? {} : { staffingMode }), ...(s.normalAllowance === undefined ? {} : { normalAllowance: currency(s.normalAllowance, '班次普通津贴') }) }
   })
   unique(shifts.map(s => s.id), '班次 ID')
   const shiftIds = new Set(shifts.map(s => s.id))
@@ -266,11 +269,11 @@ function sheet(rows: Cell[][]): string {
 export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Cell[][] } = {}): Uint8Array {
   const safe = parseBackup(JSON.stringify(state))
   const payroll = documentPayroll(safe)
-  const rows: Cell[][][] = [table(safe, payroll), [['班次', '简称', '开始时间', '结束时间', '每天最低人数', '单班工时', '固定班次津贴（元/人/班）'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.required, duration(s.start, s.end), s.normalAllowance ?? 0]), ['说明', '每天每班人数不得低于最低要求，可额外安排人员。班次格子归属开始日期；本月工时按实际时段拆月，上月跨夜进入本月的部分计入，月底跨出部分不计。']], options.payrollRows ?? makePayrollRows(payroll)]
+  const rows: Cell[][][] = [table(safe, payroll), [['班次', '简称', '开始时间', '结束时间', '人数模式', '每日人数', '单班工时', '固定班次津贴（元/人/班）'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.staffingMode === 'fixed' ? '每日固定' : '每日最少', s.required, duration(s.start, s.end), s.normalAllowance ?? 0]), ['说明', '每日最少：每天该班次不得少于设定人数，可增加安排，设为 0 仍可排班。每日固定：每天该班次须恰好达到设定人数，设为 0 不得安排。班次格子归属开始日期；本月工时按实际时段拆月，上月跨夜进入本月的部分计入，月底跨出部分不计。']], options.payrollRows ?? makePayrollRows(payroll)]
   rows[1]!.push(['津贴口径', '每人每次排班领取该班次设置的固定津贴，全部计入排班开始日期，跨夜只计一次。津贴与工资、工时、倍率及节假日无关。'])
   if (safe.rules.weekdayWeights) {
     const rule = safe.rules.weekdayWeights
-    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班最低人数，各组内每日差不超过 1 班。月首尾不足整周时，匹配完整周基准表示可满足比例的周总量，不表示月外已有这些排班。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '最低班位缺口', '权重分布检查', ...safe.shifts.map(s => s.name + '实际班次')])
+    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班的最少或固定人数要求，各组内每日差不超过 1 班。月首尾不足整周时，匹配完整周基准表示可满足比例的周总量，不表示月外已有这些排班。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', ...safe.shifts.map(s => s.name + '实际班次')])
     for (const week of weightedWeeks(safe)) {
       const assignments = safe.assignments.filter(item => week.dates.includes(item.date) && item.shiftId !== 'off')
       const selectedActual = assignments.filter(item => week.selectedDates.includes(item.date)).length
@@ -280,9 +283,17 @@ export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Ce
         const counts = dates.map(date => assignments.filter(item => item.date === date).length)
         return counts.length < 2 || Math.max(...counts) - Math.min(...counts) <= 1
       })
-      const minimumGap = week.dates.reduce((sum, date) => sum + safe.shifts.reduce((n, shift) => n + Math.max(0, shift.required - assignments.filter(item => item.date === date && item.shiftId === shift.id).length), 0), 0)
-      const problems = [minimumGap ? '最低覆盖不足' : '', !matched ? '星期比例未匹配' : '', !evenGroups ? '同组日期分布不均' : ''].filter(Boolean)
-      rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, assignments.length, selectedActual, otherActual, matched?.fullTotal ?? '未匹配', minimumGap, problems.join('；') || '通过', ...safe.shifts.map(shift => assignments.filter(item => item.shiftId === shift.id).length)])
+      let minimumGap = 0, fixedGap = 0, fixedExcess = 0
+      for (const date of week.dates) for (const shift of safe.shifts) {
+        const count = assignments.filter(item => item.date === date && item.shiftId === shift.id).length
+        const gap = Math.max(0, shift.required - count)
+        if (shift.staffingMode === 'fixed') {
+          fixedGap += gap
+          fixedExcess += Math.max(0, count - shift.required)
+        } else minimumGap += gap
+      }
+      const problems = [minimumGap ? '最低覆盖不足' : '', fixedGap ? '固定人数不足' : '', fixedExcess ? '固定人数超额' : '', !matched ? '星期比例未匹配' : '', !evenGroups ? '同组日期分布不均' : ''].filter(Boolean)
+      rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, assignments.length, selectedActual, otherActual, matched?.fullTotal ?? '未匹配', minimumGap + fixedGap, fixedExcess, problems.join('；') || '通过', ...safe.shifts.map(shift => assignments.filter(item => item.shiftId === shift.id).length)])
     }
   }
   if (rows.some(items => items.length > 100000 || items.some(row => row.length > 256))) throw new Error('Excel 导出数据量超出限制')

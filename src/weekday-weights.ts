@@ -95,28 +95,68 @@ export function weightedDayRange(week: WeightedWeek, date: string): [number, num
 
 /**
  * Necessary headcount upper bound with a variable W, never a feasibility guarantee.
- * Every date retains the sum of per-shift minimum coverage; optional shifts count
- * toward available staffing too. Hour limits, rest, eligibility by shift and
+ * Every date retains required coverage and fixed shifts also cap its headcount.
+ * Minimum-mode optional shifts can grow; fixed zero-capacity shifts cannot.
+ * Hour limits, rest, detailed eligibility matching and
  * separation groups still require the scheduler to solve the actual assignments.
  */
 export function weekdayWeightCapacity(state: PlannerState): { maxPercent: number | null; explanation: string } {
-  const explanation = '在每班每日最低人数不减少的前提下，枚举可增排的完整周班次数，按每人每天最多一班、请假、可上班次及锁定安排估算人数上限；各班资格、休息间隔、工时上下限和互斥规则仍须通过求解，不代表一定可排。'
+  const explanation = '按严格覆盖估算：最低人数班可增排，固定人数班不能超额；结合每人每天最多一班、请假、可上班次及锁定安排计算人数上限。具体班次资格匹配、休息间隔、工时上下限和互斥规则仍须通过求解，不代表一定可排；允许缺员时该参考上限不适用。'
   const rule = state.rules.weekdayWeights
   if (!rule || weekdayWeightRuleError(rule)) return { maxPercent: null, explanation }
   const weeks = weightedWeeks(state)
   if (!weeks.length) return { maxPercent: null, explanation }
   const capacity = new Map<string, number>()
   const minimum = new Map<string, number>()
-  const shifts = new Set(state.shifts.map(shift => shift.id))
-  const locked = new Map(state.assignments.filter(a => a.locked).map(a => [`${a.employeeId}:${a.date}`, a.shiftId]))
+  const shifts = new Map(state.shifts.map(shift => [shift.id, shift]))
+  const employees = new Map(state.employees.map(employee => [employee.id, employee]))
+  const lockedByDate = new Map<string, Map<string, Set<string>>>()
+  for (const assignment of state.assignments) {
+    if (!assignment.locked) continue
+    let byEmployee = lockedByDate.get(assignment.date)
+    if (!byEmployee) lockedByDate.set(assignment.date, byEmployee = new Map())
+    let ids = byEmployee.get(assignment.employeeId)
+    if (!ids) byEmployee.set(assignment.employeeId, ids = new Set())
+    ids.add(assignment.shiftId)
+  }
   for (const week of weeks) for (const date of week.dates) {
-    capacity.set(date, state.employees.filter(employee => {
-      if (employee.unavailableDates.includes(date) || employee.maxHoursPerWeek <= 0) return false
-      const fixed = locked.get(`${employee.id}:${date}`)
-      if (fixed !== undefined) return fixed !== 'off' && shifts.has(fixed) && employee.eligibleShiftIds.includes(fixed)
-      return employee.eligibleShiftIds.some(id => shifts.has(id))
-    }).length)
-    minimum.set(date, state.shifts.reduce((sum, shift) => sum + Math.max(shift.required, new Set(state.assignments.filter(a => a.date === date && a.locked && a.shiftId === shift.id).map(a => a.employeeId)).size), 0))
+    const locked = lockedByDate.get(date) ?? new Map<string, Set<string>>()
+    const lockedCounts = new Map<string, number>()
+    let workingLocks = 0
+    for (const [employeeId, ids] of locked) {
+      const employee = employees.get(employeeId)
+      if (!employee || ids.size !== 1) return { maxPercent: null, explanation }
+      const shiftId = ids.values().next().value!
+      if (shiftId === 'off') continue
+      const shift = shifts.get(shiftId)
+      if (!shift || !employee.eligibleShiftIds.includes(shiftId) || employee.unavailableDates.includes(date) || employee.maxHoursPerWeek <= 0) return { maxPercent: null, explanation }
+      const count = (lockedCounts.get(shiftId) ?? 0) + 1
+      if (shift.staffingMode === 'fixed' && count > shift.required) return { maxPercent: null, explanation }
+      lockedCounts.set(shiftId, count)
+      workingLocks++
+    }
+    const available = state.employees.filter(employee => !locked.has(employee.id) && !employee.unavailableDates.includes(date) && employee.maxHoursPerWeek > 0)
+    const eligibleEmployees = new Set<string>()
+    let availableSlots = 0
+    let required = 0
+    for (const shift of state.shifts) {
+      const count = lockedCounts.get(shift.id) ?? 0
+      required += Math.max(shift.required, count)
+      const remaining = shift.staffingMode === 'fixed' ? shift.required - count : available.length
+      if (remaining <= 0) continue
+      let eligible = 0
+      for (const employee of available) {
+        if (!employee.eligibleShiftIds.includes(shift.id)) continue
+        eligible++
+        eligibleEmployees.add(employee.id)
+      }
+      availableSlots += Math.min(remaining, eligible)
+    }
+    // Both bounds can overestimate a bipartite employee/shift matching, but
+    // neither can underestimate it. Shared qualifications must not be greedily
+    // consumed here: that could turn a feasible mixed-mode model into "no room".
+    capacity.set(date, workingLocks + Math.min(eligibleEmployees.size, availableSlots))
+    minimum.set(date, required)
     if (minimum.get(date)! > capacity.get(date)!) return { maxPercent: null, explanation }
   }
   function fitsGroup(dates: string[], total: number) {

@@ -158,7 +158,9 @@ def validate_request(request):
         shift_ids.add(sid)
         if _clock(shift.get('start')) == _clock(shift.get('end')):
             raise InvalidInput('班次开始和结束时间不能相同。')
-        _num(shift.get('required'), '每日班次最低人数', 0, MAX_EMPLOYEES, True)
+        _num(shift.get('required'), '每日班次人数', 0, MAX_EMPLOYEES, True)
+        if shift.get('staffingMode', 'minimum') not in ('minimum', 'fixed'):
+            raise InvalidInput('班次人数模式必须为 minimum（每日最少）或 fixed（每日固定）。')
     employee_ids = set()
     for emp in employees:
         _obj(emp, '员工')
@@ -308,12 +310,30 @@ def solve(request: Any) -> dict:
             selected = set(group['shiftIds']) or set(smap)
             if any(len(staff & members) > 1 for (_, sid), staff in fixed_coverage.items() if sid in selected):
                 conflicts.append(issue('separation', f'固定排班违反同班互斥分组“{group.get("name", group["id"])}”。'))
+        for (day, sid), staff in fixed_coverage.items():
+            if day in active and smap[sid].get('staffingMode', 'minimum') == 'fixed' and len(staff) > smap[sid]['required']:
+                conflicts.append(issue('overstaffed', f'{smap[sid].get("name", sid)}锁定排班有 {len(staff)} 人，超过每日固定人数 {smap[sid]["required"]}；允许缺员也不能突破固定人数上限。', date=dt.date.fromordinal(day).isoformat()))
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
             return response('INFEASIBLE', '固定排班存在硬约束冲突，原排班未修改。', conflicts)
-        # Daily required counts are lower bounds, so they never cap the team's
-        # available monthly work. Individual availability checks remain below.
+        # Minimum-mode counts never cap available monthly work. Fixed-mode
+        # ceilings are enforced per day below, including when shortages are allowed.
+        if all(s.get('staffingMode', 'minimum') == 'fixed' for s in shifts):
+            # This upper bound is valid only when EVERY shift has a hard daily
+            # ceiling. Include actual carry-in work, not a guessed prior-month quota.
+            capacity = sum(
+                overlap_minutes(day * DAY + clock, day * DAY + clock + duration, month_start, month_end) * smap[sid]['required']
+                for day in dates for sid, (clock, duration) in shift_times.items()
+            ) + sum(
+                overlap_minutes(start, end, month_start, month_end)
+                for work in fixed_work.values() for start, end, a in work if _date(a['date']) not in active
+            )
+            minimum = sum(monthly_minimums.values())
+            if minimum > capacity:
+                return response('INFEASIBLE', '全部班次的固定人数上限无法提供所需月工时，原排班未修改。', [issue(
+                    'monthly-min-hours', f'月最低工时合计 {_hours_text(minimum)} 小时，固定人数上限在本月最多提供 {_hours_text(capacity)} 小时；请调整固定人数、最低工时或将适合的班次改为每日最少人数。'
+                )])
         check_time()
         model = cp_model.CpModel()
         x = {}
@@ -342,6 +362,8 @@ def solve(request: Any) -> dict:
                 day_week_maximums = defaultdict(int)
                 for sid in e['eligibleShiftIds']:
                     if caps[eid] == 0:
+                        continue
+                    if smap[sid].get('staffingMode', 'minimum') == 'fixed' and len(fixed_coverage[(day, sid)]) >= smap[sid]['required']:
                         continue
                     clock, duration = shift_times[sid]
                     start, end = day * DAY + clock, day * DAY + clock + duration
@@ -407,10 +429,18 @@ def solve(request: Any) -> dict:
             for s in shifts:
                 target = max(0, int(s['required']) - len(fixed_coverage[(day, s['id'])]))
                 terms = coverage[(day, s['id'])]
+                fixed_staffing = s.get('staffingMode', 'minimum') == 'fixed'
                 if allow_partial:
                     shortage = model.new_int_var(0, target, f'shortage_{day}_{s["id"]}')
                     shortages.append(shortage)
-                    model.add_max_equality(shortage, [target - sum(terms), 0])
+                    if fixed_staffing:
+                        # A nonnegative exact shortfall keeps the fixed ceiling
+                        # hard and provides a tighter linear model than max().
+                        model.add(sum(terms) + shortage == target)
+                    else:
+                        model.add_max_equality(shortage, [target - sum(terms), 0])
+                elif fixed_staffing:
+                    model.add(sum(terms) == target)
                 else:
                     model.add(sum(terms) >= target)
         if weights:
@@ -529,7 +559,7 @@ def solve(request: Any) -> dict:
         if saved_assignments is not None and status in (cp_model.UNKNOWN, cp_model.OPTIMAL):
             return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, None, None, '已保留满足全部硬约束的可行方案，后续班次数或公平轮班优化达到时限。')
         if status == cp_model.INFEASIBLE:
-            return response('INFEASIBLE', '已证明当前硬约束无法同时满足，原排班未修改。请检查每日最低人数、请假、工时、班间休息、同班互斥及星期权重；允许缺员也不会放宽星期配额和工时规则。', [issue('infeasible', '现有人员、每日最低人数与硬规则存在冲突。')])
+            return response('INFEASIBLE', '已证明当前硬约束无法同时满足，原排班未修改。请检查每日最少或固定人数、请假、工时、班间休息、同班互斥及星期权重；允许缺员也不会放宽固定人数上限、星期配额和工时规则。', [issue('infeasible', '现有人员、班次人数设置与硬规则存在冲突。')])
         if status == cp_model.MODEL_INVALID:
             return response('MODEL_INVALID', '求解器拒绝了无效模型，原排班未修改。', [issue('model-invalid', solver.solution_info()[:1000])])
         return response('UNKNOWN', '求解达到时限，尚未找到可行方案；这不代表无解。原排班未修改。', [issue('timeout', '可增加求解时限后重试。')])
@@ -555,7 +585,8 @@ def _success(response, assignments, status, state, shortage, objective, bound, m
         for shift in state['shifts']:
             missing = shift['required'] - coverage[(date.isoformat(), shift['id'])]
             if missing > 0:
-                shortages.append({'id': f'coverage-{date}-{shift["id"]}', 'type': 'coverage', 'severity': 'warning', 'date': date.isoformat(), 'message': f'{date.isoformat()} {shift.get("name", shift["id"])}比每日最低人数缺 {missing} 人。'})
+                mode = '固定' if shift.get('staffingMode', 'minimum') == 'fixed' else '最少'
+                shortages.append({'id': f'coverage-{date}-{shift["id"]}', 'type': 'coverage', 'severity': 'warning', 'date': date.isoformat(), 'message': f'{date.isoformat()} {shift.get("name", shift["id"])}比每日{mode}人数缺 {missing} 人。'})
     if message is None:
         message = '已找到最优排班方案。' if status == 'OPTIMAL' else '已找到可行排班方案；时限内尚未证明公平性最优。'
         if shortage:

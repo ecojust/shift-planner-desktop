@@ -92,7 +92,8 @@ const requiredPerDay = computed(() => state.value.shifts.reduce((sum, s) => sum 
 const coverage = computed(() => {
   const total = dates.value.length * requiredPerDay.value
   const filled = dates.value.reduce((sum, date) => sum + state.value.shifts.reduce((n, s) => n + Math.min(s.required, monthAssignments.value.filter(a => a.date === date && a.shiftId === s.id).length), 0), 0)
-  return { total, filled, percentage: total ? Math.round(filled / total * 100) : 100 }
+  const excess = dates.value.reduce((sum, date) => sum + state.value.shifts.reduce((n, s) => n + (s.staffingMode === 'fixed' ? Math.max(0, monthAssignments.value.filter(a => a.date === date && a.shiftId === s.id).length - s.required) : 0), 0), 0)
+  return { total, filled, excess, percentage: total ? Math.round(filled / total * 100) : 100 }
 })
 const lockedCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.locked).length)
 const dayAllowances = computed(() => new Map(payroll.value.dailyRows.map(row => [`${row.employeeId}:${row.date}`, row])))
@@ -112,7 +113,10 @@ function employeeHours(id: string) { return Number((actualMonthHours.value.get(i
 function employeeDays(id: string) { return monthAssignments.value.filter(a => a.employeeId === id).length }
 function dailyFilled(date: string) { return monthAssignments.value.filter(a => a.date === date).length }
 function dailyCovered(date: string) {
-  return state.value.shifts.every(shift => monthAssignments.value.filter(a => a.date === date && a.shiftId === shift.id).length >= shift.required)
+  return state.value.shifts.every(shift => {
+    const count = monthAssignments.value.filter(a => a.date === date && a.shiftId === shift.id).length
+    return shift.staffingMode === 'fixed' ? count === shift.required : count >= shift.required
+  })
 }
 function dayAllowance(employeeId: string, date: string) { return dayAllowances.value.get(`${employeeId}:${date}`) }
 function dailyAllowanceTotal(date: string) { return employees.value.reduce((sum, employee) => sum + Math.round((dayAllowance(employee.id, date)?.totalAllowance ?? 0) * 100), 0) / 100 }
@@ -128,12 +132,19 @@ function flash(message: string) { notice.value = message; window.clearTimeout(no
 function remember() { history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])) }); if (history.value.length > 10) history.value.shift() }
 function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; flash('已撤销上一次排班调整') } }
 function chooseSection(value: Section) { section.value = value; mobileNav.value = false }
-function changeMonth(value: string) { if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value)) return; state.value.month = value; weekIndex.value = 0; history.value = [] }
+function changeMonth(value: string) { if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value) || Number(value.slice(0, 4)) < 1) return; state.value.month = value; weekIndex.value = 0; history.value = [] }
+function selectMonth(event: Event) {
+  const input = event.target as HTMLInputElement
+  changeMonth(input.value)
+  input.value = state.value.month
+}
+function navigateMonth(direction: number) {
+  const index = Number(state.value.month.slice(0, 4)) * 12 + Number(state.value.month.slice(5)) - 1 + direction
+  if (index < 12 || index >= 120000) return
+  changeMonth(`${String(Math.floor(index / 12)).padStart(4, '0')}-${String(index % 12 + 1).padStart(2, '0')}`)
+}
 function navigatePeriod(direction: number) {
-  if (view.value === 'week' && weekIndex.value + direction >= 0 && weekIndex.value + direction < weekCount.value) { weekIndex.value += direction; return }
-  const d = new Date(`${state.value.month}-15T12:00:00`); d.setMonth(d.getMonth() + direction)
-  changeMonth(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`)
-  if (view.value === 'week' && direction < 0) weekIndex.value = weekCount.value - 1
+  if (view.value === 'week' && weekIndex.value + direction >= 0 && weekIndex.value + direction < weekCount.value) weekIndex.value += direction
 }
 function goToday() { changeMonth(today.slice(0, 7)); weekIndex.value = weekOf(today) }
 function openCell(employee: Employee, date: string) { const a = entry(employee.id, date); editing.value = { employee, date, shiftId: leave(employee, date) ? 'leave' : a?.shiftId || 'off', locked: a?.locked ?? true } }
@@ -295,7 +306,7 @@ function escapeKey(event: KeyboardEvent) {
   if (event.key === 'Escape') { editing.value = null; calendarDate.value = ''; showGenerate.value = false; showBackup.value = false; showHelp.value = false; importCandidate.value = null; mobileNav.value = false }
   if (event.key === 'Tab') {
     const modal = document.querySelector('.sp-modal')
-    const controls = modal ? [...modal.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href]')].filter(e => e.offsetParent !== null) : []
+    const controls = modal ? [...modal.querySelectorAll<HTMLElement>('button:not(:disabled), input:not(:disabled), select:not(:disabled), a[href], summary')].filter(e => e.offsetParent !== null) : []
     if (controls.length) {
       const first = controls[0]!, last = controls[controls.length - 1]!
       if (event.shiftKey && (document.activeElement === first || !modal?.contains(document.activeElement))) { event.preventDefault(); last.focus() }
@@ -318,7 +329,16 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
       <div class="sp-sidebar-bottom"><button class="sp-help" @click="showBackup = true; mobileNav = false"><Icon name="file" :size="18" />备份与恢复</button><button class="sp-help" @click="showHelp = true; mobileNav = false"><Icon name="info" :size="18" />使用帮助</button></div>
     </aside>
     <div class="sp-main">
-      <header class="sp-topbar"><div class="sp-breadcrumb"><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" @click="mobileNav = true"><Icon name="menu" /></button><span>工作空间</span><Icon name="arrow" :size="13" /><strong>{{ sectionLabel }}</strong></div><div class="sp-top-actions"><span class="sp-save-indicator" :class="{ error: saveError }"><i></i>{{ saveError ? '保存异常' : savedAt ? `${savedAt} 已保存` : '本地保存' }}</span><span class="sp-build-version" title="北京时间 · 本次软件构建时间" :aria-label="`构建版本 ${BUILD_VERSION}`"><span>构建</span><code>{{ BUILD_VERSION }}</code></span></div></header>
+      <header class="sp-topbar">
+        <div class="sp-breadcrumb"><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" @click="mobileNav = true"><Icon name="menu" /></button><strong>{{ sectionLabel }}</strong></div>
+        <div class="sp-global-month" role="group" aria-label="所有面板共用排班月份">
+          <button class="sp-icon-button" aria-label="上个月" :disabled="state.month === '0001-01'" @click="navigateMonth(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button>
+          <label><span>排班月份</span><input :value="state.month" type="month" min="0001-01" max="9999-12" aria-label="全局排班月份" @change="selectMonth" /></label>
+          <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
+          <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
+        </div>
+        <div class="sp-top-actions"><span class="sp-save-indicator" :class="{ error: saveError }"><i></i>{{ saveError ? '保存异常' : savedAt ? `${savedAt} 已保存` : '本地保存' }}</span><span class="sp-build-version" title="北京时间 · 本次软件构建时间" :aria-label="`构建版本 ${BUILD_VERSION}`"><span>构建</span><code>{{ BUILD_VERSION }}</code></span></div>
+      </header>
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
@@ -327,7 +347,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消并停止本地任务…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成浏览器排班' }}</strong><p>总计 {{ elapsedSeconds }} 秒<span v-if="desktop"> · 当前阶段 {{ phaseSeconds }} 秒</span> · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `排班搜索时限 ${solveTimeLimit} 秒，结束后还需返回并校验结果。` : solvePhase === 'finishing' ? '搜索已结束，正在返回并校验结果。' : `正在准备本地算法，启动和加载不占 ${solveTimeLimit} 秒搜索时限。` }}</p><p v-else>浏览器搜索时限 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
         <div v-if="solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status"><Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" /><div><strong>{{ solverFeedback.message }}</strong><ul v-if="solverFeedback.details.length"><li v-for="(detail,index) in solverFeedback.details.slice(0,8)" :key="index">{{ detail }}</li></ul><p v-if="solverFeedback.details.length > 8">还有 {{ solverFeedback.details.length - 8 }} 项，请检查规则与锁定安排。</p><details v-if="solverFeedback.diagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>若重新检测后仍无法启动，开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查打包的算法组件与本机运行环境。</p></details></div><button class="sp-icon-button" aria-label="关闭求解结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button></div>
         <dl v-if="section === 'calendar'" class="sp-overview" aria-label="本月排班概览">
-          <div><dt>最低覆盖</dt><dd>{{ coverage.percentage }}<small>%</small></dd><span :class="coverage.percentage === 100 ? 'sp-text-green' : 'sp-text-amber'">{{ coverage.percentage === 100 ? `${coverage.filled} 个最低班位已满足` : `缺 ${coverage.total - coverage.filled} 个班位` }}</span></div>
+          <div><dt>需求覆盖</dt><dd>{{ coverage.percentage }}<small>%</small></dd><span :class="coverage.percentage === 100 && !coverage.excess ? 'sp-text-green' : 'sp-text-amber'">{{ coverage.excess ? `固定班次超出 ${coverage.excess} 人次，请调整` : coverage.percentage === 100 ? `${coverage.filled} 个需求班位已满足` : `缺 ${coverage.total - coverage.filled} 个班位` }}</span></div>
           <div><dt>参与成员</dt><dd>{{ state.employees.length }}<small>人</small></dd><span>{{ state.shifts.length }} 种班次</span></div>
           <div><dt>计划工时</dt><dd>{{ totalHours.toLocaleString('zh-CN') }}<small>h</small></dd><span>{{ lockedCount }} 项已锁定</span></div>
         </dl>
@@ -340,7 +360,10 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
 
         <template v-if="section === 'calendar'">
           <section class="sp-calendar-card" aria-label="人员排班表">
-            <div class="sp-calendar-toolbar"><div class="sp-date-controls"><label class="sp-month-label"><Icon name="calendar" :size="19" /><span>{{ monthTitle }}</span><input :value="state.month" type="month" aria-label="选择排班月份" @change="changeMonth(($event.target as HTMLInputElement).value)" /></label><div class="sp-arrows"><button class="sp-icon-button" aria-label="上一时段" @click="navigatePeriod(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button><button class="sp-icon-button" aria-label="下一时段" @click="navigatePeriod(1)"><Icon name="arrow" :size="16" /></button></div><button class="sp-today" @click="goToday">今天</button><span class="sp-period">{{ period }}</span></div><div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div></div>
+            <div class="sp-calendar-toolbar">
+              <div class="sp-date-controls"><span class="sp-month-label"><Icon name="calendar" :size="19" /><span>{{ monthTitle }}</span></span><div v-if="view === 'week'" class="sp-arrows"><button class="sp-icon-button" aria-label="上一时段" title="本月上一周" :disabled="weekIndex === 0" @click="navigatePeriod(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button><button class="sp-icon-button" aria-label="下一时段" title="本月下一周" :disabled="weekIndex >= weekCount - 1" @click="navigatePeriod(1)"><Icon name="arrow" :size="16" /></button></div><span class="sp-period">{{ period }}</span></div>
+              <div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div>
+            </div>
             <div class="sp-filterbar"><div class="sp-filters"><label class="sp-search"><Icon name="search" :size="16" /><input v-model="employeeQuery" placeholder="搜索成员" aria-label="搜索成员" /></label><select v-model="groupFilter" aria-label="按工作组筛选"><option value="">全部工作组</option><option v-for="g in groups" :key="g" :value="g">{{ g }}</option></select></div><div class="sp-legend"><span v-for="s in state.shifts" :key="s.id"><i :style="{ background: s.color }"></i>{{ s.name }}</span><span><i class="sp-leave-dot"></i>请假</span><button class="sp-icon-button" :disabled="!history.length" aria-label="撤销上次调整" @click="undo"><Icon name="undo" :size="16" /></button></div></div>
             <div class="sp-table-scroll" tabindex="0" aria-label="可横向滚动的排班表">
               <table class="sp-schedule-table" :class="{ 'sp-month-table': view === 'month' }">
@@ -368,7 +391,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
                   <tr v-if="!employees.length"><td :colspan="visibleDates.length+3" class="sp-empty">没有找到成员，请修改筛选条件或添加成员。</td></tr>
                 </tbody>
                 <tfoot>
-                  <tr><th class="sp-person-col">每日覆盖 <small>已安排 / 最低人数</small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
+                  <tr><th class="sp-person-col">每日覆盖 <small>已安排 / 需求人数</small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
                   <tr class="sp-allowance-footer"><th class="sp-person-col">津贴合计<small>当前筛选成员</small></th><td v-for="date in visibleDates" :key="date">¥{{ payrollError ? '—' : money(dailyAllowanceTotal(date)) }}</td><td class="sp-hours-col">当月汇总 →</td><td class="sp-allowance-col" :data-allowance-total="payrollError ? null : filteredAllowanceTotal"><strong>¥{{ payrollError ? '—' : money(filteredAllowanceTotal) }}</strong></td></tr>
                 </tfoot>
               </table>
@@ -379,12 +402,12 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
           <div v-if="showIssues" class="sp-issues"><template v-if="issues.length"><button v-for="issue in issues.slice(0, 100)" :key="issue.id" @click="jumpToIssue(issue.date)"><span :class="issue.severity">{{ issue.severity === 'error' ? '冲突' : '提醒' }}</span><span>{{ issue.message }}</span><small v-if="issue.date">{{ issue.date }} ↗</small></button><p v-if="issues.length > 100">还有 {{ issues.length - 100 }} 项，请先处理当前提醒。</p></template><p v-else>休假、班次资格、月最低与周工时上下限、连续工作和休息间隔均通过检查。<button class="sp-link" @click="chooseSection('rules')">自定义规则 →</button></p></div>
         </template>
 
-        <SettingsPanel v-if="section !== 'calendar'" :state="state" :section="section" :payroll="state.payroll" :calendar="state.calendar" @change="settingsChanged" />
         <section v-if="section === 'payroll'" class="sp-payroll-card">
           <div class="sp-subheading"><div><h2>{{ monthTitle }} · 成员津贴汇总</h2><p>按本月开始的班次数累计固定津贴，跨夜班只在开始日期领取一次。</p></div></div>
           <div v-if="!payrollError" class="sp-table-scroll"><table class="sp-payroll-table"><thead><tr><th>团队成员</th><th>本月工时</th><th>额外津贴</th></tr></thead><tbody><tr v-for="row in payroll.rows" :key="row.employeeId"><th>{{ row.name }}</th><td>{{ row.totalHours }} h</td><td class="sp-text-gold"><strong>¥{{ money(row.totalAllowance) }}</strong></td></tr><tr v-if="!payroll.rows.length"><td colspan="3">暂无成员，请先添加成员并安排班次。</td></tr></tbody><tfoot><tr><th>合计</th><td>{{ totalHours }} h</td><td><strong>¥{{ money(payroll.totalAllowance) }}</strong></td></tr></tfoot></table></div>
           <div v-if="payroll.warnings.length" class="sp-payroll-note"><Icon name="info" :size="17" /><span>{{ payroll.warnings.join('；') }}</span></div>
         </section>
+        <SettingsPanel v-if="section !== 'calendar'" :state="state" :section="section" :payroll="state.payroll" :calendar="state.calendar" @change="settingsChanged" />
       </main>
     </div>
 
@@ -395,12 +418,30 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
 
     <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" @click="saveCalendar(true)">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
 
-    <div v-if="showGenerate" class="sp-overlay" @click.self="showGenerate = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title"><div class="sp-modal-heading"><div><h2 id="sp-generate-title">为 {{ monthTitle }} 生成排班</h2></div><button class="sp-icon-button" aria-label="关闭自动排班" @click="showGenerate = false"><Icon name="close" /></button></div><div class="sp-generation-summary"><Icon name="spark" :size="35" /><div><strong>{{ state.employees.length }} 位成员 · {{ state.shifts.length }} 个班次</strong><p>至少需要 {{ coverage.total }} 个班位，保留 {{ lockedCount }} 个已锁定安排。</p></div></div><p class="sp-modal-copy">将重新安排本月未锁定的班次，综合考虑请假、班次资格、月最低工时、周工时上下限、休息间隔、指定人员同班互斥、上班权重与轮班公平性。</p><template v-if="desktop"><div class="sp-solver-options"><div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>本地 OR-Tools CP-SAT</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div><p v-if="engineState === 'checking'" class="sp-engine-explanation">启动检测完成后即可开始排班，避免检测与计算同时占用本地算法。</p><details v-if="engineDiagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查算法组件与运行环境。</p></details><label>最长搜索时间<select v-model.number="solveTimeLimit" aria-label="最长搜索时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select></label><label class="sp-partial-option"><input v-model="allowPartial" type="checkbox" /><span>允许岗位缺编<small>其他硬规则仍须满足；上班权重按实际班次数核对。</small></span></label></div><p class="sp-modal-copy">{{ allowPartial ? '尽量满足每天每班最低人数，允许部分最低班位留空；只接受通过其余硬性规则检查的方案。' : '每天每班必须达到最低人数，允许额外安排人员。如果规则冲突或时间内未找到方案，不会改动原排班。' }}</p></template><p v-else class="sp-modal-note">当前为浏览器启发式排班，无法保证找到最优方案。每天每班最低人数须满足，上班权重和工时限制须通过规则检查。桌面版可使用本地约束求解器。</p><p class="sp-modal-note">其他月份保持原样。本次生成后，可使用表格右上角的撤销按钮恢复。</p><div class="sp-modal-actions"><button class="sp-button" @click="showGenerate = false">再看看</button><button class="sp-button sp-primary" :disabled="desktop && engineState !== 'ready'" @click="generate"><Icon name="spark" :size="17" />{{ desktop && engineState === 'checking' ? '等待启动检测' : '开始生成' }}</button></div></section></div>
+    <div v-if="showGenerate" class="sp-overlay" @click.self="showGenerate = false">
+      <section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title">
+        <div class="sp-modal-heading"><h2 id="sp-generate-title">为 {{ monthTitle }} 生成排班</h2><button class="sp-icon-button" aria-label="关闭自动排班" @click="showGenerate = false"><Icon name="close" /></button></div>
+        <div class="sp-generation-summary"><Icon name="spark" :size="35" /><div><strong>{{ state.employees.length }} 位成员 · {{ state.shifts.length }} 个班次</strong><p>需求 {{ coverage.total }} 个班位 · 保留 {{ lockedCount }} 项锁定安排</p></div></div>
+        <p class="sp-modal-copy">按成员工时、请假和已设置规则重新安排本月未锁定班次。每日最少人数可增派；每日固定人数须恰好满足。</p>
+        <template v-if="desktop">
+          <div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>本地 OR-Tools CP-SAT</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div>
+          <p v-if="engineState === 'checking'" class="sp-engine-explanation">本地算法启动检测完成后即可开始排班。</p>
+          <details v-if="engineDiagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查算法组件与运行环境。</p></details>
+          <details class="sp-generation-advanced"><summary>高级选项<span>{{ solveTimeLimit }} 秒搜索 · {{ allowPartial ? '允许缺员' : '严格满足人数' }}</span></summary>
+            <div class="sp-solver-options"><label>最长搜索时间<select v-model.number="solveTimeLimit" aria-label="最长搜索时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select></label><label class="sp-partial-option"><input v-model="allowPartial" type="checkbox" /><span>允许岗位缺编<small>允许人数不足，固定人数上限及其他硬规则仍须满足。</small></span></label></div>
+          </details>
+          <p v-if="allowPartial" class="sp-modal-note">当前允许缺员：生成后会列出未填满的班位。</p>
+        </template>
+        <p v-else class="sp-modal-note">浏览器使用启发式排班，可能无法找到可行方案；桌面版提供本地约束求解器。</p>
+        <p class="sp-modal-note">找不到符合规则的方案时保留原排班。其他月份不变，生成后可以撤销。</p>
+        <div class="sp-modal-actions"><button class="sp-button" @click="showGenerate = false">取消</button><button class="sp-button sp-primary" :disabled="desktop && engineState !== 'ready'" @click="generate"><Icon name="spark" :size="17" />{{ desktop && engineState === 'checking' ? '等待启动检测' : '开始生成' }}</button></div>
+      </section>
+    </div>
 
     <div v-if="showBackup" class="sp-overlay" @click.self="showBackup = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-backup-title"><div class="sp-modal-heading"><div><h2 id="sp-backup-title">备份与恢复</h2><p>数据保存在{{ storageLocation }}，不会自动云同步。</p></div><button class="sp-icon-button" aria-label="关闭备份面板" @click="showBackup = false"><Icon name="close" /></button></div><div class="sp-shift-options"><button @click="exportBackup"><Icon name="download" /><span><strong>导出完整备份</strong><small>JSON 文件，可在另一台设备恢复</small></span><Icon name="arrow" :size="16" /></button><button @click="openImport"><Icon name="upload" /><span><strong>导入备份文件</strong><small>确认后替换当前工作空间，建议先导出备份</small></span><Icon name="arrow" :size="16" /></button></div></section></div>
 
     <div v-if="importCandidate" class="sp-overlay"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-import-title"><h2 id="sp-import-title">确认恢复这个工作空间？</h2><p class="sp-modal-copy">{{ importCandidate.teamName }} · {{ importCandidate.month }}<br />{{ importCandidate.employees.length }} 位成员、{{ importCandidate.shifts.length }} 种班次。导入将替换当前数据。</p><div class="sp-modal-actions"><button class="sp-button" @click="importCandidate = null">取消</button><button class="sp-button sp-primary" @click="confirmImport">确认导入</button></div></section></div>
 
-    <div v-if="showHelp" class="sp-overlay" @click.self="showHelp = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-help-title"><div class="sp-modal-heading"><h2 id="sp-help-title">几步，安排好下个月</h2><button class="sp-icon-button" aria-label="关闭帮助" @click="showHelp = false"><Icon name="close" /></button></div><ol class="sp-help-list"><li><strong>添加团队成员</strong><p>月参考工时默认按工作日 × 8 计算；设置每人的月最低工时、周最低/最高工时、班次资格和请假日期。</p></li><li><strong>定义班次和规则</strong><p>自定义上下班时间、每日需求人数、休息间隔与连续工作天数。</p></li><li><strong>选择月份，自动生成</strong><p>点击格子调整或锁定安排。规则冲突会显示在表格下方。</p></li><li><strong>设置班次津贴</strong><p>为班次填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li><li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，JSON 用于恢复全部设置。首次进入展示的是可编辑示例团队。</p></li></ol></section></div>
+    <div v-if="showHelp" class="sp-overlay" @click.self="showHelp = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-help-title"><div class="sp-modal-heading"><h2 id="sp-help-title">几步，安排好下个月</h2><button class="sp-icon-button" aria-label="关闭帮助" @click="showHelp = false"><Icon name="close" /></button></div><ol class="sp-help-list"><li><strong>添加团队成员</strong><p>月参考工时默认按工作日 × 8 计算；设置每人的月最低工时、周最低/最高工时、班次资格和请假日期。</p></li><li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数。</p></li><li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li><li><strong>设置班次津贴</strong><p>为班次填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li><li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，JSON 用于恢复全部设置。首次进入展示的是可编辑示例团队。</p></li></ol></section></div>
   </div>
 </template>

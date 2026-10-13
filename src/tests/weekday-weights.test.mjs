@@ -94,6 +94,93 @@ test('dynamic capacity preserves daily minimum coverage and counts leave and loc
   assert.equal(weekdayWeightCapacity(fixture('2025-10', 2)).maxPercent, null)
 })
 
+test('all-fixed shifts limit weighted capacity even when more employees are available', () => {
+  const state = fixture('2026-06', 12)
+  state.shifts[0].staffingMode = 'fixed'
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 28, '35 fixed weekly assignments permit at most 28% for two days, not the requested 40%')
+  const week = weightedWeeks(state).find(week => week.dates.length === 7)
+  assert.equal(findWeightedWeek(state, week, 10, 25), null, 'daily fixed five cannot also satisfy 40%')
+  state.rules.weekdayWeights.percent = 28
+  assert.equal(findWeightedWeek(state, week, 10, 25)?.fullTotal, 35)
+  state.rules.weekdayWeights = { days: [1, 2, 3, 4, 5, 6, 7], percent: 100 }
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 100)
+})
+
+test('fixed zero does not create capacity for employees who can only work that shift', () => {
+  const state = fixture('2026-06', 12)
+  state.shifts = [{ ...state.shifts[0], id: 'closed', required: 0, staffingMode: 'fixed' }, { ...state.shifts[0], required: 1 }]
+  state.employees.forEach((employee, index) => { employee.eligibleShiftIds = index === 0 ? ['day'] : ['closed'] })
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 28, 'only the one employee qualified for an open shift can contribute')
+  state.employees[0].eligibleShiftIds = ['closed']
+  assert.equal(weekdayWeightCapacity(state).maxPercent, null, 'minimum one cannot be covered by a fixed-zero qualification')
+  state.shifts[0].staffingMode = 'minimum'
+  state.shifts[1].required = 0
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 100, 'minimum zero remains an optional working shift')
+})
+
+test('mixed-mode capacity keeps fixed slots capped and minimum shifts available for extras', () => {
+  const state = fixture('2026-06', 6)
+  state.shifts = [{ ...state.shifts[0], id: 'fixed', required: 2, staffingMode: 'fixed' }, { ...state.shifts[0], required: 1, staffingMode: 'minimum' }]
+  state.employees.forEach((employee, index) => { employee.eligibleShiftIds = index < 3 ? ['fixed'] : ['day'] })
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 40, 'two fixed slots plus three minimum-qualified staff provide five daily slots')
+  delete state.shifts[1].staffingMode
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 40, 'legacy mode omission means minimum')
+  state.shifts[1].staffingMode = 'fixed'
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 28, 'all fixed means three daily slots')
+})
+
+test('locked assignments cannot consume more than fixed capacity or bypass fixed zero', () => {
+  const state = fixture('2026-06', 6)
+  state.shifts[0].required = 1
+  state.shifts[0].staffingMode = 'fixed'
+  state.assignments = [0, 1].map(i => ({ employeeId: `e${i}`, date: '2026-06-01', shiftId: 'day', locked: true }))
+  assert.equal(weekdayWeightCapacity(state).maxPercent, null)
+  state.assignments.pop()
+  assert.equal(weekdayWeightCapacity(state).maxPercent, 28)
+  state.shifts[0].required = 0
+  assert.equal(weekdayWeightCapacity(state).maxPercent, null)
+  delete state.shifts[0].staffingMode
+  assert.notEqual(weekdayWeightCapacity(state).maxPercent, null, 'a lock above a minimum is allowed')
+  state.assignments.push({ employeeId: 'e0', date: '2026-06-01', shiftId: 'off', locked: true })
+  assert.equal(weekdayWeightCapacity(state).maxPercent, null, 'conflicting working/rest locks cannot be collapsed by map insertion order')
+})
+
+test('mixed eligibility upper bounds never reject a staffing pattern proven by exhaustive assignment enumeration', () => {
+  const profiles = [
+    [['fixed'], ['day'], ['day']],
+    [['fixed', 'day'], ['fixed'], ['day']],
+    [['fixed', 'day'], ['fixed', 'day'], ['fixed']],
+    [['fixed', 'day'], ['fixed', 'day'], ['fixed', 'day']],
+    [['fixed'], ['fixed'], ['fixed']],
+    [['day'], ['day'], ['day']],
+  ]
+  for (const fixedRequired of [0, 1, 2]) for (const profile of profiles) {
+    const state = fixture('2026-06', 3)
+    state.shifts = [{ ...state.shifts[0], id: 'fixed', required: fixedRequired, staffingMode: 'fixed' }, { ...state.shifts[0], required: 1 }]
+    state.employees.forEach((employee, index) => { employee.eligibleShiftIds = profile[index] })
+    const totals = new Set()
+    function enumerate(index, fixedCount, minimumCount) {
+      if (index === state.employees.length) {
+        if (fixedCount === fixedRequired && minimumCount >= 1) totals.add(fixedCount + minimumCount)
+        return
+      }
+      enumerate(index + 1, fixedCount, minimumCount)
+      if (profile[index].includes('fixed')) enumerate(index + 1, fixedCount + 1, minimumCount)
+      if (profile[index].includes('day')) enumerate(index + 1, fixedCount, minimumCount + 1)
+    }
+    enumerate(0, 0, 0)
+    let provenPercent = null
+    for (const selectedDaily of totals) for (const otherDaily of totals) for (let percent = 0; percent <= 100; percent++) {
+      const W = selectedDaily * 2 + otherDaily * 5
+      if (Math.ceil(W * percent / 100) === selectedDaily * 2) provenPercent = Math.max(provenPercent ?? 0, percent)
+    }
+    const estimate = weekdayWeightCapacity(state).maxPercent
+    if (provenPercent !== null) {
+      assert.ok(estimate !== null && estimate >= provenPercent, `must not understate a proven feasible pattern: fixed=${fixedRequired}, qualifications=${JSON.stringify(profile)}`)
+    }
+  }
+})
+
 test('calendar grouping handles low years, upper date boundary and leap February', () => {
   assert.equal(weightedWeeks(fixture('0001-01')).flatMap(w => w.dates).length, 31)
   assert.equal(weightedWeeks(fixture('9999-12')).flatMap(w => w.dates).at(-1), '9999-12-31')

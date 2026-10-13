@@ -482,3 +482,120 @@ for (const seed of [1010, 42, 12345]) {
     assert.equal(new Set(generated.assignments.map(item => `${item.employeeId}|${item.date}`)).size, generated.assignments.length)
   })
 }
+
+test('missing staffing mode keeps minimum semantics and explicit minimum permits surplus', () => {
+  const original = state({ employees: ['a', 'b', 'c'].map(flexibleEmployee), assignments: ['a', 'b', 'c'].map(id => assignment('2026-10-01', 'morning', true, id)) })
+  const minimum = structuredClone(original)
+  minimum.shifts.forEach(shift => { shift.staffingMode = 'minimum' })
+  assert.deepEqual(validateSchedule(minimum), validateSchedule(original))
+  assert.deepEqual(generateSchedule(minimum, 42), generateSchedule(original, 42))
+  assert.ok(!validateSchedule(minimum).some(issue => issue.type === 'overstaffed'))
+})
+
+test('fixed staffing validates exact headcount and reports shortages as coverage warnings', () => {
+  const value = state({ employees: ['a', 'b', 'c'].map(id => employee(id, { maxHoursPerWeek: 168, eligibleShiftIds: ['morning'] })), shifts: [{ ...morning, staffingMode: 'fixed', required: 2 }], assignments: [assignment('2026-10-01', 'morning', false, 'a'), assignment('2026-10-01', 'morning', false, 'b')] })
+  assert.ok(!validateSchedule(value).some(issue => issue.date === '2026-10-01'))
+  const shortage = validateSchedule(value).find(issue => issue.type === 'coverage')
+  assert.equal(shortage.severity, 'warning')
+  assert.match(shortage.message, /每日固定 2/)
+  value.assignments.push(assignment('2026-10-01', 'morning', false, 'c'))
+  const excess = validateSchedule(value).find(issue => issue.type === 'overstaffed')
+  assert.equal(excess.severity, 'error')
+  assert.equal(excess.date, '2026-10-01')
+  assert.match(excess.message, /超出固定人数 1 人/)
+})
+
+test('locked fixed overstaffing in the selected month is never silently replaced', () => {
+  const original = ['a', 'b'].map(id => assignment('2026-10-01', 'morning', true, id))
+  const value = state({ employees: ['a', 'b'].map(id => employee(id, { maxHoursPerWeek: 168, eligibleShiftIds: ['morning'] })), shifts: [{ ...morning, staffingMode: 'fixed' }], assignments: original })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, false)
+  assert.deepEqual(generated.assignments, original)
+  assert.notEqual(generated.assignments, original)
+  assert.ok(generated.issues.some(issue => issue.type === 'overstaffed' && issue.date === '2026-10-01' && issue.severity === 'error'))
+})
+
+test('current fixed staffing does not retroactively cap preserved out-of-month history', () => {
+  const original = ['a', 'b'].map(id => assignment('2026-09-30', 'morning', true, id))
+  const value = state({ employees: ['a', 'b'].map(id => employee(id, { maxHoursPerWeek: 168, eligibleShiftIds: ['morning'] })), shifts: [{ ...morning, staffingMode: 'fixed' }], assignments: original })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  assert.deepEqual(generated.issues, [])
+  assert.deepEqual(generated.assignments.filter(item => item.date === '2026-09-30'), original)
+  for (const date of datesOfMonth(value.month)) assert.equal(generated.assignments.filter(item => item.date === date && item.shiftId === 'morning').length, 1)
+  value.employees[0].maxHoursPerWeek = 8
+  value.assignments.push(assignment('2026-10-01', 'morning', false, 'a'))
+  assert.ok(validateSchedule(value).some(issue => issue.type === 'weekly-hours'), 'historical work still counts toward weekly caps')
+  assert.ok(!validateSchedule(value).some(issue => issue.type === 'overstaffed'))
+})
+
+test('fixed zero prohibits assignments while minimum zero can supply employee hours', () => {
+  const value = state({ employees: [employee('a', { minHoursPerMonth: 32 })], shifts: [{ ...morning, staffingMode: 'fixed', required: 0 }, { ...night, staffingMode: 'minimum', required: 0 }] })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  assert.deepEqual(generated.issues, [])
+  assert.ok(generated.assignments.length > 0)
+  assert.ok(generated.assignments.every(item => item.shiftId === 'night'))
+  value.assignments = [assignment('2026-10-01', 'morning')]
+  assert.ok(validateSchedule(value).some(issue => issue.type === 'overstaffed'))
+})
+
+test('fixed capacity cannot be exceeded to satisfy otherwise impossible employee minimums', () => {
+  const original = [assignment('2026-10-01', 'off', true, 'a')]
+  const value = state({
+    employees: ['a', 'b', 'c'].map(id => employee(id, { minHoursPerMonth: 160, maxHoursPerWeek: 56, eligibleShiftIds: ['morning'] })),
+    shifts: [{ ...morning, staffingMode: 'fixed', required: 1 }],
+    assignments: original,
+  })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, false)
+  assert.deepEqual(generated.assignments, original)
+  assert.ok(generated.issues.some(issue => issue.type === 'monthly-min-hours'))
+  assert.ok(!generated.issues.some(issue => issue.type === 'overstaffed'), 'heuristic must not exceed fixed counts while trying to fill hours')
+})
+
+test('mixed fixed and minimum staffing adds needed work only to uncapped shifts', () => {
+  const value = state({
+    employees: ['a', 'b', 'c', 'd'].map(id => employee(id, { minHoursPerMonth: 160, maxHoursPerWeek: 56 })),
+    shifts: [{ ...morning, staffingMode: 'fixed', required: 1 }, { ...night, staffingMode: 'minimum', required: 1 }],
+  })
+  const generated = generateSchedule(value, 1010)
+  assert.equal(generated.success, true)
+  assert.deepEqual(generated.issues, [])
+  let grew = false
+  for (const date of datesOfMonth(value.month)) {
+    assert.equal(generated.assignments.filter(item => item.date === date && item.shiftId === 'morning').length, 1)
+    const count = generated.assignments.filter(item => item.date === date && item.shiftId === 'night').length
+    assert.ok(count >= 1)
+    if (count > 1) grew = true
+  }
+  assert.ok(grew)
+})
+
+test('dynamic weekday weights respect fixed shift upper limits alongside expandable minimum shifts', () => {
+  const value = weightState({ shifts: [{ ...morning, staffingMode: 'fixed', required: 1 }, { ...night, staffingMode: 'minimum', required: 0 }] })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  assert.deepEqual(generated.issues, [])
+  assert.ok(generated.assignments.some(item => item.shiftId === 'night'))
+  for (const date of datesOfMonth(value.month)) assert.equal(generated.assignments.filter(item => item.date === date && item.shiftId === 'morning').length, 1)
+})
+
+test('all-fixed staffing refuses weighted quotas that would require surplus workers', () => {
+  const value = weightState({ shifts: [{ ...morning, staffingMode: 'fixed', required: 1 }, { ...night, staffingMode: 'fixed', required: 0 }] })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, false)
+  assert.deepEqual(generated.assignments, value.assignments)
+  assert.ok(generated.issues.some(issue => issue.type.startsWith('weekday-')))
+  assert.ok(!generated.issues.some(issue => issue.type === 'overstaffed'))
+})
+
+test('staffing mode rejects unknown values without mutating the existing roster', () => {
+  for (const mode of [null, '', 'exact', 'Minimum', false, 1, {}, []]) {
+    const value = state({ shifts: [{ ...morning, staffingMode: mode }], employees: [employee('a', { eligibleShiftIds: ['morning'] })], assignments: [assignment('2026-10-01')] })
+    assert.ok(validateSchedule(value).some(issue => issue.type === 'configuration' && /人数模式/.test(issue.message)))
+    const generated = generateSchedule(value)
+    assert.equal(generated.success, false)
+    assert.deepEqual(generated.assignments, value.assignments)
+  }
+})
