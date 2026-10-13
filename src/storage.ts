@@ -120,6 +120,8 @@ export function parseBackup(text: string): PlannerDocument {
     version: 1, teamName: string(root.teamName, 100, '团队名称'), month: monthValue(root.month), employees, shifts, assignments,
     rules: { minRestHours: number(r.minRestHours, 0, 48, '最短休息小时'), maxConsecutiveDays: number(r.maxConsecutiveDays, 1, 31, '最多连续工作天数', true) },
   }
+  // Retire the former sample label in saved workspaces and imported backups.
+  if (state.teamName === '星河服务团队') state.teamName = '我的排班'
   // Preserve old backups without applying their retired weekend fairness objective.
   if (r.balanceWeekends !== undefined) state.rules.balanceWeekends = bool(r.balanceWeekends, '旧版周末选项')
   const weightsError = weekdayWeightRuleError(r.weekdayWeights)

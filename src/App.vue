@@ -15,9 +15,10 @@ import { minimumMonthHours, monthlyHoursByEmployee, resolveHoursState } from './
 import './planner.css'
 
 const brandMarkUrl = `${import.meta.env.BASE_URL}brand-mark.png`
+const helpQrCodeUrl = `${import.meta.env.BASE_URL}qrcode_for_gh_a8aeeae2d3cd_258.jpg`
 
 type Document = PlannerState & PayrollConfig
-type Section = 'calendar' | 'team' | 'shifts' | 'rules' | 'payroll'
+type Section = 'calendar' | 'team' | 'shifts' | 'rules'
 const notice = ref('')
 const saveError = ref('')
 let initial: PlannerState | null = null
@@ -66,7 +67,6 @@ const savedAt = ref('')
 const navigation: { key: Section; label: string; icon: string }[] = [
   { key: 'calendar', label: '排班日历', icon: 'calendar' }, { key: 'team', label: '成员管理', icon: 'people' },
   { key: 'shifts', label: '班次设置', icon: 'clock' }, { key: 'rules', label: '排班规则', icon: 'rules' },
-  { key: 'payroll', label: '班次津贴', icon: 'wallet' },
 ]
 const sectionLabel = computed(() => navigation.find(n => n.key === section.value)!.label)
 const dates = computed(() => datesOfMonth(state.value.month))
@@ -98,8 +98,6 @@ const coverage = computed(() => {
 const lockedCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.locked).length)
 const dayAllowances = computed(() => new Map(payroll.value.dailyRows.map(row => [`${row.employeeId}:${row.date}`, row])))
 const employeeAllowances = computed(() => new Map(payroll.value.rows.map(row => [row.employeeId, row])))
-const allowanceRecipients = computed(() => payroll.value.rows.filter(row => row.totalAllowance > 0).length)
-const allowanceShiftCount = computed(() => monthAssignments.value.filter(a => (findShift(a.shiftId)?.normalAllowance ?? 0) > 0).length)
 const filteredAllowanceTotal = computed(() => employees.value.reduce((sum, employee) => sum + Math.round((employeeAllowances.value.get(employee.id)?.totalAllowance ?? 0) * 100), 0) / 100)
 const monthTitle = computed(() => `${state.value.month.slice(0, 4)} 年 ${Number(state.value.month.slice(5))} 月`)
 const period = computed(() => view.value === 'month' ? '整月总览' : `${Number(visibleDates.value[0]?.slice(8))} 日 — ${Number(visibleDates.value.at(-1)?.slice(8))} 日`)
@@ -324,7 +322,6 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
     <button v-if="mobileNav" class="sp-nav-scrim" aria-label="关闭导航" @click="mobileNav = false"></button>
     <aside class="sp-sidebar" :class="{ 'is-open': mobileNav }">
       <a class="sp-brand" href="#" @click.prevent="chooseSection('calendar')"><img :src="brandMarkUrl" alt="" width="40" height="40" /><span>排班 <b>plus</b></span></a>
-      <div class="sp-workspace"><Icon name="people" :size="17" /><strong :title="state.teamName">{{ state.teamName }}</strong></div>
       <nav aria-label="应用导航"><button v-for="item in navigation" :key="item.key" :class="{ active: section === item.key }" :aria-current="section === item.key ? 'page' : undefined" @click="chooseSection(item.key)"><Icon :name="item.icon" /><span>{{ item.label }}</span><span v-if="item.key === 'team'" class="sp-nav-count">{{ state.employees.length }}</span></button></nav>
       <div class="sp-sidebar-bottom"><button class="sp-help" @click="showBackup = true; mobileNav = false"><Icon name="file" :size="18" />备份与恢复</button><button class="sp-help" @click="showHelp = true; mobileNav = false"><Icon name="info" :size="18" />使用帮助</button></div>
     </aside>
@@ -342,7 +339,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
-        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span aria-hidden="true">·</span><button @click="showGenerate = true">{{ desktop ? '本地 CP-SAT' : '浏览器启发式排班' }}</button></p></div><div v-if="section === 'calendar' || section === 'payroll'" class="sp-heading-actions"><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '检查算法…' : '自动排班' }}</button></div></div>
+        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span aria-hidden="true">·</span><button @click="showGenerate = true">{{ desktop ? '本地 CP-SAT' : '浏览器启发式排班' }}</button></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '检查算法…' : '自动排班' }}</button></div></div>
         <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
         <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消并停止本地任务…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成浏览器排班' }}</strong><p>总计 {{ elapsedSeconds }} 秒<span v-if="desktop"> · 当前阶段 {{ phaseSeconds }} 秒</span> · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `排班搜索时限 ${solveTimeLimit} 秒，结束后还需返回并校验结果。` : solvePhase === 'finishing' ? '搜索已结束，正在返回并校验结果。' : `正在准备本地算法，启动和加载不占 ${solveTimeLimit} 秒搜索时限。` }}</p><p v-else>浏览器搜索时限 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
         <div v-if="solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status"><Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" /><div><strong>{{ solverFeedback.message }}</strong><ul v-if="solverFeedback.details.length"><li v-for="(detail,index) in solverFeedback.details.slice(0,8)" :key="index">{{ detail }}</li></ul><p v-if="solverFeedback.details.length > 8">还有 {{ solverFeedback.details.length - 8 }} 项，请检查规则与锁定安排。</p><details v-if="solverFeedback.diagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>若重新检测后仍无法启动，开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查打包的算法组件与本机运行环境。</p></details></div><button class="sp-icon-button" aria-label="关闭求解结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button></div>
@@ -351,13 +348,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
           <div><dt>参与成员</dt><dd>{{ state.employees.length }}<small>人</small></dd><span>{{ state.shifts.length }} 种班次</span></div>
           <div><dt>计划工时</dt><dd>{{ totalHours.toLocaleString('zh-CN') }}<small>h</small></dd><span>{{ lockedCount }} 项已锁定</span></div>
         </dl>
-        <p v-if="payrollError && (section === 'payroll' || section === 'calendar')" class="sp-calculation-error" role="alert">津贴无法计算：{{ payrollError }}。调整配置前不会导出金额。</p>
-        <dl v-if="section === 'payroll'" class="sp-overview" aria-label="本月津贴概览">
-          <div><dt>本月额外津贴</dt><dd><small>¥</small>{{ payrollError ? '—' : money(payroll.totalAllowance) }}</dd></div>
-          <div><dt>领取津贴人数</dt><dd>{{ payrollError ? '—' : allowanceRecipients }}<small>人</small></dd><span>本月已排有津贴的班次</span></div>
-          <div><dt>计津贴班次</dt><dd>{{ payrollError ? '—' : allowanceShiftCount }}<small>班</small></dd><span>每人排一次，领取一份</span></div>
-        </dl>
-
+        <p v-if="payrollError && section === 'calendar'" class="sp-calculation-error" role="alert">津贴无法计算：{{ payrollError }}。调整配置前不会导出金额。</p>
         <template v-if="section === 'calendar'">
           <section class="sp-calendar-card" aria-label="人员排班表">
             <div class="sp-calendar-toolbar">
@@ -402,12 +393,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
           <div v-if="showIssues" class="sp-issues"><template v-if="issues.length"><button v-for="issue in issues.slice(0, 100)" :key="issue.id" @click="jumpToIssue(issue.date)"><span :class="issue.severity">{{ issue.severity === 'error' ? '冲突' : '提醒' }}</span><span>{{ issue.message }}</span><small v-if="issue.date">{{ issue.date }} ↗</small></button><p v-if="issues.length > 100">还有 {{ issues.length - 100 }} 项，请先处理当前提醒。</p></template><p v-else>休假、班次资格、月最低与周工时上下限、连续工作和休息间隔均通过检查。<button class="sp-link" @click="chooseSection('rules')">自定义规则 →</button></p></div>
         </template>
 
-        <section v-if="section === 'payroll'" class="sp-payroll-card">
-          <div class="sp-subheading"><div><h2>{{ monthTitle }} · 成员津贴汇总</h2><p>按本月开始的班次数累计固定津贴，跨夜班只在开始日期领取一次。</p></div></div>
-          <div v-if="!payrollError" class="sp-table-scroll"><table class="sp-payroll-table"><thead><tr><th>团队成员</th><th>本月工时</th><th>额外津贴</th></tr></thead><tbody><tr v-for="row in payroll.rows" :key="row.employeeId"><th>{{ row.name }}</th><td>{{ row.totalHours }} h</td><td class="sp-text-gold"><strong>¥{{ money(row.totalAllowance) }}</strong></td></tr><tr v-if="!payroll.rows.length"><td colspan="3">暂无成员，请先添加成员并安排班次。</td></tr></tbody><tfoot><tr><th>合计</th><td>{{ totalHours }} h</td><td><strong>¥{{ money(payroll.totalAllowance) }}</strong></td></tr></tfoot></table></div>
-          <div v-if="payroll.warnings.length" class="sp-payroll-note"><Icon name="info" :size="17" /><span>{{ payroll.warnings.join('；') }}</span></div>
-        </section>
-        <SettingsPanel v-if="section !== 'calendar'" :state="state" :section="section" :payroll="state.payroll" :calendar="state.calendar" @change="settingsChanged" />
+        <SettingsPanel v-if="section !== 'calendar'" :state="state" :section="section" :payroll="state.payroll" @change="settingsChanged" />
       </main>
     </div>
 
@@ -442,6 +428,21 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
 
     <div v-if="importCandidate" class="sp-overlay"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-import-title"><h2 id="sp-import-title">确认恢复这个工作空间？</h2><p class="sp-modal-copy">{{ importCandidate.teamName }} · {{ importCandidate.month }}<br />{{ importCandidate.employees.length }} 位成员、{{ importCandidate.shifts.length }} 种班次。导入将替换当前数据。</p><div class="sp-modal-actions"><button class="sp-button" @click="importCandidate = null">取消</button><button class="sp-button sp-primary" @click="confirmImport">确认导入</button></div></section></div>
 
-    <div v-if="showHelp" class="sp-overlay" @click.self="showHelp = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-help-title"><div class="sp-modal-heading"><h2 id="sp-help-title">几步，安排好下个月</h2><button class="sp-icon-button" aria-label="关闭帮助" @click="showHelp = false"><Icon name="close" /></button></div><ol class="sp-help-list"><li><strong>添加团队成员</strong><p>月参考工时默认按工作日 × 8 计算；设置每人的月最低工时、周最低/最高工时、班次资格和请假日期。</p></li><li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数。</p></li><li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li><li><strong>设置班次津贴</strong><p>为班次填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li><li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，JSON 用于恢复全部设置。首次进入展示的是可编辑示例团队。</p></li></ol></section></div>
+    <div v-if="showHelp" class="sp-overlay" @click.self="showHelp = false">
+      <section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-help-title">
+        <div class="sp-modal-heading"><h2 id="sp-help-title">几步，安排好下个月</h2><button class="sp-icon-button" aria-label="关闭帮助" @click="showHelp = false"><Icon name="close" /></button></div>
+        <ol class="sp-help-list">
+          <li><strong>添加团队成员</strong><p>月参考工时默认按工作日 × 8 计算；设置每人的月最低工时、周最低/最高工时、班次资格和请假日期。</p></li>
+          <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数。</p></li>
+          <li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li>
+          <li><strong>设置班次津贴</strong><p>在「班次设置」填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li>
+          <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，JSON 用于恢复全部设置。首次进入展示的是可编辑示例团队。</p></li>
+        </ol>
+        <figure class="sp-help-qrcode">
+          <img :src="helpQrCodeUrl" alt="公众号二维码" width="258" height="258" />
+          <figcaption>扫码关注公众号</figcaption>
+        </figure>
+      </section>
+    </div>
   </div>
 </template>

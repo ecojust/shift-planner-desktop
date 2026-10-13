@@ -16,9 +16,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-brand { display: flex; align-items: center; gap: 10px; padding: 0 8px; font-size: 22px; font-weight: 650; letter-spacing: -.6px; white-space: nowrap; }
 .sp-brand img { flex-shrink: 0; width: 40px; height: 40px; }
 .sp-brand b { font-weight: 500; letter-spacing: -1px; }
-.sp-workspace { display: flex; align-items: center; gap: 9px; padding: 16px 12px; margin: 25px 0 15px; border-top: 1px solid #e6eae5; border-bottom: 1px solid #e6eae5; color: #65766b; min-width: 0; }
-.sp-workspace strong { font-size: 12px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sp-sidebar nav { display: grid; gap: 7px; }
+.sp-sidebar nav { display: grid; gap: 7px; margin-top: 30px; }
 .sp-sidebar nav button { width: 100%; display: flex; align-items: center; gap: 12px; min-height: 46px; border: none; background: none; border-radius: 8px; padding: 0 13px; text-align: left; color: #607367; font-size: 13px; }
 .sp-sidebar nav button:hover { background: #f4f7f5; }
 .sp-sidebar nav button.active { color: #214f40; background: #e5ede6; font-weight: 650; }
@@ -142,18 +140,10 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-issues small { margin-left: auto; color: #95a198; white-space: nowrap; }
 .sp-issues > p { font-size: 11px; color: #839a8d; }
 .sp-link { border: 0; background: none; color: var(--sp-teal) !important; }
-.sp-payroll-card { background: #fff; border: 1px solid #e2eae5; border-radius: 12px; overflow: hidden; margin-bottom: 22px; }
 .sp-subheading { display: flex; justify-content: space-between; gap: 16px; padding: 23px; align-items: center; }
 .sp-subheading h2 { font-size: 17px; font-weight: 600; }
 .sp-subheading p { font-size: 11px; color: #9aa79e; margin-top: 7px; }
 .sp-subheading input { padding: 7px; background: #f7faf8; color: #637e6c; border: 1px solid #e0e9e3; border-radius: 5px; }
-.sp-payroll-table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 12px; text-align: right; }
-.sp-payroll-table th, .sp-payroll-table td { padding: 15px 20px; border-bottom: 1px solid #edf1ee; overflow-wrap: anywhere; }
-.sp-payroll-table tr > :first-child { text-align: left; }
-.sp-payroll-table thead { background: #f8fbf9; color: #8a9e91; font-size: 10px; }
-.sp-payroll-table th { font-weight: 500; }
-.sp-payroll-table tfoot { background: #f3f8f5; color: #507260; }
-.sp-payroll-note { display: flex; gap: 10px; background: #faf7ec; padding: 13px 23px; font-size: 10px; color: #a89663; }
 .sp-banner { display: flex; align-items: center; gap: 10px; padding: 12px 16px; margin-bottom: 20px; border-radius: 8px; font-size: 12px; }
 .sp-banner-warning { background: #fff0e4; border: 1px solid #f2d8b6; color: #a37947; }
 .sp-banner button { background: none; border: 0; text-decoration: underline; }
@@ -187,6 +177,9 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-help-list { padding-left: 22px; color: #66806e; }
 .sp-help-list li { padding-left: 6px; margin: 19px 0; font-size: 13px; }
 .sp-help-list p { color: #97a59b; line-height: 1.9; font-size: 11px; margin-top: 5px; }
+.sp-help-qrcode { display: grid; justify-items: center; gap: 10px; margin: 24px 0 0; padding-top: 20px; border-top: 1px solid #e4eae5; }
+.sp-help-qrcode img { display: block; width: 172px; max-width: 100%; height: auto; }
+.sp-help-qrcode figcaption { color: #65786e; font-size: 12px; }
 .sp-nav-scrim { display: none; }
 .sp-shift-cell > span { font-size: 12px; }
 .sp-shift-cell small { font-size: 10px; color: #527361; }
@@ -284,7 +277,7 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
   .sp-legend { width: 100%; justify-content: flex-end; gap: 12px; }.sp-schedule-table { min-width: 820px; }.sp-schedule-table .sp-person-col { width: 142px; padding-left: 12px; padding-right: 8px; }.sp-person { gap: 6px; }.sp-person-avatar { height: 28px; width: 28px; }.sp-person strong { font-size: 12px; }.sp-person small { font-size: 9px; }
   .sp-calendar-bottom { padding: 8px 12px; font-size: 10px; }.sp-check-status { min-height: 36px; }
   .sp-toast { left: 50%; bottom: 15px; width: max-content; max-width: 92vw; }.sp-modal { padding: 22px 19px; border-radius: 14px; max-height: calc(100dvh - 30px); }.sp-overlay { padding: 15px 12px; }
-  .sp-subheading { padding: 18px 14px; flex-wrap: wrap; }.sp-subheading p { font-size: 11px; }.sp-payroll-note { padding: 12px 14px; font-size: 11px; }.sp-issues small { display: none; }.sp-issues > button { align-items: flex-start; }
+  .sp-subheading { padding: 18px 14px; flex-wrap: wrap; }.sp-subheading p { font-size: 11px; }.sp-issues small { display: none; }.sp-issues > button { align-items: flex-start; }
 }
 @media (max-width: 400px) { .sp-global-month label > span { display: none; } }
 @media print { .sp-main { margin: 0; }.sp-content { padding: 0; }.sp-check-status { display: none; } }
@@ -306,4 +299,4 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-edit-allowance p { margin: 6px 0; font-size: 12px; }
 .sp-edit-allowance small { color: #9b855b; font-size: 11px; }
 @media(min-width:900px) { .sp-schedule-table .sp-allowance-col { position: sticky; right: 0; z-index: 2; box-shadow: -3px 0 6px #a7935310; } }
-@media(max-width:720px) { .sp-allowance-legend { padding: 11px 13px; } .sp-payroll-table th, .sp-payroll-table td { padding: 13px 10px; } }
+@media(max-width:720px) { .sp-allowance-legend { padding: 11px 13px; } }

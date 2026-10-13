@@ -8,7 +8,7 @@ export function makeDefaultState(month?: string): PlannerState {
   const colors = ['#d7e8f8', '#f7dbd0', '#e4def5', '#d9eddf', '#f5e8c9', '#d9e7ed']
   const state: PlannerState = {
     version: 1,
-    teamName: '星河服务团队',
+    teamName: '我的排班',
     month: month || currentMonth,
     employees: names.map((name, index) => ({
       id: `employee-${index + 1}`,

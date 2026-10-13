@@ -2,13 +2,12 @@
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import type { Employee, PlannerState, Rules, Shift } from './domain.ts'
 import type { PayrollSettings } from './payroll.ts'
-import type { DayKind } from './calendar.ts'
 import LeaveCalendarDialog from './LeaveCalendarDialog.vue'
 import { hoursToMinutes, monthlyHoursReference } from './hours.ts'
 import { weightedDayRange, weightedWeeks, weekdayWeightCapacity, weekdayWeightRuleError } from './weekday-weights.ts'
 import type { WeightedWeek } from './weekday-weights.ts'
 
-const props = defineProps<{ state: PlannerState; section: 'team' | 'shifts' | 'rules' | 'payroll'; payroll: PayrollSettings; calendar?: Record<string, DayKind> }>()
+const props = defineProps<{ state: PlannerState; section: 'team' | 'shifts' | 'rules'; payroll: PayrollSettings }>()
 const emit = defineEmits<{ change: [] }>()
 // Keep these form limits aligned with storage.ts so every saved form can be backed up.
 const limits = { employees: 200, shifts: 24, separationGroups: 200, monthlyReferences: 1200, leaveDates: 3660, employeeText: 80, shiftName: 60, shortName: 8, groupName: 80, required: 200, minRestHours: 48, allowance: 100000000 }
@@ -17,8 +16,6 @@ const error = ref('')
 const editor = ref<'employee' | 'shift' | 'separation' | null>(null)
 const editorElement = ref<HTMLFormElement | null>(null)
 let editorTrigger: HTMLElement | null = null
-const allowanceShiftId = ref('')
-const allowanceDraft = ref<number | string>(0)
 const pendingDelete = ref<{ type: 'employee' | 'shift' | 'separation'; id: string; name: string } | null>(null)
 const leaveEmployeeId = ref('')
 const leaveEmployee = computed(() => props.state.employees.find(employee => employee.id === leaveEmployeeId.value))
@@ -139,8 +136,8 @@ const shiftDuration = computed(() => {
   const minutes = (parse(shiftDraft.end) - parse(shiftDraft.start) + 1440) % 1440
   return Number((minutes / 60).toFixed(2))
 })
-watch([() => props.section, () => props.state, () => props.payroll], () => {
-  editor.value = null; editorTrigger = null; allowanceShiftId.value = ''; leaveEmployeeId.value = ''; pendingDelete.value = null; feedback.value = ''; error.value = ''
+watch([() => props.section, () => props.state], () => {
+  editor.value = null; editorTrigger = null; leaveEmployeeId.value = ''; pendingDelete.value = null; feedback.value = ''; error.value = ''
   resetRules()
 })
 function notice(message: string) { feedback.value = message; error.value = ''; emit('change') }
@@ -232,19 +229,6 @@ function saveShift() {
 function validAllowance(value: unknown) {
   if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > limits.allowance || Number(Number(value).toFixed(2)) !== Number(value)) { error.value = `班次津贴需为 0–${limits.allowance} 元，最多保留两位小数。`; return false }
   return true
-}
-function openAllowance(shift: Shift) {
-  allowanceShiftId.value = shift.id
-  allowanceDraft.value = shift.normalAllowance ?? 0
-  error.value = ''; feedback.value = ''
-}
-function saveAllowance() {
-  if (!validAllowance(allowanceDraft.value)) return
-  const shift = props.state.shifts.find(item => item.id === allowanceShiftId.value)
-  if (!shift) { error.value = '该班次已不存在，请重新选择。'; return }
-  shift.normalAllowance = Number(allowanceDraft.value)
-  allowanceShiftId.value = ''
-  notice(`${shift.name}津贴已保存，现有排班的逐日津贴与汇总已更新。`)
 }
 function requestDelete(type: 'employee' | 'shift' | 'separation', id: string, name: string) {
   if (type === 'shift' && props.state.shifts.length <= 1) { error.value = '至少需要保留一个班次。'; return }
@@ -450,27 +434,6 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
       <details class="sp-settings-help-details sp-settings-bottom-help"><summary>排班规则说明</summary><p>自动排班综合考虑已排工时、班次分配与人员互斥。启用权重后，按实际班数核对星期占比。与其他限制冲突时会提示原因并保留原排班，锁定安排保持不变。</p></details>
     </template>
 
-    <template v-else>
-      <details class="sp-settings-help-details sp-settings-allowance-details"><summary>调整班次津贴</summary>
-        <header class="sp-settings-heading sp-settings-allowance-heading">
-        <div><p>与「班次设置」共用金额，每人每班领取一次。</p></div>
-      </header>
-      <div class="sp-settings-shift-grid">
-        <article v-for="shift in state.shifts" :key="shift.id" class="sp-settings-shift-card sp-settings-allowance-card">
-          <div class="sp-settings-shift-top"><span class="sp-settings-shift-mark" :style="{ background: shift.color }">{{ shift.shortName }}</span><div><h3>{{ shift.name }}</h3><p>{{ shift.start }}–{{ shift.end }}{{ shift.end < shift.start ? ' 次日' : '' }}</p></div></div>
-          <form v-if="allowanceShiftId === shift.id" class="sp-settings-allowance-form" @submit.prevent="saveAllowance">
-            <label class="sp-settings-field">固定津贴<span class="sp-settings-input-unit"><input v-model.number="allowanceDraft" type="number" min="0" :max="limits.allowance" step="0.01" required :aria-label="`${shift.name}班次津贴`" /><span>元 / 人 / 班</span></span></label>
-            <div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="allowanceShiftId = ''; error = ''">取消津贴编辑</button><button type="submit" class="sp-settings-button sp-settings-primary">保存班次津贴</button></div>
-          </form>
-          <template v-else>
-            <p class="sp-settings-allowance-value"><span>¥</span> {{ (shift.normalAllowance ?? 0).toFixed(2) }} <small>元 / 人 / 班</small></p>
-            <div class="sp-settings-card-bottom"><span>{{ (shift.normalAllowance ?? 0) === 0 ? '暂未设置津贴' : '排一次班，计一次津贴' }}</span><button class="sp-settings-edit" :aria-label="`设置${shift.name}津贴`" @click="openAllowance(shift)">设置津贴</button></div>
-          </template>
-        </article>
-      </div>
-      <p class="sp-settings-footnote">津贴金额与「班次设置」共用，修改后会更新已有排班的金额。未排班或排为休息时不领取；月末跨夜班的整笔津贴计入本月，不拆到下月。</p>
-      </details>
-    </template>
     <LeaveCalendarDialog v-if="leaveEmployee" :key="leaveEmployee.id" :employee="leaveEmployee" :initial-month="state.month" @save="saveLeave" @close="leaveEmployeeId = ''" />
   </section>
 </template>
@@ -493,7 +456,6 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
 @media(max-width:720px){.sp-settings-weight-options{margin-left:0}.sp-settings-weekday-options{grid-template-columns:repeat(4,minmax(0,1fr));gap:7px}.sp-settings-weekday-option{padding:8px 5px;gap:6px}.sp-settings-weight-percent-row{align-items:flex-start;flex-wrap:wrap;gap:10px}.sp-settings-weight-percent-row>.sp-settings-field{width:100%}.sp-settings-weight-percent-row>.sp-settings-hint{width:100%}.sp-settings-weight-weeks{grid-template-columns:1fr}.sp-settings-weight-week{padding:14px}.sp-settings-weekday-rule>.sp-settings-rule{padding-top:20px}.sp-settings-weight-options>.sp-settings-soft-note{padding:12px;line-height:1.85}}
 @media(prefers-reduced-motion:reduce){.sp-settings button,.sp-settings-switch>span,.sp-settings-switch>span:after{transition:none}}
 .sp-settings-shift-allowance{margin:-8px 0 20px!important;font-size:12px;color:#81908f;line-height:1.8}.sp-settings-shift-allowance strong{color:#966c23;margin-left:8px;font-weight:600}.sp-settings-shift-allowance>span{font-size:11px}
-.sp-settings-allowance-heading>div{flex:1;min-width:0}.sp-settings-allowance-heading p{margin-top:8px}.sp-settings-allowance-heading>.sp-settings-field{width:185px;flex-shrink:0}.sp-settings-allowance-value{font-size:27px;line-height:1.5;font-weight:600;color:#99722f;margin:24px 0!important;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.sp-settings-allowance-value>span{font-size:18px;font-weight:500}.sp-settings-allowance-value>small{display:block;margin-top:5px;color:#99a59f;font-size:11px;font-weight:400}.sp-settings-allowance-form{margin-top:21px}.sp-settings-allowance-form>.sp-settings-actions{margin-top:17px;justify-content:flex-end;flex-wrap:wrap}.sp-settings-allowance-form .sp-settings-button{font-size:11px!important;padding:9px 12px}.sp-settings-allowance-card .sp-settings-card-bottom>.sp-settings-edit{padding:4px 0;margin-left:0}@media(max-width:720px){.sp-settings-allowance-heading{flex-wrap:wrap}.sp-settings-allowance-heading>div,.sp-settings-allowance-heading>.sp-settings-field{width:100%;flex-basis:100%}.sp-settings-allowance-form>.sp-settings-actions>.sp-settings-button{flex:1}}
 
 .sp-settings-inline-guide{font-size:12px;color:#788d88;line-height:1.85;margin:0 0 18px!important}.sp-settings-inline-hours{margin-top:20px}.sp-settings-inline-shifts{border:0;padding:0;margin:0 0 18px;min-width:0}.sp-settings-inline-shifts legend{font-size:11px;font-weight:600;color:#6b8278;margin-bottom:10px}.sp-settings-inline-shift-options{display:flex;flex-wrap:wrap;gap:6px}.sp-settings-inline-shift-options>button{display:inline-flex;align-items:center;gap:5px;border:1px solid #dce7e1;border-radius:6px;background:#f8fbf9;color:#809389;font-size:11px;padding:7px 9px;min-height:34px;max-width:100%;overflow-wrap:anywhere;text-align:left}.sp-settings-inline-shift-options>button.selected{background:var(--shift-color);border-color:#a8c5b8;color:#3f6c58}.sp-settings-inline-shift-options>button>span{font-size:12px;flex-shrink:0}.sp-settings-inline-hint{font-size:10px;line-height:1.8;color:#8a9a91;margin-top:8px!important}.sp-settings-inline-month{padding-top:15px;border-top:1px solid #edf1ee}.sp-settings-inline-reference{font-size:11px;line-height:1.6;margin-bottom:13px}.sp-settings-inline-reference input{width:15px;height:15px}.sp-settings-inline-hours .sp-settings-field{font-size:11px;gap:7px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:38px;padding-right:9px}.sp-settings-inline-hours .sp-settings-input-unit input{padding:9px 10px;font-size:13px}.sp-settings-inline-hours input:disabled{color:#8f9f98;background:#f0f5f2;cursor:default}.sp-settings-inline-hours .sp-settings-input-unit>span{font-size:10px}.sp-settings-inline-week{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.sp-settings-inline-error{font-size:11px;line-height:1.75;color:#ab5745;background:#fff3ee;border:1px solid #f2d9cc;border-radius:6px;padding:9px 10px;margin-top:12px!important}.sp-settings-inline-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:14px;padding-top:12px;border-top:1px dashed #dce6df}.sp-settings-inline-actions>span{font-size:10px;color:#967549}.sp-settings-inline-actions>div{display:flex;gap:6px;margin-left:auto}.sp-settings-inline-actions .sp-settings-button{padding:7px 10px;font-size:11px!important;min-height:34px}.sp-settings-member-bottom{margin-top:18px}.sp-settings-leave-trigger{display:inline-flex;align-items:center;gap:7px;border:0;padding:5px 0;background:none;color:#5c8a74;font-size:11px!important;min-height:30px;text-align:left}.sp-settings-leave-trigger svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.6;fill:none;flex-shrink:0}.sp-settings-leave-trigger:hover{color:#245b4e}
 @media(max-width:720px){.sp-settings-inline-hours .sp-settings-input-unit input{font-size:16px}.sp-settings-inline-hours{margin-top:18px}.sp-settings-inline-shift-options>button{min-height:38px;padding:8px 10px}.sp-settings-inline-actions .sp-settings-button{min-height:38px}.sp-settings-leave-trigger{min-height:36px;font-size:12px!important}.sp-settings-inline-guide{font-size:11px}.sp-settings-inline-week{gap:12px}}
@@ -501,5 +463,5 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
 .sp-settings-staffing-mode{grid-column:1/-1;border:0;padding:0;margin:0;min-width:0}.sp-settings-staffing-mode legend{font-size:12px;color:#657982;font-weight:600;margin-bottom:10px}.sp-settings-staffing-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.sp-settings-staffing-options>label{display:flex;align-items:flex-start;gap:10px;padding:13px 14px;border:1px solid #dfe8e4;border-radius:9px;background:#fbfdfc;color:#728a80;cursor:pointer;min-width:0}.sp-settings-staffing-options>label.selected{border-color:#83b5a2;background:#edf6f1;color:#2c654e}.sp-settings-staffing-options input{accent-color:#245b4e;width:16px;height:16px;flex-shrink:0;margin:1px 0 0}.sp-settings-staffing-options strong{display:block;font-size:12px;font-weight:600;line-height:1.5}.sp-settings-staffing-options small{display:block;margin-top:5px;font-size:11px;line-height:1.7;color:#83998f}.sp-settings-staffing-options>label:focus-within{outline:3px solid #99ddd4;outline-offset:2px}@media(max-width:720px){.sp-settings-staffing-options{gap:8px}.sp-settings-staffing-options>label{padding:12px 9px;gap:7px}.sp-settings-staffing-options strong{font-size:11px}.sp-settings-staffing-options small{font-size:10px}.sp-settings-staffing-mode legend{font-size:11px}}
 .sp-settings-current-month{display:flex;flex-direction:column;gap:5px;flex-shrink:0;padding:9px 12px;border-radius:7px;background:#f1f7f3;color:#56776b;line-height:1.5;margin:0!important}.sp-settings-current-month strong{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}.sp-settings-current-month>span{font-size:10px;color:#8ba095}@media(max-width:720px){.sp-settings-current-month{flex-basis:100%;flex-direction:row;justify-content:space-between;align-items:center;padding:9px 10px}}
 .sp-settings-month-reference{padding:18px 20px}.sp-settings-month-reference>.sp-settings-reference-body{margin-top:0;align-items:center;gap:20px}.sp-settings-reference-summary h3{font-size:13px;font-weight:600;margin-bottom:7px}.sp-settings-reference-summary h3 small{font-size:11px;font-weight:400;color:#95a49e;margin-left:9px}.sp-settings-month-reference .sp-settings-reference-summary strong{font-size:28px}.sp-settings-month-reference .sp-settings-reference-summary p{font-size:11px;margin-top:5px}.sp-settings-month-reference .sp-settings-reference-form>.sp-settings-field{width:155px}.sp-settings-month-reference .sp-settings-reference-form{gap:10px}.sp-settings-month-reference .sp-settings-calendar-warning{font-size:11px;padding:8px 10px;margin-top:12px!important}.sp-settings-help-details{font-size:11px;line-height:1.85;color:#809389;margin-top:14px;padding-top:12px;border-top:1px solid #e7ede8}.sp-settings-help-details>summary{cursor:pointer;color:#587d6c;font-size:12px;line-height:1.6;padding:4px 0;min-height:27px;width:fit-content;max-width:100%}.sp-settings-help-details>summary:focus-visible{outline:3px solid #99ddd4;outline-offset:3px;border-radius:3px}.sp-settings-help-details>p{margin-top:10px!important;font-size:11px;line-height:1.9}.sp-settings-help-details>.sp-settings-soft-note{margin-top:10px!important;padding:12px 14px;background:#f8fbf9;border-color:#e5eee8}.sp-settings-reference-details{margin-top:13px;padding-top:9px}.sp-settings-calculation-details{margin-top:16px}.sp-settings-calculation-details>.sp-settings-weight-formula{margin-top:13px}.sp-settings-bottom-help{padding:0;border:0;margin-top:15px}.sp-settings-bottom-help .sp-settings-footnote{margin-top:8px!important}@media(max-width:720px){.sp-settings-month-reference{padding:15px}.sp-settings-month-reference>.sp-settings-reference-body{gap:13px}.sp-settings-month-reference .sp-settings-reference-summary{flex-basis:100%}.sp-settings-reference-form>.sp-settings-field{flex-basis:100%!important}.sp-settings-reference-form>.sp-settings-actions{width:100%}.sp-settings-reference-form>.sp-settings-actions>.sp-settings-button{flex:1}.sp-settings-reference-details{margin-top:12px}.sp-settings-help-details>summary{min-height:32px}.sp-settings-help-details>.sp-settings-soft-note{padding:11px}}
-.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:110px}.sp-settings-allowance-details{margin-top:20px;padding:16px 20px;border:1px solid #e1e9eb;border-radius:10px;background:#fff}.sp-settings-allowance-details>summary{font-size:13px;font-weight:600}.sp-settings-allowance-details .sp-settings-allowance-heading{margin-top:15px;margin-bottom:16px}.sp-settings-allowance-details .sp-settings-footnote{font-size:11px;margin-top:16px!important}.sp-settings-allowance-details .sp-settings-shift-grid{margin-top:0}@media(max-width:720px){.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:150px}.sp-settings-allowance-details{padding:13px 14px}}
+.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:110px}@media(max-width:720px){.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:150px}}
 </style>

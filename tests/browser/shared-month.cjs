@@ -7,7 +7,7 @@ const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
 const url = process.env.STAFFING_TEST_URL || 'http://127.0.0.1:5197'
 const output = path.resolve(process.env.SHARED_MONTH_TEST_OUTPUT || 'test-results/shared-month-ui')
 const checks = [], errors = []
-const report = { url, startedAt: new Date().toISOString(), scope: 'Real Chromium shared-month controls, draft isolation, payroll, rules and independent leave calendar', checks, errors, ok: false }
+const report = { url, startedAt: new Date().toISOString(), scope: 'Real Chromium shared-month controls, draft isolation, calendar allowance totals, rules and independent leave calendar', checks, errors, ok: false }
 const record = (name, detail) => { checks.push({ name, ok: true, detail }); console.log(`PASS ${name}`) }
 
 function fixture() {
@@ -61,11 +61,11 @@ async function main() {
     await page.locator('input[type=file]').setInputFiles({ name: 'shared-month.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(original)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     await persisted(document => document.teamName === original.teamName)
-    for (const section of ['排班日历', '成员管理', '班次设置', '排班规则', '班次津贴']) {
+    for (const section of ['排班日历', '成员管理', '班次设置', '排班规则']) {
       await navigate(section)
       await uniqueMonth('2026-10')
     }
-    record('all-five-pages-share-one-visible-month-control')
+    record('all-four-pages-share-one-visible-month-control')
 
     await navigate('排班日历')
     await setMonth('2026-11')
@@ -90,11 +90,11 @@ async function main() {
     assert.equal((await state()).monthlyReferenceHours['2026-10'], 168)
     assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
     assert.equal(await page.getByLabel('月份测试甲每周最低工时', { exact: true }).inputValue(), '12')
-    await navigate('班次津贴')
+    await navigate('排班规则')
     await navigate('成员管理')
     assert.equal(await page.getByLabel('月份测试甲每周最低工时', { exact: true }).inputValue(), '12')
-    assert.equal((await state()).employees[0].minHoursPerWeek, 0, 'Navigating through allowances must preserve the unsaved draft without saving it')
-    record('member-hour-draft-survives-navigation-through-allowance-summary')
+    assert.equal((await state()).employees[0].minHoursPerWeek, 0, 'Navigating through rules must preserve the unsaved draft without saving it')
+    record('member-hour-draft-survives-navigation-through-rules')
     await page.getByRole('button', { name: '取消月份测试甲设置修改', exact: true }).click()
     await saveReference(160)
     await setMonth('2026-10')
@@ -110,13 +110,13 @@ async function main() {
     assert.equal(await page.locator('.sp-settings-weight-preview article').first().getAttribute('data-week'), '2026-09-28')
     record('weekday-example-regroups-weeks-from-shared-month')
 
-    await navigate('班次津贴')
-    const allowanceTotal = () => page.locator('[aria-label="本月津贴概览"] dd').first()
+    await navigate('排班日历')
+    const allowanceTotal = () => page.locator('[data-allowance-total] strong')
     assert.equal(Number((await allowanceTotal().innerText()).replace(/[¥￥,\s]/g, '')), 20)
     await setMonth('2026-11')
     assert.equal(Number((await allowanceTotal().innerText()).replace(/[¥￥,\s]/g, '')), 50)
     await uniqueMonth('2026-11')
-    record('allowance-summary-follows-shared-month-assignments', { october: 20, november: 50 })
+    record('calendar-allowance-total-follows-shared-month-assignments', { october: 20, november: 50 })
 
     await navigate('成员管理')
     await page.getByRole('button', { name: '设置月份测试甲请假', exact: true }).click()
@@ -178,7 +178,7 @@ async function main() {
     }
     await setMonth('2026-10')
     assert.equal(await personalMonth().inputValue(), '168')
-    await navigate('班次津贴')
+    await navigate('排班日历')
     await uniqueMonth('2026-10')
     assert.equal(Number((await allowanceTotal().innerText()).replace(/[¥￥,\s]/g, '')), 20)
     record('mobile-shared-month-change-updates-members-and-allowances')
