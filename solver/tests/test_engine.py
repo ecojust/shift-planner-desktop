@@ -195,19 +195,50 @@ class SolverTest(unittest.TestCase):
         self.assertFeasible(result)
         self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 160 * 60)
 
-    def test_total_monthly_minimum_exceeding_demand_is_explained(self):
+    def test_monthly_minimum_can_add_people_above_daily_minimum(self):
         s = state(employees=[employee('a', minimum_month=160), employee('b', minimum_month=160)])
         original = copy.deepcopy(s)
         for allow_partial in (False, True):
             r = request(s)
             r['options']['allowPartial'] = allow_partial
             result = solve(r)
-            self.assertEqual(result['status'], 'INFEASIBLE')
-            self.assertNotIn('assignments', result)
-            self.assertIn('248', result['issues'][0]['message'])
-            self.assertIn('320', result['issues'][0]['message'])
-            self.assertEqual(result['issues'][0]['type'], 'monthly-min-hours')
+            self.assertFeasible(result)
+            self.assertGreaterEqual(len(result['assignments']), 40)
+            self.assertLess(len(result['assignments']), 62)
+            for eid in ('a', 'b'):
+                self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], eid)[0], 160 * 60)
+            self.assert_daily_minimum(s, result['assignments'])
         self.assertEqual(s, original)
+
+    def test_required_zero_is_available_for_extra_work_but_not_filled_without_a_reason(self):
+        s = state(employees=[employee('a', minimum_month=16)], shifts=[shift(required=0)])
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(len(result['assignments']), 2)
+        self.assertEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 16 * 60)
+        s['employees'][0]['minHoursPerMonth'] = 0
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(result['assignments'], [])
+
+    def test_locked_assignments_above_minimum_and_on_zero_required_shift_remain_valid(self):
+        locked = [assignment('a', '2026-10-01'), assignment('b', '2026-10-01')]
+        s = state(assignments=locked)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertTrue(all(item in result['assignments'] for item in locked))
+        self.assertEqual(len(result['assignments']), 32)
+        s['shifts'][0]['required'] = 0
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(result['assignments'], locked)
+
+    def test_extra_staffing_preserves_separation_and_cannot_relax_weekly_maxima(self):
+        s = state(employees=[employee('a', minimum_month=160), employee('b', minimum_month=160)])
+        s['rules']['separationGroups'] = [dict(id='g', name='分开', employeeIds=['a', 'b'], shiftIds=[])]
+        self.assertEqual(solve(request(s))['status'], 'INFEASIBLE')
+        s = state(employees=[employee('a', minimum_month=160, cap=8)], shifts=[shift(required=0)])
+        self.assertEqual(solve(request(s))['status'], 'INFEASIBLE')
 
     def test_individual_unreachable_monthly_minimum_is_explained(self):
         leaves = [f'2026-10-{day:02d}' for day in range(1, 32)]
@@ -301,50 +332,84 @@ class SolverTest(unittest.TestCase):
         s = state(employees=[employee('a', cap=.025, minimum_week=.025)])
         self.assertEqual(solve(request(s))['status'], 'MODEL_INVALID')
 
-    def test_weekday_weights_ceiling_once_for_team_not_per_shift(self):
+    def assert_daily_minimum(self, s, assignments):
+        counts = {}
+        for item in assignments:
+            key = (item['date'], item['shiftId'])
+            counts[key] = counts.get(key, 0) + 1
+        first = dt.date.fromisoformat(s['month'] + '-01')
+        date = first
+        while date.month == first.month:
+            for item in s['shifts']:
+                self.assertGreaterEqual(counts.get((date.isoformat(), item['id']), 0), item['required'])
+            date += dt.timedelta(days=1)
+
+    def assert_weighted_actual(self, s, assignments):
+        weights = s['rules']['weekdayWeights']
+        chosen = set(weights['days'])
+        first = dt.date.fromisoformat(s['month'] + '-01')
+        weeks = {}
+        date = first
+        while date.month == first.month:
+            week = (date - dt.timedelta(days=date.weekday())).isoformat()
+            weeks.setdefault(week, []).append(date)
+            date += dt.timedelta(days=1)
+        counts = weekly_team_counts(s, assignments)
+        for week, days in weeks.items():
+            by_day = counts.get(week, ({}, {}))[0]
+            selected = [by_day.get(day.isoformat(), 0) for day in days if day.weekday() + 1 in chosen]
+            others = [by_day.get(day.isoformat(), 0) for day in days if day.weekday() + 1 not in chosen]
+            for group in (selected, others):
+                if group:
+                    self.assertLessEqual(max(group) - min(group), 1)
+            actual_s, actual_o = sum(selected), sum(others)
+            candidates = [actual_s + actual_o] if len(days) == 7 else range(7 * len(s['employees']) + 1)
+            matches = []
+            for total in candidates:
+                q = (total * weights['percent'] + 99) // 100
+                target_s = (q * len(selected) + len(chosen) - 1) // len(chosen)
+                other_count = 7 - len(chosen)
+                target_o = ((total - q) * len(others) + other_count - 1) // other_count if other_count else 0
+                if (target_s, target_o) == (actual_s, actual_o):
+                    matches.append(total)
+            self.assertTrue(matches, (week, by_day, weights))
+
+    def test_weekday_weights_use_actual_team_total_and_keep_every_daily_shift_minimum(self):
         s = state(month='2026-02', employees=[employee(str(i), ['early', 'late'], cap=168) for i in range(6)], shifts=[shift(), shift('late', '16:00', '23:00')])
         s['rules'].update(weekdayWeights={'days': [1, 2], 'percent': 20}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
-        counts = weekly_team_counts(s, result['assignments'])
-        days, shifts = counts['2026-02-02']
-        self.assertEqual(shifts, {'early': 7, 'late': 7})
-        self.assertEqual(days.get('2026-02-02', 0) + days.get('2026-02-03', 0), 3)  # ceil(14 * .2), not 2 * ceil(7 * .2)
-        self.assertLessEqual(abs(days.get('2026-02-02', 0) - days.get('2026-02-03', 0)), 1)
-        remaining = [days.get(f'2026-02-{day:02d}', 0) for day in range(4, 9)]
-        self.assertLessEqual(max(remaining) - min(remaining), 1)
-        # Only Sunday remains in the first week: ceil(11 / 5)=3 total.
-        # Equal shift remainders use stable input order, not random ties.
-        self.assertEqual(counts['2026-01-26'][1], {'early': 2, 'late': 1})
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+        days, by_shift = weekly_team_counts(s, result['assignments'])['2026-02-02']
+        total = sum(days.values())
+        self.assertGreater(total, 14)  # 14 cannot cover both shifts on both selected weekdays.
+        self.assertEqual(days.get('2026-02-02', 0) + days.get('2026-02-03', 0), (total * 20 + 99) // 100)
+        self.assertTrue(all(count >= 7 for count in by_shift.values()))
 
-    def test_partial_targets_match_user_example_and_largest_remainder(self):
-        shifts = [shift(required=2), shift('late', '16:00', '23:00', 2), shift('night', '23:00', '07:00', 1)]
+    def test_partial_targets_preserve_user_example_shares_for_a_given_full_week_total(self):
         config = {'days': [1, 6], 'percent': 40}
-        # Complete week 35 -> selected 14, other 21. Missing Monday retains
-        # Saturday's seven and all 21 others, rather than renormalizing to 35.
         tuesday_to_sunday = [dt.date(2026, 9, day).toordinal() for day in range(1, 7)]
-        result = weekday_targets(config, tuesday_to_sunday, shifts)
-        self.assertEqual(result[2:], (7, 21, {'early': 11, 'late': 11, 'night': 6}))
-        # Also missing Tuesday: other share ceil(21*4/5)=17, total 24.
+        self.assertEqual(weekday_targets(config, tuesday_to_sunday, 35)[2:], (7, 21))
         wednesday_to_sunday = [dt.date(2026, 4, day).toordinal() for day in range(1, 6)]
-        result = weekday_targets(config, wednesday_to_sunday, shifts)
-        self.assertEqual(result[2:], (7, 17, {'early': 10, 'late': 9, 'night': 5}))
+        self.assertEqual(weekday_targets(config, wednesday_to_sunday, 35)[2:], (7, 17))
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent weekday-budget comparison')
-    def test_weekday_budgets_match_frontend_across_partial_weeks(self):
+    def test_weekday_budgets_match_frontend_at_explicit_variable_full_totals(self):
         samples = []
         for month in ('2026-02', '2026-04', '2026-09', '2026-10'):
             for days, percent in (([1, 6], 40), ([6, 7], 50), ([1], 100), ([1], 0), (list(range(1, 8)), 100)):
-                s = state(month=month, shifts=[shift(required=2), shift('late', '16:00', '23:00', 2), shift('night', '23:00', '07:00', 1)])
+                s = state(month=month)
                 s['rules']['weekdayWeights'] = {'days': days, 'percent': percent}
-                samples.append(s)
+                for full_total in (0, 7, 13, 35):
+                    samples.append({'state': s, 'fullTotal': full_total})
         root = Path(__file__).resolve().parents[2]
-        javascript = "import {readFileSync} from 'node:fs'; import {weightedWeeks} from './src/weekday-weights.ts'; process.stdout.write(JSON.stringify(JSON.parse(readFileSync(0,'utf8')).map(weightedWeeks)))"
+        javascript = "import {readFileSync} from 'node:fs'; import {weightedWeeks} from './src/weekday-weights.ts'; process.stdout.write(JSON.stringify(JSON.parse(readFileSync(0,'utf8')).map(item=>weightedWeeks(item.state,item.fullTotal))))"
         run = subprocess.run(['node', '--input-type=module', '-e', javascript], cwd=root, input=json.dumps(samples), text=True, encoding='utf-8', capture_output=True, check=True)
-        for s, weeks in zip(samples, json.loads(run.stdout)):
+        for sample, weeks in zip(samples, json.loads(run.stdout)):
             for week in weeks:
-                _, _, selected, others, targets = weekday_targets(s['rules']['weekdayWeights'], [dt.date.fromisoformat(day).toordinal() for day in week['dates']], s['shifts'])
-                self.assertEqual((selected, others, selected + others, targets), (week['selectedTarget'], week['otherTarget'], week['totalTarget'], week['shiftTargets']))
+                _, _, selected, others = weekday_targets(sample['state']['rules']['weekdayWeights'], [dt.date.fromisoformat(day).toordinal() for day in week['dates']], sample['fullTotal'])
+                self.assertEqual((selected, others, selected + others), (week['selectedTarget'], week['otherTarget'], week['totalTarget']))
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
     def test_weighted_solution_matches_frontend_validator(self):
@@ -356,82 +421,65 @@ class SolverTest(unittest.TestCase):
         validation = subprocess.run(['node', str(check)], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
-    def test_weekday_weights_partial_week_keeps_absent_weekday_shares(self):
+    def test_weekday_weights_boundary_weeks_keep_absent_shares_without_losing_daily_coverage(self):
         s = state(month='2026-10', employees=[employee(str(i), cap=168) for i in range(5)])
         s['rules'].update(weekdayWeights={'days': [6, 7], 'percent': 50}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
-        counts = weekly_team_counts(s, result['assignments'])
-        # Full week: weekend ceil(7*.5)=4, remaining 3. Thu-Sun
-        # retains all four selected shifts and ceil(3*2/5)=2 other shifts.
-        first, _ = counts['2026-09-28']
-        self.assertEqual(first.get('2026-10-03', 0) + first.get('2026-10-04', 0), 4)
-        self.assertEqual(sum(first.values()), 6)
-        # Mon-Sat retains half of the selected four, and all three others.
-        last, _ = counts['2026-10-26']
-        self.assertEqual(last.get('2026-10-31', 0), 2)
-        self.assertEqual(sum(last.values()), 5)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+        first, _ = weekly_team_counts(s, result['assignments'])['2026-09-28']
+        self.assertGreaterEqual(first.get('2026-10-01', 0), 1)
+        self.assertGreaterEqual(first.get('2026-10-02', 0), 1)
 
-    def test_weighted_scarce_staff_and_partial_still_obey_hard_targets(self):
+    def test_partial_coverage_may_relax_daily_minimum_but_never_the_weight_ratio(self):
         s = state(month='2026-06', employees=[employee('a', cap=168), employee('b', cap=168)])
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         self.assertEqual(solve(request(s))['status'], 'INFEASIBLE')
-        r = request(s)
-        r['options']['allowPartial'] = True
+        r = request(s); r['options']['allowPartial'] = True
         result = solve(r)
-        self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertNotIn('assignments', result)
-        self.assertTrue(any(i['type'] == 'weekday-weights' for i in result['issues']))
+        self.assertFeasible(result)
+        self.assert_weighted_actual(s, result['assignments'])
+        self.assertTrue(all(dt.date.fromisoformat(a['date']).weekday() == 0 for a in result['assignments']))
+        self.assertEqual(result['stats']['shortageCount'], 25)
+        self.assertEqual(len(result['assignments']), 5)
 
-    def test_weekday_weights_partial_does_not_relax_with_locked_ratio_conflict(self):
-        locked = [assignment('a', '2026-06-02')]
-        s = state(month='2026-06', employees=[employee(str(i), cap=168) for i in range(7)] + [employee('a', cap=168)], assignments=locked)
+    def test_locked_assignment_in_zero_weight_group_remains_infeasible_even_with_partial(self):
+        s = state(month='2026-06', employees=[employee('a', cap=168), employee('b', cap=168)], assignments=[assignment('a', '2026-06-02')])
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
-        r = request(s)
-        r['options']['allowPartial'] = True
+        r = request(s); r['options']['allowPartial'] = True
         result = solve(r)
         self.assertEqual(result['status'], 'INFEASIBLE')
         self.assertNotIn('assignments', result)
 
-    def test_weighted_fixed_day_can_exceed_baseline_daily_required(self):
-        locked = [assignment(str(i), '2026-06-01') for i in range(7)]
-        s = state(month='2026-06', employees=[employee(str(i), cap=168) for i in range(7)], assignments=locked)
+    def test_weighted_locked_counts_above_old_total_are_feasible_with_extra_staffing(self):
+        locked = [assignment(str(i), '2026-06-01') for i in range(8)]
+        s = state(month='2026-06', employees=[employee(str(i), cap=168) for i in range(8)], shifts=[shift(required=0)], assignments=locked)
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
         self.assertTrue(all(item in result['assignments'] for item in locked))
-        self.assertEqual(len(result['assignments']), 35)
+        self.assertEqual(len(result['assignments']), 8)
+        self.assert_weighted_actual(s, result['assignments'])
 
-    def test_weighted_fixed_week_overstaffing_detected(self):
-        locked = [assignment(str(i), '2026-06-01') for i in range(8)]
-        s = state(month='2026-06', employees=[employee(str(i), cap=168) for i in range(8)], assignments=locked)
-        s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
-        result = solve(request(s))
-        self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertTrue(any(i['type'] == 'overstaffed' for i in result['issues']))
-
-    def test_weighted_outside_month_assignments_preserved_without_entering_quota(self):
+    def test_weighted_outside_month_assignments_are_preserved_but_not_counted_in_quota(self):
         prior = assignment('a', '2026-09-28', locked=False)
         s = state(month='2026-10', employees=[employee('a', cap=168), employee('b', cap=168), employee('c', cap=168)], assignments=[prior])
         s['rules'].update(weekdayWeights={'days': [6, 7], 'percent': 50}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
         self.assertIn(prior, result['assignments'])
-        first, _ = weekly_team_counts(s, result['assignments'])['2026-09-28']
-        self.assertEqual(sum(first.values()), 6)
-        self.assertEqual(first.get('2026-10-03', 0) + first.get('2026-10-04', 0), 4)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
 
-    def test_zero_weight_partial_week_remains_empty_without_redistribution(self):
-        s = state(month='2026-02', employees=[employee(str(i), cap=168) for i in range(7)])
+    def test_zero_weight_partial_week_can_be_empty_only_when_daily_minimum_permits_it(self):
+        s = state(month='2026-02', employees=[employee(str(i), cap=168, minimum_month=8) for i in range(7)], shifts=[shift(required=0)])
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
-        for partial in (False, True):
-            r = request(s)
-            r['options']['allowPartial'] = partial
-            result = solve(r)
-            self.assertFeasible(result)
-            self.assertFalse(any(a['date'] == '2026-02-01' for a in result['assignments']))
-            self.assertEqual(len(result['assignments']), 28)
-            self.assertEqual(result['stats']['shortageCount'], 0)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertFalse(any(a['date'] == '2026-02-01' for a in result['assignments']))
+        self.assertEqual(len(result['assignments']), 7)
+        self.assert_weighted_actual(s, result['assignments'])
 
     def test_all_weekdays_at_100_percent_is_uniform(self):
         s = state(month='2026-06', employees=[employee('a', cap=168), employee('b', cap=168)])
@@ -439,17 +487,50 @@ class SolverTest(unittest.TestCase):
         result = solve(request(s))
         self.assertFeasible(result)
         self.assertEqual(len(result['assignments']), 30)
-        self.assertTrue(all(len(days) in (2, 7) and set(days.values()) == {1} for days, _ in weekly_team_counts(s, result['assignments']).values()))
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
 
-    def test_weighted_monthly_capacity_does_not_reject_redistributed_nights(self):
-        # Five Mondays retain seven shifts each, all ending in June. Counting
-        # baseline daily demand or clipping a hypothetical June 30 shift would
-        # undercount the 280 hours supplied by the weighted weekly targets.
-        s = state(month='2026-06', employees=[employee(str(i), ['night'], cap=168, minimum_month=40) for i in range(7)], shifts=[shift('night', '23:00', '07:00')])
+    def test_weighted_zero_required_nights_can_supply_monthly_minimum(self):
+        s = state(month='2026-06', employees=[employee(str(i), ['night'], cap=168, minimum_month=40) for i in range(7)], shifts=[shift('night', '23:00', '07:00', 0)])
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
         self.assertEqual(sum(actual_month_minutes(s, result['assignments'], str(i))[0] for i in range(7)), 280 * 60)
+        self.assert_weighted_actual(s, result['assignments'])
+
+    def test_user_twelve_employee_monthly_and_weekly_minimum_screenshot(self):
+        ids = ['early', 'late', 'night']
+        s = state(employees=[employee(str(i), ids, cap=56, minimum_month=144, minimum_week=40) for i in range(12)],
+                  shifts=[shift(), shift('late', '14:00', '22:00'), shift('night', '22:00', '06:00')])
+        s['rules']['maxConsecutiveDays'] = 5
+        # CI hosts vary; the product's 15-second budget is checked separately.
+        r = request(s); r['options']['timeLimitSeconds'] = 30
+        result = solve(r)
+        self.assertFeasible(result)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assertGreater(len(result['assignments']), 31 * 3)
+        self.assertLess(len(result['assignments']), 31 * 12)
+        for employee_id in map(str, range(12)):
+            minutes, weeks = actual_month_minutes(s, result['assignments'], employee_id)
+            self.assertGreaterEqual(minutes, 144 * 60)
+            for week, actual in weeks.items():
+                start = dt.date.fromisoformat(week)
+                days = sum((start + dt.timedelta(days=d)).strftime('%Y-%m') == s['month'] for d in range(7))
+                self.assertGreaterEqual(actual, (40 * 60 * days + 6) // 7)
+                self.assertLessEqual(actual, 56 * 60)
+
+    def test_twelve_employee_minimums_also_work_with_uniform_hard_weekday_weights(self):
+        ids = ['early', 'late', 'night']
+        s = state(employees=[employee(str(i), ids, cap=56, minimum_month=144, minimum_week=40) for i in range(12)],
+                  shifts=[shift(), shift('late', '14:00', '22:00'), shift('night', '22:00', '06:00')])
+        s['rules'].update(maxConsecutiveDays=5, weekdayWeights={'days': list(range(1, 8)), 'percent': 100})
+        r = request(s); r['options']['timeLimitSeconds'] = 30
+        result = solve(r)
+        self.assertFeasible(result)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+        for eid in map(str, range(12)):
+            self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], eid)[0], 144 * 60)
 
     def test_invalid_weekday_weight_schemas_and_deprecated_switch(self):
         invalid = [None, {}, {'days': [], 'percent': 50}, {'days': [1, 1], 'percent': 50}, {'days': [0], 'percent': 50}, {'days': [8], 'percent': 50}, {'days': [True], 'percent': 50}, {'days': [1], 'percent': -1}, {'days': [1], 'percent': 101}, {'days': [1], 'percent': 1.5}, {'days': list(range(1, 8)), 'percent': 99}]
@@ -496,15 +577,17 @@ class SolverTest(unittest.TestCase):
         self.assertEqual(json.loads(validation.stdout), [])
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for frontend reference resolution')
-    def test_frontend_reference_defaults_resolve_before_solver_and_explain_capacity(self):
+    def test_frontend_reference_defaults_can_add_staff_to_meet_monthly_hours(self):
         folder = Path(__file__).resolve().parent
         fixture = subprocess.run(['node', str(folder / 'default_fixture.mjs'), '--reference'], text=True, encoding='utf-8', capture_output=True, check=True)
         s = json.loads(fixture.stdout)
         self.assertTrue(all(isinstance(e['minHoursPerMonth'], (int, float)) and e['minHoursPerMonth'] > 0 for e in s['employees']))
-        result = solve(request(s))
-        self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertEqual(result['issues'][0]['type'], 'monthly-min-hours')
-        self.assertNotIn('assignments', result)
+        r = request(s); r['options']['timeLimitSeconds'] = 10
+        result = solve(r)
+        self.assertFeasible(result)
+        self.assert_daily_minimum(s, result['assignments'])
+        for e in s['employees']:
+            self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], e['id'])[0], e['minHoursPerMonth'] * 60)
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
     def test_positive_month_and_week_minimums_match_js_validator(self):

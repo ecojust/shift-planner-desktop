@@ -2,7 +2,7 @@ import { strToU8, zipSync } from 'fflate'
 import { dayInfo, calculatePayroll, createPayrollConfig, payrollRows as makePayrollRows } from './payroll.ts'
 import type { DayKind, PlannerDocument, PayrollSettings, PayrollResult } from './payroll'
 import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
-import { weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
+import { findWeightedWeek, weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
 
 export const STORAGE_KEY = 'shift-planner:v1'
 const MAX_BYTES = 2 * 1024 * 1024
@@ -266,12 +266,24 @@ function sheet(rows: Cell[][]): string {
 export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Cell[][] } = {}): Uint8Array {
   const safe = parseBackup(JSON.stringify(state))
   const payroll = documentPayroll(safe)
-  const rows: Cell[][][] = [table(safe, payroll), [['班次', '简称', '开始时间', '结束时间', safe.rules.weekdayWeights ? '基准每日人数' : '每日人数', '单班工时', '固定班次津贴（元/人/班）'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.required, duration(s.start, s.end), s.normalAllowance ?? 0]), ['说明', '班次格子归属开始日期；本月工时按实际时段拆月，上月跨夜进入本月的部分计入，月底跨出部分不计。']], options.payrollRows ?? makePayrollRows(payroll)]
+  const rows: Cell[][][] = [table(safe, payroll), [['班次', '简称', '开始时间', '结束时间', '每天最低人数', '单班工时', '固定班次津贴（元/人/班）'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.required, duration(s.start, s.end), s.normalAllowance ?? 0]), ['说明', '每天每班人数不得低于最低要求，可额外安排人员。班次格子归属开始日期；本月工时按实际时段拆月，上月跨夜进入本月的部分计入，月底跨出部分不计。']], options.payrollRows ?? makePayrollRows(payroll)]
   rows[1]!.push(['津贴口径', '每人每次排班领取该班次设置的固定津贴，全部计入排班开始日期，跨夜只计一次。津贴与工资、工时、倍率及节假日无关。'])
   if (safe.rules.weekdayWeights) {
     const rule = safe.rules.weekdayWeights
-    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按团队完整周班次数计算，部分周保留原星期份额；各组内每日差不超过 1 班。`], ['自然周起始', '本月首日', '本月末日', '本段总班次', '选中星期配额', '其余星期配额', ...safe.shifts.map(s => s.name + '周配额')])
-    for (const week of weightedWeeks(safe)) rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, week.totalTarget, week.selectedTarget, week.otherTarget, ...safe.shifts.map(s => week.shiftTargets[s.id] ?? 0)])
+    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班最低人数，各组内每日差不超过 1 班。月首尾不足整周时，匹配完整周基准表示可满足比例的周总量，不表示月外已有这些排班。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '最低班位缺口', '权重分布检查', ...safe.shifts.map(s => s.name + '实际班次')])
+    for (const week of weightedWeeks(safe)) {
+      const assignments = safe.assignments.filter(item => week.dates.includes(item.date) && item.shiftId !== 'off')
+      const selectedActual = assignments.filter(item => week.selectedDates.includes(item.date)).length
+      const otherActual = assignments.length - selectedActual
+      const matched = findWeightedWeek(safe, week, selectedActual, otherActual)
+      const evenGroups = [week.selectedDates, week.otherDates].every(dates => {
+        const counts = dates.map(date => assignments.filter(item => item.date === date).length)
+        return counts.length < 2 || Math.max(...counts) - Math.min(...counts) <= 1
+      })
+      const minimumGap = week.dates.reduce((sum, date) => sum + safe.shifts.reduce((n, shift) => n + Math.max(0, shift.required - assignments.filter(item => item.date === date && item.shiftId === shift.id).length), 0), 0)
+      const problems = [minimumGap ? '最低覆盖不足' : '', !matched ? '星期比例未匹配' : '', !evenGroups ? '同组日期分布不均' : ''].filter(Boolean)
+      rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, assignments.length, selectedActual, otherActual, matched?.fullTotal ?? '未匹配', minimumGap, problems.join('；') || '通过', ...safe.shifts.map(shift => assignments.filter(item => item.shiftId === shift.id).length)])
+    }
   }
   if (rows.some(items => items.length > 100000 || items.some(row => row.length > 256))) throw new Error('Excel 导出数据量超出限制')
   if (rows.some(items => items.some(row => row.some(cell => typeof cell === 'number' ? !Number.isFinite(cell) : typeof cell !== 'string' || cell.length > 32767)))) throw new Error('Excel 单元格必须为有效文本或有限数字')

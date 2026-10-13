@@ -110,7 +110,7 @@ async function main() {
     assert.equal(await monthHours('陈晨').inputValue(), '120')
     record('per-month-reference-and-restore-auto')
 
-    // Date overrides must feed the reference as well as the payroll calendar.
+    // Date overrides must feed the working-day reference.
     await navigate('排班日历')
     await page.getByRole('button', { name: '月视图', exact: true }).click()
     await page.getByRole('button', { name: '设置 2025-10-09 日期类型', exact: true }).click()
@@ -179,8 +179,13 @@ async function main() {
     await persisted(s => JSON.stringify(s.employees) === JSON.stringify(backupState.employees) && JSON.stringify(s.monthlyReferenceHours) === JSON.stringify(backupState.monthlyReferenceHours))
     record('json-download-and-confirmed-import-preserve-new-fields')
 
-    // Old sample has more employee minimum hours than supplied shift hours.
-    // Browser heuristic must reject safely, without claiming a proof of infeasibility.
+    // Staffing requirements are minimums, so employee hours may be met by
+    // adding shifts. Use a genuinely impossible personal bound for this case:
+    // 744 monthly hours cannot fit within a 42-hour weekly maximum.
+    await monthHours('工时测试员').fill('744')
+    await saveHours('工时测试员')
+    await persisted(s => s.employees.find(e => e.name === '工时测试员')?.minHoursPerMonth === 744)
+    // Browser search must reject safely and retain the previous roster.
     await navigate('排班日历')
     await page.getByRole('button', { name: '陈晨 2025-10-01 休息，点击编辑', exact: true }).click()
     await page.getByRole('dialog').getByRole('button', { name: /^早 早班/ }).click()

@@ -99,27 +99,17 @@ def _hours_text(minutes: int):
     return f'{minutes / 60:.2f}'.rstrip('0').rstrip('.')
 
 
-def weekday_targets(config, days, shifts):
-    """Keep absent weekdays' shares outside the month, without renormalizing."""
+def weekday_targets(config, days, full_total):
+    """Project a variable full-week budget into this month, without renormalizing."""
     chosen = set(config['days'])
     selected = [day for day in days if dt.date.fromordinal(day).weekday() + 1 in chosen]
     others = [day for day in days if day not in selected]
-    daily_total = sum(int(shift['required']) for shift in shifts)
-    full_total = daily_total * 7
     full_selected = (full_total * int(config['percent']) + 99) // 100
     full_other = full_total - full_selected
     selected_target = (full_selected * len(selected) + len(chosen) - 1) // len(chosen)
     other_count = 7 - len(chosen)
     other_target = (full_other * len(others) + other_count - 1) // other_count if other_count else 0
-    total = selected_target + other_target
-    # Hamilton / largest remainder allocation: integer arithmetic, stable
-    # input shift order for ties, exactly the team's partial-week total.
-    targets = {shift['id']: total * int(shift['required']) // daily_total if daily_total else 0 for shift in shifts}
-    if daily_total:
-        ranked = sorted(enumerate(shifts), key=lambda item: (-(total * int(item[1]['required']) % daily_total), item[0]))
-        for _, shift in ranked[:total - sum(targets.values())]:
-            targets[shift['id']] += 1
-    return selected, others, selected_target, other_target, targets
+    return selected, others, selected_target, other_target
 
 
 def validate_request(request):
@@ -168,7 +158,7 @@ def validate_request(request):
         shift_ids.add(sid)
         if _clock(shift.get('start')) == _clock(shift.get('end')):
             raise InvalidInput('班次开始和结束时间不能相同。')
-        _num(shift.get('required'), '每日班次需求', 0, MAX_EMPLOYEES, True)
+        _num(shift.get('required'), '每日班次最低人数', 0, MAX_EMPLOYEES, True)
     employee_ids = set()
     for emp in employees:
         _obj(emp, '员工')
@@ -265,7 +255,7 @@ def solve(request: Any) -> dict:
             week_days[week] += 1
             week_dates[week].append(day)
         weights = state['rules'].get('weekdayWeights')
-        weighted_weeks = {week: weekday_targets(weights, days, shifts) for week, days in week_dates.items()} if weights else {}
+        weighted_weeks = {week: weekday_targets(weights, days, 0)[:2] for week, days in week_dates.items()} if weights else {}
         # A partial boundary week has its own minimum for the days in this
         # month. Out-of-month work counts only towards the full-week maximum.
         weekly_targets = {eid: {week: (minutes * days + 6) // 7 for week, days in week_days.items()} for eid, minutes in weekly_minimums.items()}
@@ -318,44 +308,12 @@ def solve(request: Any) -> dict:
             selected = set(group['shiftIds']) or set(smap)
             if any(len(staff & members) > 1 for (_, sid), staff in fixed_coverage.items() if sid in selected):
                 conflicts.append(issue('separation', f'固定排班违反同班互斥分组“{group.get("name", group["id"])}”。'))
-        if weights:
-            for week, days in week_dates.items():
-                selected, others, selected_target, other_target, shift_targets = weighted_weeks[week]
-                for sid, shift in smap.items():
-                    count = sum(len(fixed_coverage[(day, sid)]) for day in days)
-                    if count > shift_targets[sid]:
-                        conflicts.append(issue('overstaffed', '锁定排班已超过该自然周在本月的班次总需求，请先调整锁定或需求人数。', date=dt.date.fromordinal(week).isoformat()))
-                for label, group, target in (('所选星期', selected, selected_target), ('其余星期', others, other_target)):
-                    locked_counts = [sum(len(fixed_coverage[(day, sid)]) for sid in smap) for day in group]
-                    if sum(locked_counts) > target or (group and max(locked_counts) > (target + len(group) - 1) // len(group)):
-                        conflicts.append(issue('weekday-weights', f'锁定排班与{label}的 {target} 班次配额或组内每日均摊冲突。', date=dt.date.fromordinal(week).isoformat()))
-                    if target > len(group) * len(employees):
-                        conflicts.append(issue('weekday-weights', f'{label}需要 {target} 班次，但这 {len(group)} 天按每人每天最多一班仅能提供 {len(group) * len(employees)} 班次；请降低权重或调整人员与需求。', date=dt.date.fromordinal(week).isoformat()))
-        else:
-            for (day, sid), staff in fixed_coverage.items():
-                if day in active and len(staff) > smap[sid]['required']:
-                    conflicts.append(issue('overstaffed', '锁定排班已超出本月班次需求，请先调整锁定或需求人数。', date=dt.date.fromordinal(day).isoformat()))
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
-            return response('INFEASIBLE', '固定排班或星期配额存在硬约束冲突，原排班未修改。', conflicts)
-        # With exact daily demand, the total available work is bounded before
-        # searching. Carry-in work has a start date outside the editable month.
-        month_capacity = (sum(
-            target * shift_times[sid][1]
-            for _, _, _, _, shift_targets in weighted_weeks.values() for sid, target in shift_targets.items()
-        ) if weights else sum(
-            overlap_minutes(day * DAY + clock, day * DAY + clock + duration, month_start, month_end) * smap[sid]['required']
-            for day in dates for sid, (clock, duration) in shift_times.items()
-        )) + sum(
-            overlap_minutes(start, end, month_start, month_end)
-            for work in fixed_work.values() for start, end, a in work if _date(a['date']) not in active
-        )
-        total_minimum = sum(monthly_minimums.values())
-        if total_minimum > month_capacity:
-            return response('INFEASIBLE', '员工月最低工时合计超过本月班次需求可提供的工时，原排班未修改。', [issue(
-                'monthly-min-hours', f'月最低工时合计 {_hours_text(total_minimum)} 小时，班次需求最多提供 {_hours_text(month_capacity)} 小时；请调整个人最低工时或班次需求。'
-            )])
+            return response('INFEASIBLE', '固定排班存在硬约束冲突，原排班未修改。', conflicts)
+        # Daily required counts are lower bounds, so they never cap the team's
+        # available monthly work. Individual availability checks remain below.
         check_time()
         model = cp_model.CpModel()
         x = {}
@@ -383,7 +341,7 @@ def solve(request: Any) -> dict:
                 day_maximum = 0
                 day_week_maximums = defaultdict(int)
                 for sid in e['eligibleShiftIds']:
-                    if smap[sid]['required'] == 0 or caps[eid] == 0:
+                    if caps[eid] == 0:
                         continue
                     clock, duration = shift_times[sid]
                     start, end = day * DAY + clock, day * DAY + clock + duration
@@ -444,31 +402,46 @@ def solve(request: Any) -> dict:
                     if terms:
                         model.add(sum(terms) + prior <= 1)
         shortages = []
-        # Weighted team targets are fixed hard counts. Allowing a shortage
-        # would violate selected + remaining targets, so do not relax them.
-        allow_partial = options.get('allowPartial', False) and not weights
-        demand_periods = list(week_dates.items()) if weights else [(day, [day]) for day in dates]
-        for period, days in demand_periods:
+        allow_partial = options.get('allowPartial', False)
+        for day in dates:
             for s in shifts:
-                demand = weighted_weeks[period][4][s['id']] if weights else int(s['required'])
-                target = demand - sum(len(fixed_coverage[(day, s['id'])]) for day in days)
-                terms = [var for day in days for var in coverage[(day, s['id'])]]
+                target = max(0, int(s['required']) - len(fixed_coverage[(day, s['id'])]))
+                terms = coverage[(day, s['id'])]
                 if allow_partial:
-                    shortage = model.new_int_var(0, target, f'shortage_{period}_{s["id"]}')
+                    shortage = model.new_int_var(0, target, f'shortage_{day}_{s["id"]}')
                     shortages.append(shortage)
-                    model.add(sum(terms) + shortage == target)
+                    model.add_max_equality(shortage, [target - sum(terms), 0])
                 else:
-                    model.add(sum(terms) == target)
+                    model.add(sum(terms) >= target)
         if weights:
-            for week, (selected, others, selected_target, other_target, _) in weighted_weeks.items():
+            staff = len(employees)
+            selected_count = len(weights['days'])
+            other_count = 7 - selected_count
+            for week, (selected, others) in weighted_weeks.items():
                 counts = {}
                 for day in week_dates[week]:
                     count = model.new_int_var(0, len(employees), f'weekday_total_{day}')
                     fixed_count = sum(len(fixed_coverage[(day, sid)]) for sid in smap)
                     model.add(count == sum(var for sid in smap for var in coverage[(day, sid)]) + fixed_count)
                     counts[day] = count
+                # Full weeks use their actual count. At a month boundary W is
+                # a complete-week basis whose absent weekdays retain their share.
+                full_total = model.new_int_var(0, 7 * staff, f'full_week_total_{week}')
+                full_selected = model.new_int_var(0, 7 * staff, f'full_week_selected_{week}')
+                full_other = model.new_int_var(0, 7 * staff, f'full_week_other_{week}')
+                model.add_division_equality(full_selected, full_total * int(weights['percent']) + 99, 100)
+                model.add(full_other == full_total - full_selected)
+                selected_target = model.new_int_var(0, len(selected) * staff, f'selected_target_{week}')
+                other_target = model.new_int_var(0, len(others) * staff, f'other_target_{week}')
+                model.add_division_equality(selected_target, full_selected * len(selected) + selected_count - 1, selected_count)
+                if other_count:
+                    model.add_division_equality(other_target, full_other * len(others) + other_count - 1, other_count)
+                else:
+                    model.add(other_target == 0)
                 model.add(sum(counts[day] for day in selected) == selected_target)
                 model.add(sum(counts[day] for day in others) == other_target)
+                if len(week_dates[week]) == 7:
+                    model.add(full_total == sum(counts.values()))
                 for label, group in (('selected', selected), ('remaining', others)):
                     if len(group) > 1:
                         low = model.new_int_var(0, len(employees), f'weekday_{week}_{label}_min')
@@ -520,36 +493,43 @@ def solve(request: Any) -> dict:
                 if solver.value(var):
                     result.append({'employeeId': eid, 'date': dt.date.fromordinal(day).isoformat(), 'shiftId': sid, 'locked': False})
             return sorted(result, key=lambda a: (a['date'], a['employeeId'], a['shiftId']))
-        phase_one_optimal = True
         saved_assignments = None
         shortage_count = 0
+        # Strict priorities: satisfy as much daily minimum coverage as explicitly
+        # allowed, then avoid unnecessary assignments, then improve fairness.
+        # Never add people simply to reduce a fairness score.
+        phases = []
         if allow_partial:
-            model.minimize(sum(shortages))
-            # Obtain a provably minimum shortfall before optimizing fairness.
+            phases.append(('coverage', sum(shortages)))
+        phases.extend([('staffing', sum(x.values())), ('fairness', fairness)])
+        status = cp_model.UNKNOWN
+        for index, (phase, objective) in enumerate(phases):
             remaining = deadline - time.monotonic()
-            solver, status = run(remaining * 0.7)
-            if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-                saved_assignments = extract(solver)
-                shortage_count = sum(solver.value(var) for var in shortages)
-                phase_one_optimal = status == cp_model.OPTIMAL
-                if phase_one_optimal and deadline - time.monotonic() > 0.01:
-                    model.add(sum(shortages) == shortage_count)
-                    for var in x.values():
-                        model.add_hint(var, solver.value(var))
-                    model.minimize(fairness)
-                    solver, status = run(deadline - time.monotonic())
-                else:
-                    return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, None, None, '已找到最少缺员的可行方案，公平轮班优化达到时限。' if phase_one_optimal else '已找到满足全部硬约束的缺员方案；时限内尚未证明缺员数最少。')
-        else:
-            model.minimize(fairness)
-            solver, status = run(deadline - time.monotonic())
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            final_status = 'OPTIMAL' if status == cp_model.OPTIMAL and phase_one_optimal else 'FEASIBLE'
-            return _success(response, extract(solver), final_status, state, shortage_count, solver.objective_value, solver.best_objective_bound)
-        if saved_assignments is not None and status == cp_model.UNKNOWN:
-            return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, None, None, '已找到最少缺员的可行方案，公平轮班优化达到时限。')
+            if remaining <= 0.005:
+                break
+            model.minimize(objective)
+            # Lower-priority phases only start after this objective is proved
+            # optimal. Reserving time for them would waste budget if this stage
+            # has not found a first feasible roster yet.
+            solver, status = run(remaining)
+            if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                break
+            saved_assignments = extract(solver)
+            shortage_count = sum(solver.value(var) for var in shortages)
+            if status == cp_model.FEASIBLE:
+                unresolved = {'coverage': '缺员数最少', 'staffing': '班次总数最少', 'fairness': '公平性最优'}[phase]
+                return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, solver.objective_value, solver.best_objective_bound,
+                                f'已找到满足硬约束的可行排班；时限内尚未证明{unresolved}。')
+            if index == len(phases) - 1:
+                return _success(response, saved_assignments, 'OPTIMAL', state, shortage_count, solver.objective_value, solver.best_objective_bound)
+            model.add(objective == round(solver.objective_value))
+            model.clear_hints()
+            for var in x.values():
+                model.add_hint(var, solver.value(var))
+        if saved_assignments is not None and status in (cp_model.UNKNOWN, cp_model.OPTIMAL):
+            return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, None, None, '已保留满足全部硬约束的可行方案，后续班次数或公平轮班优化达到时限。')
         if status == cp_model.INFEASIBLE:
-            return response('INFEASIBLE', '已证明当前硬约束无法同时满足，原排班未修改。请检查需求人数、请假、工时、班间休息、同班互斥及星期权重；允许缺员也不会放宽星期配额和工时规则。', [issue('infeasible', '现有人员、班次需求与硬规则存在冲突。')])
+            return response('INFEASIBLE', '已证明当前硬约束无法同时满足，原排班未修改。请检查每日最低人数、请假、工时、班间休息、同班互斥及星期权重；允许缺员也不会放宽星期配额和工时规则。', [issue('infeasible', '现有人员、每日最低人数与硬规则存在冲突。')])
         if status == cp_model.MODEL_INVALID:
             return response('MODEL_INVALID', '求解器拒绝了无效模型，原排班未修改。', [issue('model-invalid', solver.solution_info()[:1000])])
         return response('UNKNOWN', '求解达到时限，尚未找到可行方案；这不代表无解。原排班未修改。', [issue('timeout', '可增加求解时限后重试。')])
@@ -571,19 +551,11 @@ def _success(response, assignments, status, state, shortage, objective, bound, m
     month = state['month']
     first = dt.date.fromisoformat(month + '-01')
     dates = [first + dt.timedelta(days=day) for day in range(calendar.monthrange(first.year, first.month)[1])]
-    periods = defaultdict(list)
-    weighted = bool(state['rules'].get('weekdayWeights'))
     for date in dates:
-        key = (date - dt.timedelta(days=date.weekday())).isoformat() if weighted else date.isoformat()
-        periods[key].append(date.isoformat())
-    for date, days in periods.items():
-        shift_targets = weekday_targets(state['rules']['weekdayWeights'], [_date(day) for day in days], state['shifts'])[4] if weighted else None
         for shift in state['shifts']:
-            target = shift_targets[shift['id']] if shift_targets is not None else shift['required']
-            missing = target - sum(coverage[(day, shift['id'])] for day in days)
+            missing = shift['required'] - coverage[(date.isoformat(), shift['id'])]
             if missing > 0:
-                period = f'{date} 起的自然周（当月 {len(days)} 天）' if weighted else date
-                shortages.append({'id': f'coverage-{date}-{shift["id"]}', 'type': 'coverage', 'severity': 'warning', 'date': date, 'message': f'{period} {shift.get("name", shift["id"])}缺 {missing} 人次。'})
+                shortages.append({'id': f'coverage-{date}-{shift["id"]}', 'type': 'coverage', 'severity': 'warning', 'date': date.isoformat(), 'message': f'{date.isoformat()} {shift.get("name", shift["id"])}比每日最低人数缺 {missing} 人。'})
     if message is None:
         message = '已找到最优排班方案。' if status == 'OPTIMAL' else '已找到可行排班方案；时限内尚未证明公平性最优。'
         if shortage:

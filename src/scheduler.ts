@@ -1,6 +1,6 @@
 import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain.ts'
 import { hoursToMinutes, minimumMonthHours } from './hours.ts'
-import { weekdayWeightRuleError, weightedWeeks, type WeightedWeek } from './weekday-weights.ts'
+import { weekdayWeightRuleError, weightedWeeks, findWeightedWeek, type WeightedWeek } from './weekday-weights.ts'
 
 const DAY = 86_400_000
 const HOUR = 3_600_000
@@ -245,23 +245,24 @@ export function validateSchedule(state: PlannerState): Issue[] {
       add(type, message)
       issues[issues.length - 1]!.date = week.dates[0]!
     }
-    for (const shift of state.shifts) {
-      const count = week.dates.reduce((sum, date) => sum + (coverage.get(`${date}|${shift.id}`)?.size || 0), 0)
-      const target = week.shiftTargets[shift.id] || 0
-      if (count !== target) quotaIssue('weekday-shift-quota', `${week.id} 起的一周，${shift.name}已排 ${count} 人次，星期权重要求 ${target} 人次。`)
+    const selectedActual = week.selectedDates.reduce((sum, date) => sum + dateTotal(date), 0)
+    const otherActual = week.otherDates.reduce((sum, date) => sum + dateTotal(date), 0)
+    if (!findWeightedWeek(state, week, selectedActual, otherActual)) {
+      quotaIssue('weekday-quota', `${week.id} 起的一周，所选星期 ${selectedActual} 人次、其余星期 ${otherActual} 人次，不符合实际总班次数的星期权重；月边界保留缺失星期原份额。`)
     }
-    for (const [label, dates, target] of [['所选星期', week.selectedDates, week.selectedTarget], ['其余星期', week.otherDates, week.otherTarget]] as const) {
-      const counts = dates.map(dateTotal), total = counts.reduce((sum, count) => sum + count, 0)
-      if (total !== target) quotaIssue('weekday-quota', `${week.id} 起的一周，${label}已排 ${total} 人次，星期权重要求 ${target} 人次。`)
+    for (const [label, dates] of [['所选星期', week.selectedDates], ['其余星期', week.otherDates]] as const) {
+      const counts = dates.map(dateTotal)
       if (counts.length && Math.max(...counts) - Math.min(...counts) > 1) quotaIssue('weekday-balance', `${week.id} 起的一周，${label}应平摊排班人次；当前每天为 ${counts.join('、')} 人次，最多相差 1 人次。`)
     }
   }
-  for (const date of weighted.length ? [] : datesOfMonth(state.month)) {
+  // A shift's required headcount is a daily floor, including weighted weeks.
+  for (const date of datesOfMonth(state.month)) {
     for (const shift of state.shifts) {
       const count = coverage.get(`${date}|${shift.id}`)?.size || 0
-      if (count < shift.required) add('coverage', `${date} ${shift.name}缺 ${shift.required - count} 人（${count}/${shift.required}）。`, undefined, 'warning')
-      else if (count > shift.required) add('overstaffed', `${date} ${shift.name}超出需求 ${count - shift.required} 人（${count}/${shift.required}），请检查手动或锁定排班。`, undefined, 'warning')
-      if (count !== shift.required) issues[issues.length - 1]!.date = date
+      if (count < shift.required) {
+        add('coverage', `${date} ${shift.name}缺 ${shift.required - count} 人（已排 ${count} / 每日最少 ${shift.required}）。`, undefined, 'warning')
+        issues[issues.length - 1]!.date = date
+      }
     }
   }
   return issues
@@ -364,70 +365,135 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
   }
   const shifts = new Map(state.shifts.map(shift => [shift.id, shift]))
   const monthMinimums = new Map(state.employees.map(employee => [employee.id, minimumMinutes(minimumMonthHours(state, employee))]))
-  const weighted = weightedWeeks(state)
-  const weightedByDate = new Map(weighted.flatMap(week => week.dates.map(date => [date, week] as const)))
+  const weightExamples = weightedWeeks(state)
   const employeeIds = new Set(state.employees.map(employee => employee.id))
-  let best = fixed, bestRank = [Infinity, Infinity, Infinity]
+  const dailyMinimum = state.shifts.reduce((sum, shift) => sum + shift.required, 0)
+  let best = fixed, bestRank = [Infinity, Infinity, Infinity, Infinity]
   for (let attempt = 0; attempt < 32; attempt++) {
     const random = randomSource(seed + attempt * 7919)
+    // A stable shift preference leaves usable rest windows between workdays.
+    // Rotate preferences between strategies instead of forcing daily shift variety.
+    const preferredShift = new Map(state.employees.map((employee, index) => [employee.id, employee.eligibleShiftIds[(index + Math.floor(attempt / 4)) % Math.max(1, employee.eligibleShiftIds.length)]]))
     const assignments = fixed.map(item => ({ ...item }))
     const plans = state.employees.map(employee => ({ employee, work: [], occupied: new Set<string>(), days: new Set<number>(), weeks: new Map<number, number>(), monthWeeks: new Map<number, number>(), hours: 0, shiftCounts: new Map<string, number>() } as EmployeePlan))
     for (const item of fixed) {
       const plan = plans.find(entry => entry.employee.id === item.employeeId)
       if (plan) addToPlan(plan, item, shifts, state.month, window)
     }
-    const dayTargets = weightedDailyTargets(weighted, fixed, employeeIds, shifts, random)
-    const weekCounts = new Map(weighted.map(week => [week.id, new Map(state.shifts.map(shift => [shift.id, new Set(fixed.filter(item => employeeIds.has(item.employeeId) && item.shiftId === shift.id && week.dates.includes(item.date)).map(item => `${item.date}|${item.employeeId}`)).size]))]))
-    let missing = 0
-    // Alternate traversal to avoid always leaving shortages at the month end.
-    const traversal = attempt % 4 === 3 ? [...dates].reverse() : dates
-    for (const date of traversal) {
-      const week = weightedByDate.get(date)
-      const dailyCount = (shiftId: string) => new Set(assignments.filter(item => item.date === date && item.shiftId === shiftId && employeeIds.has(item.employeeId)).map(item => item.employeeId)).size
-      let dateCount = state.shifts.reduce((sum, shift) => sum + dailyCount(shift.id), 0)
-      const dateTarget = week ? dayTargets.get(date)! : Infinity
-      const slots = state.shifts.map(shift => ({ shift, count: week ? weekCounts.get(week.id)!.get(shift.id)! : dailyCount(shift.id), target: week ? week.shiftTargets[shift.id] || 0 : shift.required }))
-      while (dateCount < dateTarget && slots.some(slot => slot.count < slot.target)) {
-        const choices = slots.filter(slot => slot.count < slot.target).map(slot => {
-          const prototype = workFor({ employeeId: '', date, shiftId: slot.shift.id, locked: false }, shifts)!
-          return { slot, prototype, candidates: plans.filter(plan => allowed(plan, prototype, state, assignments)) }
-        }).sort((a, b) => a.candidates.length - b.candidates.length || b.prototype.start - a.prototype.start)
-        const { slot, prototype, candidates } = choices[0]!
-        if (!candidates.length) {
-          if (!week) missing += slot.target - slot.count
-          slot.count = slot.target
-          continue
-        }
-        const scored = candidates.map(plan => {
-          const monthGain = Math.min(Math.max(0, monthMinimums.get(plan.employee.id)! - plan.hours * 60), overlapMinutes(prototype, window.start, window.end))
-          const weekGain = window.weeks.reduce((sum, week) => sum + Math.min(Math.max(0, minimumWeekMinutes(plan.employee, week.days) - (plan.monthWeeks.get(week.week) || 0)), overlapMinutes(prototype, week.start, week.end)), 0)
-          return { plan, score:
-            - weekGain * 1000 - monthGain * 10
-            + plan.hours / Math.max(1, plan.employee.maxHoursPerWeek) * 10
-            + (plan.shiftCounts.get(slot.shift.id) || 0) * 0.7
-            + ((plan.weeks.get(weekStart(prototype.start)) || 0) / Math.max(1, plan.employee.maxHoursPerWeek)) * 3
-            + random() * (attempt % 3 === 0 ? 2 : 0.8)
+    // These are search candidates, never fixed limits derived from required.
+    // The desktop solver searches the full domain; this browser heuristic tries
+    // increasing legal budgets and validates the final actual counts independently.
+    const weighted = weightExamples.map(example => {
+      const requiredSlots = plans.reduce((sum, plan) => {
+        const longest = Math.max(0, ...state.shifts.filter(shift => plan.employee.eligibleShiftIds.includes(shift.id)).map(shift => shiftHours(shift) * 60))
+        const needed = Math.max(minimumWeekMinutes(plan.employee, example.dates.length), monthMinimums.get(plan.employee.id)! * example.dates.length / dates.length)
+        return sum + (longest ? Math.ceil(needed / longest) : 0)
+      }, 0)
+      const choices: WeightedWeek[] = []
+      for (let fullTotal = 0; fullTotal <= state.employees.length * 7; fullTotal++) {
+        const candidate = weightedWeeks(state, fullTotal).find(week => week.id === example.id)!
+        if (candidate.totalTarget < requiredSlots) continue
+        const fits = [[candidate.selectedDates, candidate.selectedTarget], [candidate.otherDates, candidate.otherTarget]].every(([rawDates, rawTotal]) => {
+          const group = rawDates as string[], total = rawTotal as number
+          if (!group.length) return total === 0
+          const low = Math.floor(total / group.length), high = Math.ceil(total / group.length)
+          if (low < dailyMinimum || high > state.employees.length) return false
+          let floor = 0, ceiling = 0
+          for (const date of group) {
+            const lockedWork = new Set(fixed.filter(item => item.date === date && shifts.has(item.shiftId)).map(item => item.employeeId)).size
+            const available = plans.filter(plan => !plan.employee.unavailableDates.includes(date) && plan.employee.maxHoursPerWeek > 0 && plan.employee.eligibleShiftIds.length && !fixed.some(item => item.employeeId === plan.employee.id && item.date === date && item.shiftId === 'off')).length
+            const min = Math.max(low, lockedWork), max = Math.min(high, available)
+            if (min > max) return false
+            floor += min; ceiling += max
           }
-        }).sort((a, b) => a.score - b.score)
-        const chosen = scored[0]!.plan
-        const assignment = { employeeId: chosen.employee.id, date, shiftId: slot.shift.id, locked: false }
-        assignments.push(assignment)
-        addToPlan(chosen, assignment, shifts, state.month, window)
-        slot.count++
-        dateCount++
-        if (week) weekCounts.get(week.id)!.set(slot.shift.id, weekCounts.get(week.id)!.get(slot.shift.id)! + 1)
+          return floor <= total && total <= ceiling
+        })
+        if (fits && !choices.some(week => week.totalTarget === candidate.totalTarget && week.selectedTarget === candidate.selectedTarget)) choices.push(candidate)
       }
-      if (week) missing += Math.max(0, dateTarget - dateCount)
+      // No candidate is not a proof of infeasibility; validation reports it and
+      // the existing roster is retained for the exact desktop solver to retry.
+      return choices[Math.min(Math.floor(attempt / 8), Math.max(0, choices.length - 1))] ?? example
+    })
+    const dayTargets = weightedDailyTargets(weighted, fixed, employeeIds, shifts, random)
+    const countOn = (date: string, shiftId?: string) => new Set(assignments.filter(item => item.date === date && shifts.has(item.shiftId) && (!shiftId || item.shiftId === shiftId) && employeeIds.has(item.employeeId)).map(item => item.employeeId)).size
+    const gain = (plan: EmployeePlan, prototype: Work) => {
+      const monthGain = Math.min(Math.max(0, monthMinimums.get(plan.employee.id)! - plan.hours * 60), overlapMinutes(prototype, window.start, window.end))
+      const weekGain = window.weeks.reduce((sum, week) => sum + Math.min(Math.max(0, minimumWeekMinutes(plan.employee, week.days) - (plan.monthWeeks.get(week.week) || 0)), overlapMinutes(prototype, week.start, week.end)), 0)
+      return { monthGain, weekGain }
     }
+    const pick = (candidates: Array<{ plan: EmployeePlan; prototype: Work }>, requireGain = false, targetWeek?: MonthWindow['weeks'][number]) => {
+      const scored = candidates.map(({ plan, prototype }) => {
+        const { monthGain, weekGain } = gain(plan, prototype)
+        // Sunday-night hours mostly belong to Monday's week. When repairing a
+        // specific week's minimum, prefer the hours actually credited to that week.
+        const targetGain = targetWeek ? Math.min(Math.max(0, minimumWeekMinutes(plan.employee, targetWeek.days) - (plan.monthWeeks.get(targetWeek.week) || 0)), overlapMinutes(prototype, targetWeek.start, targetWeek.end)) : 0
+        return { plan, prototype, useful: monthGain + weekGain > EPSILON, score:
+          -weekGain * 1000 - monthGain * 10
+          - targetGain * 10000
+          + (preferredShift.get(plan.employee.id) === prototype.assignment.shiftId ? 0 : 30)
+          + plan.hours / Math.max(1, plan.employee.maxHoursPerWeek) * 10
+          - (plan.shiftCounts.get(prototype.assignment.shiftId) || 0) * 0.7
+          + random() * (attempt % 3 === 0 ? 2 : 0.8) }
+      }).filter(item => !requireGain || item.useful).sort((a, b) => a.score - b.score)
+      const chosen = scored[0]
+      if (!chosen) return false
+      const assignment = { ...chosen.prototype.assignment, employeeId: chosen.plan.employee.id }
+      assignments.push(assignment)
+      addToPlan(chosen.plan, assignment, shifts, state.month, window)
+      return true
+    }
+    const candidatesOn = (date: string, shiftList: Shift[], onlyPlan?: EmployeePlan) => {
+      if (weighted.length && countOn(date) >= (dayTargets.get(date) ?? 0)) return []
+      return shiftList.flatMap(shift => {
+        const prototype = workFor({ employeeId: '', date, shiftId: shift.id, locked: false }, shifts)!
+        return (onlyPlan ? [onlyPlan] : plans).filter(plan => allowed(plan, prototype, state, assignments)).map(plan => ({ plan, prototype }))
+      })
+    }
+    const traversal = attempt % 4 === 3 ? [...dates].reverse() : dates
+    // Cover every shift first; weighted ratios do not remove this daily floor.
+    for (const date of traversal) {
+      const ordered = [...state.shifts].sort((a, b) => candidatesOn(date, [a]).length - candidatesOn(date, [b]).length || b.start.localeCompare(a.start))
+      for (const shift of ordered) while (countOn(date, shift.id) < shift.required) {
+        if (!pick(candidatesOn(date, [shift]))) break
+      }
+    }
+    if (weighted.length) {
+      for (const date of traversal) while (countOn(date) < (dayTargets.get(date) ?? 0)) {
+        if (!pick(candidatesOn(date, state.shifts))) break
+      }
+    } else {
+      // Add qualified staff even when all daily minimums are covered. Complete
+      // each boundary/full week before the month-only minimum to avoid wasting
+      // available dates on work that cannot reduce an earlier weekly deficit.
+      for (const week of window.weeks) {
+        const group = plans.map(plan => ({ plan, tie: random() })).sort((a, b) => (b.plan.employee.minHoursPerWeek ?? 0) - (a.plan.employee.minHoursPerWeek ?? 0) || a.tie - b.tie)
+        for (const { plan } of group) {
+          while ((plan.monthWeeks.get(week.week) || 0) + EPSILON < minimumWeekMinutes(plan.employee, week.days)) {
+            const candidates = traversal.flatMap(date => candidatesOn(date, state.shifts, plan)).filter(item => overlapMinutes(item.prototype, week.start, week.end) > 0)
+            if (!pick(candidates, true, week)) break
+          }
+        }
+      }
+      for (const plan of [...plans].sort((a, b) => (monthMinimums.get(b.employee.id)! - b.hours * 60) - (monthMinimums.get(a.employee.id)! - a.hours * 60))) {
+        while (plan.hours * 60 + EPSILON < monthMinimums.get(plan.employee.id)!) {
+          if (!pick(traversal.flatMap(date => candidatesOn(date, state.shifts, plan)), true)) break
+        }
+      }
+    }
+    const missing = dates.reduce((sum, date) => sum + state.shifts.reduce((total, shift) => total + Math.max(0, shift.required - countOn(date, shift.id)), 0), 0)
     const ratios = plans.filter(plan => plan.employee.maxHoursPerWeek > 0).map(plan => plan.hours / plan.employee.maxHoursPerWeek)
     const mean = ratios.reduce((sum, value) => sum + value, 0) / Math.max(1, ratios.length)
     const fairness = ratios.reduce((sum, value) => sum + (value - mean) ** 2, 0)
     const deficit = plans.reduce((sum, plan) => sum
       + Math.max(0, monthMinimums.get(plan.employee.id)! - plan.hours * 60)
       + window.weeks.reduce((total, week) => total + Math.max(0, minimumWeekMinutes(plan.employee, week.days) - (plan.monthWeeks.get(week.week) || 0)), 0), 0)
-    const rank = [deficit, missing, fairness]
+    const weightErrors = weighted.length ? validateSchedule({ ...state, assignments }).filter(issue => issue.type.startsWith('weekday-')).length : 0
+    const rank = [deficit + weightErrors * 1e6, missing, assignments.length, fairness]
     const firstDifference = rank.findIndex((value, index) => Math.abs(value - bestRank[index]!) > EPSILON)
     if (firstDifference >= 0 && rank[firstDifference]! < bestRank[firstDifference]!) { bestRank = rank; best = assignments }
+    // Stop once all hard requirements and coverage pass; further random restarts
+    // only polish fairness and needlessly delay an already usable roster.
+    if (deficit < EPSILON && missing === 0 && weightErrors === 0 && !validateSchedule({ ...state, assignments }).length) break
   }
   best.sort((a, b) => a.date.localeCompare(b.date) || a.employeeId.localeCompare(b.employeeId) || a.shiftId.localeCompare(b.shiftId))
   const issues = validateSchedule({ ...state, assignments: best })

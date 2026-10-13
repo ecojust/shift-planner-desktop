@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { datesOfMonth, shiftHours, validateSchedule, generateSchedule } from '../scheduler.ts'
 import { makeDefaultState } from '../defaults.ts'
-import { weightedWeeks } from '../weekday-weights.ts'
+import { weightedWeeks, findWeightedWeek } from '../weekday-weights.ts'
 
 const morning = { id: 'morning', name: '早班', shortName: '早', start: '08:00', end: '16:00', color: '#fff', required: 1 }
 const night = { id: 'night', name: '夜班', shortName: '夜', start: '22:00', end: '06:00', color: '#eee', required: 0 }
@@ -21,7 +21,7 @@ test('calendar and overnight durations are deterministic civil dates', () => {
   assert.equal(shiftHours({ ...night, start: '25:00' }), 0)
 })
 
-test('default demo retains its full roster and reports new reference minimum deficits honestly', () => {
+test('default demo retains its illustrative roster and regeneration adds people to meet reference minimums', () => {
   const value = makeDefaultState('2026-10')
   assert.equal(value.employees.length, 12)
   assert.equal(value.assignments.length, 31 * 5)
@@ -29,9 +29,10 @@ test('default demo retains its full roster and reports new reference minimum def
   const initialIssues = validateSchedule(value)
   assert.ok(initialIssues.some(issue => issue.type === 'monthly-min-hours'))
   assert.ok(initialIssues.every(issue => issue.type === 'monthly-min-hours'))
-  const rejected = generateSchedule(value, 41)
-  assert.equal(rejected.success, false)
-  assert.deepEqual(rejected.assignments, value.assignments)
+  const expanded = generateSchedule(value, 41)
+  assert.equal(expanded.success, true)
+  assert.ok(expanded.assignments.length > value.assignments.length)
+  assert.deepEqual(validateSchedule({ ...value, assignments: expanded.assignments }), [])
   // The unchanged demonstration is feasible under its original, zero-minimum rules.
   value.employees.forEach(employee => { employee.minHoursPerMonth = 0 })
   assert.deepEqual(validateSchedule(value), [])
@@ -100,7 +101,7 @@ test('invalid and surplus locked work is reported instead of deleted', () => {
   const value = state({ employees: [employee('a', { eligibleShiftIds: ['morning'], unavailableDates: ['2026-10-01'] })], assignments: locked })
   const result = generateSchedule(value)
   for (const item of locked) assert.ok(result.assignments.some(other => JSON.stringify(other) === JSON.stringify(item)))
-  for (const type of ['duplicate', 'qualification', 'unavailable', 'unknown-shift', 'overstaffed']) assert.ok(result.issues.some(issue => issue.type === type), type)
+  for (const type of ['duplicate', 'qualification', 'unavailable', 'unknown-shift']) assert.ok(result.issues.some(issue => issue.type === type), type)
 })
 
 test('impossible staffing leaves explicit shortages without relaxing rules or mutating input', () => {
@@ -270,10 +271,10 @@ test('heuristic gives minimum deficits priority while keeping weekly caps and st
   assert.deepEqual(generated, generateSchedule(value, 42))
 })
 
-test('unmet monthly or weekly minimum never replaces the original schedule or relaxes demand', () => {
+test('unmet monthly or weekly minimum retains the original when no eligible extra work is possible', () => {
   for (const minimum of [{ minHoursPerMonth: 32 }, { minHoursPerWeek: 40 }]) {
     const original = [assignment('2026-10-02', 'off', true), assignment('2026-09-30', 'night')]
-    const value = state({ employees: [employee('a', minimum)], shifts: [{ ...morning, required: 0 }, night], assignments: original })
+    const value = state({ employees: [employee('a', { ...minimum, eligibleShiftIds: [] })], shifts: [{ ...morning, required: 0 }, night], assignments: original })
     const result = generateSchedule(value)
     assert.equal(result.success, false)
     assert.deepEqual(result.assignments, original)
@@ -320,83 +321,81 @@ const weightState = (extra = {}) => state({
   ...extra,
 })
 
-test('weekday weights replace fixed daily demand with exact weekly team quotas and even group distribution', () => {
+test('weekday weights use actual totals while preserving each daily shift minimum', () => {
   const value = weightState()
   const result = generateSchedule(value, 42)
   assert.equal(result.success, true)
   assert.deepEqual(result.issues, [])
-  assert.equal(result.assignments.length, 32) // Partial-week ceiling keeps its share, not a renormalized 31.
+  assert.ok(result.assignments.length > 31)
+  for (const date of datesOfMonth(value.month)) assert.ok(result.assignments.some(item => item.date === date && item.shiftId === 'morning'))
   for (const week of weightedWeeks(value)) {
     const weekItems = result.assignments.filter(item => week.dates.includes(item.date))
-    assert.equal(weekItems.length, week.totalTarget)
-    assert.equal(weekItems.filter(item => week.selectedDates.includes(item.date)).length, week.selectedTarget)
-    assert.equal(weekItems.filter(item => week.otherDates.includes(item.date)).length, week.otherTarget)
+    const selected = weekItems.filter(item => week.selectedDates.includes(item.date)).length
+    const others = weekItems.length - selected
+    assert.ok(findWeightedWeek(value, week, selected, others))
+    if (week.dates.length === 7) assert.equal(selected, Math.ceil(weekItems.length * 40 / 100))
     for (const dates of [week.selectedDates, week.otherDates]) {
       const counts = dates.map(date => weekItems.filter(item => item.date === date).length)
       if (counts.length) assert.ok(Math.max(...counts) - Math.min(...counts) <= 1)
     }
   }
-  const weeks = weightedWeeks(value)
-  assert.equal(weeks[0].selectedTarget, 3)
-  assert.equal(weeks[0].otherTarget, 2) // ceil(4 remaining weekday seats × 2/5), not redistributed.
-  assert.equal(weeks.at(-1).selectedTarget, 2) // Only Saturday is in October: ceil(3 × 1/2).
-  assert.equal(weeks.at(-1).otherTarget, 4)
   assert.deepEqual(result, generateSchedule(value, 42))
 })
 
-test('weighted weekly totals allow multiple employees of one shift on a day instead of capping it at old daily demand', () => {
+test('daily minimum coverage is checked even when a 100 percent weekend ratio leaves weekdays empty', () => {
   const value = weightState({
     employees: Array.from({ length: 9 }, (_, index) => flexibleEmployee(String(index))),
     shifts: [{ ...morning }, { ...night, required: 1 }],
     rules: { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [6, 7], percent: 100 } },
   })
   const result = generateSchedule(value)
-  assert.equal(result.success, true)
-  assert.deepEqual(result.issues, [])
-  assert.ok(result.assignments.every(item => [0, 6].includes(new Date(`${item.date}T00:00:00Z`).getUTCDay())))
-  const week = result.assignments.filter(item => item.date >= '2026-10-05' && item.date <= '2026-10-11')
-  assert.equal(week.length, 14)
-  assert.equal(week.filter(item => item.shiftId === 'morning').length, 7)
-  assert.equal(week.filter(item => item.shiftId === 'night').length, 7)
-  assert.ok(week.some(item => week.filter(other => other.date === item.date && other.shiftId === item.shiftId).length > 1))
+  assert.ok(result.issues.some(issue => issue.type === 'coverage' && issue.date === '2026-10-05'))
+  assert.ok(!result.issues.some(issue => issue.type === 'overstaffed'))
 })
 
-test('rounding applies once to the team and shift budgets use a stable largest-remainder split', () => {
+test('weight rounding applies once to the actual team total without per-shift upper quotas', () => {
   const value = weightState({
     employees: Array.from({ length: 6 }, (_, index) => flexibleEmployee(String(index))),
     shifts: [{ ...morning }, { ...night, required: 1 }],
     rules: { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [6, 7], percent: 30 } },
   })
-  const weeks = weightedWeeks(value)
-  assert.equal(weeks[1].selectedTarget, 5) // ceil(14 × 30%), not 2 × ceil(7 × 30%) = 6.
-  assert.equal(weeks[0].totalTarget, 9) // First partial week: 5 selected + ceil(9 × 2/5).
-  assert.deepEqual({ ...weeks[0].shiftTargets }, { morning: 5, night: 4 })
+  const example = weightedWeeks(value, 14)
+  assert.equal(example[1].selectedTarget, 5)
+  assert.equal(example[0].totalTarget, 9)
+  assert.equal(example[0].shiftTargets, undefined)
   const result = generateSchedule(value)
   assert.equal(result.success, true)
   assert.deepEqual(result.issues, [])
+  for (const date of datesOfMonth(value.month)) for (const shift of value.shifts) {
+    assert.ok(result.assignments.filter(item => item.date === date && item.shiftId === shift.id).length >= shift.required)
+  }
 })
 
-test('feasible locked extra seats determine which selected date receives the rounding remainder', () => {
-  const locked = [assignment('2026-10-10', 'morning', true, 'a'), assignment('2026-10-10', 'morning', true, 'b')]
+test('locked staffing above the daily floor is retained and the weighted budget can grow', () => {
+  const locked = ['a', 'b', 'c'].map(id => assignment('2026-10-10', 'morning', true, id))
   const value = weightState({ assignments: locked })
   const result = generateSchedule(value)
   assert.equal(result.success, true)
   assert.deepEqual(result.issues, [])
-  assert.deepEqual(result.assignments.filter(item => item.date === '2026-10-10'), locked)
-  assert.equal(result.assignments.filter(item => item.date === '2026-10-11').length, 1)
+  for (const item of locked) assert.ok(result.assignments.some(other => JSON.stringify(other) === JSON.stringify(item)))
+  const saturday = result.assignments.filter(item => item.date === '2026-10-10').length
+  const sunday = result.assignments.filter(item => item.date === '2026-10-11').length
+  assert.ok(Math.abs(saturday - sunday) <= 1)
 })
 
-test('weighted quota or group imbalance never overwrites a locked incompatible roster', () => {
-  const locked = ['a', 'b', 'c'].map(id => assignment('2026-10-10', 'morning', true, id))
+test('weighted group imbalance never replaces a locked incompatible roster', () => {
+  const locked = [
+    ...['a', 'b', 'c', 'd'].map(id => assignment('2026-10-10', 'morning', true, id)),
+    ...['a', 'b', 'c', 'd'].map(id => assignment('2026-10-11', 'off', true, id)),
+  ]
   const value = weightState({ assignments: locked })
   const result = generateSchedule(value)
   assert.equal(result.success, false)
   assert.deepEqual(result.assignments, locked)
-  assert.ok(result.issues.some(issue => issue.type.startsWith('weekday-') && issue.severity === 'error'))
-  assert.ok(result.issues.filter(issue => issue.type.startsWith('weekday-')).every(issue => !!issue.date))
+  assert.ok(result.issues.some(issue => issue.type === 'weekday-balance'))
 })
 
-test('weighted shortages are hard errors even if an ordinary partial schedule could be produced', () => {
+test('weighted shortages preserve the original if the attempted quota itself cannot be satisfied', () => {
   const value = weightState({ employees: [flexibleEmployee('a')], assignments: [assignment('2026-10-01', 'off', true)] })
   const result = generateSchedule(value)
   assert.equal(result.success, false)
@@ -404,7 +403,7 @@ test('weighted shortages are hard errors even if an ordinary partial schedule co
   assert.ok(result.issues.some(issue => issue.type === 'weekday-quota'))
 })
 
-test('manual redistribution is checked against group and shift totals, not fixed day-by-shift demand', () => {
+test('manual redistribution is checked against actual group totals', () => {
   const value = weightState()
   const generated = generateSchedule(value)
   const assignments = generated.assignments.map(item => ({ ...item }))
@@ -433,9 +432,53 @@ test('invalid weekday rules return configuration errors and retain the original 
 })
 
 test('a partial week without selected weekdays has zero quota at a 100 percent selected share', () => {
-  const value = weightState({ month: '2026-11', rules: { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [6, 7], percent: 100 } } })
+  const value = weightState({ month: '2026-11', shifts: [{ ...morning, required: 0 }, night], rules: { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [6, 7], percent: 100 } } })
   const result = generateSchedule(value)
   assert.equal(result.success, true)
   assert.deepEqual(result.issues, [])
   assert.ok(!result.assignments.some(item => item.date === '2026-11-30')) // Monday alone has no redistributed weekend budget.
 })
+
+
+test('zero daily minimum permits additional assignments needed for positive employee minimums', () => {
+  const value = state({ employees: [employee('a', { minHoursPerMonth: 32 })], shifts: [{ ...morning, required: 0 }, night] })
+  const result = generateSchedule(value)
+  assert.equal(result.success, true)
+  assert.equal(result.assignments.length, 4)
+  assert.deepEqual(result.issues, [])
+})
+
+test('surplus manual or locked staff meet the daily minimum without overstaffing warnings', () => {
+  const value = state({ employees: ['a', 'b', 'c'].map(flexibleEmployee), assignments: ['a', 'b', 'c'].map(id => assignment('2026-10-01', 'morning', true, id)) })
+  const issues = validateSchedule(value)
+  assert.ok(!issues.some(issue => issue.type === 'overstaffed'))
+  assert.ok(!issues.some(issue => issue.type === 'coverage' && issue.date === '2026-10-01'))
+})
+
+for (const seed of [1010, 42, 12345]) {
+  test(`12-person three-shift roster meets daily coverage and 40-hour weekly minimums, seed ${seed}`, () => {
+    const late = { ...morning, id: 'late', name: '晚班', shortName: '晚', start: '14:00', end: '22:00' }
+    const value = state({
+      employees: Array.from({ length: 12 }, (_, index) => employee(`member-${index}`, {
+        minHoursPerMonth: 144,
+        minHoursPerWeek: 40,
+        maxHoursPerWeek: 56,
+        eligibleShiftIds: ['morning', 'late', 'night'],
+      })),
+      shifts: [{ ...morning, required: 1 }, late, { ...night, required: 1 }],
+      rules: { minRestHours: 11, maxConsecutiveDays: 5 },
+    })
+    const before = JSON.stringify(value)
+    const generated = generateSchedule(value, seed)
+    assert.equal(generated.success, true)
+    assert.deepEqual(generated.issues, [])
+    assert.deepEqual(validateSchedule({ ...value, assignments: generated.assignments }), [])
+    assert.equal(JSON.stringify(value), before)
+    assert.ok(generated.assignments.length > 31 * 3, 'extra staffing must be allowed beyond daily minimums')
+    for (const date of datesOfMonth(value.month)) for (const shift of value.shifts) {
+      const people = new Set(generated.assignments.filter(item => item.date === date && item.shiftId === shift.id).map(item => item.employeeId))
+      assert.ok(people.size >= shift.required, `${date} ${shift.id} needs at least ${shift.required} people`)
+    }
+    assert.equal(new Set(generated.assignments.map(item => `${item.employeeId}|${item.date}`)).size, generated.assignments.length)
+  })
+}
