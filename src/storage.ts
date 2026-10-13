@@ -1,6 +1,8 @@
 import { strToU8, zipSync } from 'fflate'
 import { dayInfo } from './payroll.ts'
 import type { DayKind, PlannerDocument, PayrollSettings } from './payroll'
+import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
+import { weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
 
 export const STORAGE_KEY = 'shift-planner:v1'
 const MAX_BYTES = 2 * 1024 * 1024
@@ -86,7 +88,11 @@ export function parseBackup(text: string): PlannerDocument {
     if (eligibleShiftIds.some(value => !shiftIds.has(value))) fail('员工引用了不存在的班次')
     const unavailableDates = list(e.unavailableDates, 3660, '请假日期').map(value => dateValue(value, '请假日期'))
     unique(unavailableDates, '请假日期')
-    return { id: id(e.id, '员工 ID'), name: string(e.name, 80, '姓名'), role: string(e.role, 80, '岗位', true), group: string(e.group, 80, '分组', true), color: color(e.color, '员工颜色'), maxHoursPerWeek: number(e.maxHoursPerWeek, 0, 168, '每周最多工时'), eligibleShiftIds, unavailableDates }
+    const minHoursPerMonth = e.minHoursPerMonth === undefined || e.minHoursPerMonth === null ? null : number(e.minHoursPerMonth, 0, 744, '每月最低工时')
+    const minHoursPerWeek = e.minHoursPerWeek === undefined ? 0 : number(e.minHoursPerWeek, 0, 168, '每周最低工时')
+    const maxHoursPerWeek = number(e.maxHoursPerWeek, 0, 168, '每周最高工时')
+    if (minHoursPerWeek > maxHoursPerWeek || hoursToMinutes(minHoursPerWeek, 'ceil') > hoursToMinutes(maxHoursPerWeek, 'floor')) fail('每周最低工时不能超过最高工时（按分钟核算）')
+    return { id: id(e.id, '员工 ID'), name: string(e.name, 80, '姓名'), role: string(e.role, 80, '岗位', true), group: string(e.group, 80, '分组', true), color: color(e.color, '员工颜色'), minHoursPerMonth, minHoursPerWeek, maxHoursPerWeek, eligibleShiftIds, unavailableDates }
   })
   unique(employees.map(e => e.id), '员工 ID')
   const employeeIds = new Set(employees.map(e => e.id))
@@ -104,7 +110,22 @@ export function parseBackup(text: string): PlannerDocument {
   const r = object(root.rules, '规则')
   const state: PlannerDocument = {
     version: 1, teamName: string(root.teamName, 100, '团队名称'), month: monthValue(root.month), employees, shifts, assignments,
-    rules: { minRestHours: number(r.minRestHours, 0, 48, '最短休息小时'), maxConsecutiveDays: number(r.maxConsecutiveDays, 1, 31, '最多连续工作天数', true), balanceWeekends: bool(r.balanceWeekends, '均衡周末') },
+    rules: { minRestHours: number(r.minRestHours, 0, 48, '最短休息小时'), maxConsecutiveDays: number(r.maxConsecutiveDays, 1, 31, '最多连续工作天数', true) },
+  }
+  // Preserve old backups without applying their retired weekend fairness objective.
+  if (r.balanceWeekends !== undefined) state.rules.balanceWeekends = bool(r.balanceWeekends, '旧版周末选项')
+  const weightsError = weekdayWeightRuleError(r.weekdayWeights)
+  if (weightsError) fail(weightsError)
+  if (r.weekdayWeights !== undefined) {
+    const weights = r.weekdayWeights as { days: number[]; percent: number }
+    state.rules.weekdayWeights = { days: [...weights.days], percent: weights.percent }
+  }
+  if (root.monthlyReferenceHours !== undefined) {
+    const raw = object(root.monthlyReferenceHours, '月参考工时')
+    if (Object.keys(raw).length > 1200) fail('月参考工时最多保存 1200 个月')
+    const references: Record<string, number> = Object.create(null)
+    for (const [month, hours] of Object.entries(raw)) references[monthValue(month)] = number(hours, 0, 744, '月参考工时')
+    state.monthlyReferenceHours = references
   }
   if (r.separationGroups !== undefined) {
     const groups = list(r.separationGroups, 200, '互斥组').map((entry, index) => {
@@ -176,16 +197,16 @@ function table(state: PlannerDocument): Cell[][] {
   const dates = Array.from({ length: daysInMonth(year!, month!) }, (_, i) => `${state.month}-${String(i + 1).padStart(2, '0')}`)
   const shifts = new Map(state.shifts.map(s => [s.id, s]))
   const assignments = new Map(state.assignments.map(a => [`${a.employeeId}:${a.date}`, a]))
+  const actualHours = monthlyHoursByEmployee(state)
   const headers = dates.map(date => `${date}（${dayInfo(date, state.calendar ?? {}).label}）`)
-  return [ ['姓名', '岗位', '分组', ...headers, '总工时'], ...state.employees.map(employee => {
-    let hours = 0
+  return [ ['姓名', '岗位', '分组', ...headers, '本月实际工时'], ...state.employees.map(employee => {
     const cells = dates.map(date => {
       const assignment = assignments.get(`${employee.id}:${date}`)
       const shift = assignment ? shifts.get(assignment.shiftId) : undefined
-      if (shift) { hours += duration(shift.start, shift.end); return shift.name }
+      if (shift) return shift.name
       return employee.unavailableDates.includes(date) ? '请假' : '休息'
     })
-    return [employee.name, employee.role, employee.group, ...cells, Math.round(hours * 100) / 100]
+    return [employee.name, employee.role, employee.group, ...cells, Math.round((actualHours.get(employee.id) ?? 0) * 100) / 100]
   }) ]
 }
 function csvCell(cell: Cell): string {
@@ -215,7 +236,12 @@ function sheet(rows: Cell[][]): string {
 /** A real Excel workbook; text is inlineStr, never a formula, including user-provided names. */
 export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Cell[][] } = {}): Uint8Array {
   const safe = parseBackup(JSON.stringify(state))
-  const rows: Cell[][][] = [table(safe), [['班次', '简称', '开始时间', '结束时间', '每日人数', '单班工时'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.required, duration(s.start, s.end)]), ['说明', '结束时间早于开始时间表示跨午夜班次；排班归属开始日期。']], options.payrollRows ?? [['津贴明细'], ['尚未提供津贴计算结果']]]
+  const rows: Cell[][][] = [table(safe), [['班次', '简称', '开始时间', '结束时间', safe.rules.weekdayWeights ? '基准每日人数' : '每日人数', '单班工时'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.required, duration(s.start, s.end)]), ['说明', '班次格子归属开始日期；本月工时按实际时段拆月，上月跨夜进入本月的部分计入，月底跨出部分不计。']], options.payrollRows ?? [['津贴明细'], ['尚未提供津贴计算结果']]]
+  if (safe.rules.weekdayWeights) {
+    const rule = safe.rules.weekdayWeights
+    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按团队完整周班次数计算，部分周保留原星期份额；各组内每日差不超过 1 班。`], ['自然周起始', '本月首日', '本月末日', '本段总班次', '选中星期配额', '其余星期配额', ...safe.shifts.map(s => s.name + '周配额')])
+    for (const week of weightedWeeks(safe)) rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, week.totalTarget, week.selectedTarget, week.otherTarget, ...safe.shifts.map(s => week.shiftTargets[s.id] ?? 0)])
+  }
   if (rows.some(items => items.length > 100000 || items.some(row => row.length > 256))) throw new Error('Excel 导出数据量超出限制')
   if (rows.some(items => items.some(row => row.some(cell => typeof cell === 'number' ? !Number.isFinite(cell) : typeof cell !== 'string' || cell.length > 32767)))) throw new Error('Excel 单元格必须为有效文本或有限数字')
   const names = ['排班表', '班次说明', '津贴明细']

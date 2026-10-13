@@ -25,9 +25,12 @@ export function makeDefaultState(month?: string): PlannerState {
       { id: 'evening', name: '晚班', shortName: '晚', start: '14:00', end: '22:00', color: '#e5def7', required: 2 },
       { id: 'night', name: '夜班', shortName: '夜', start: '22:00', end: '06:00', color: '#dce8fa', required: 1 },
     ],
-    rules: { minRestHours: 11, maxConsecutiveDays: 5, balanceWeekends: true },
+    rules: { minRestHours: 11, maxConsecutiveDays: 5 },
     assignments: [],
   }
   state.assignments = generateSchedule(state).assignments
+  // Retain the illustrative roster; new minimums may reveal genuine deficits.
+  // Do not silently change daily staffing demand just to make the sample feasible.
+  state.employees = state.employees.map(employee => ({ ...employee, minHoursPerMonth: null, minHoursPerWeek: 0 }))
   return state
 }

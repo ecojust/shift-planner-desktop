@@ -4,6 +4,9 @@ export interface Employee {
   role: string
   group: string
   color: string
+  /** null follows this month's team reference; missing is a legacy zero minimum. */
+  minHoursPerMonth?: number | null
+  minHoursPerWeek?: number
   maxHoursPerWeek: number
   eligibleShiftIds: string[]
   unavailableDates: string[]
@@ -22,7 +25,10 @@ export interface Shift {
 export interface Rules {
   minRestHours: number
   maxConsecutiveDays: number
-  balanceWeekends: boolean
+  /** Legacy backup key, ignored by the current scheduler. */
+  balanceWeekends?: boolean
+  /** Team-wide hard allocation; ISO weekdays: Monday=1, Sunday=7. */
+  weekdayWeights?: { days: number[]; percent: number }
   /** Each group permits at most one member per date / shift. Empty shiftIds means all shifts. */
   separationGroups?: { id: string; name: string; employeeIds: string[]; shiftIds: string[] }[]
 }
@@ -40,6 +46,8 @@ export interface PlannerState {
   teamName: string
   /** YYYY-MM */
   month: string
+  /** Manual reference hours by YYYY-MM. Missing months use calendar workdays × 8. */
+  monthlyReferenceHours?: Record<string, number>
   employees: Employee[]
   shifts: Shift[]
   rules: Rules

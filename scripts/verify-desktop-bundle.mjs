@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeDefaultState } from '../src/defaults.ts';
+import { monthlyHoursByEmployee, resolveHoursState } from '../src/hours.ts';
 import { validateSchedule } from '../src/scheduler.ts';
+import { weightedWeeks } from '../src/weekday-weights.ts';
 import { captureFrozen, parseFrozenInfo } from './frozen-process.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
 import { verifyMacSignature } from './verify-macos-signature.mjs';
@@ -17,6 +19,77 @@ const platforms = {
   'x86_64-apple-darwin': { id: 'macos-x64', os: 'darwin', nodeArch: 'x64', nativeArch: 'x86_64' },
   'aarch64-apple-darwin': { id: 'macos-arm64', os: 'darwin', nodeArch: 'arm64', nativeArch: 'arm64' },
 };
+
+export function makeBundleScheduleFixtures() {
+  const reference = makeDefaultState('2026-10');
+  reference.assignments = [];
+  const coverage = {
+    ...reference,
+    employees: reference.employees.map(employee => ({ ...employee, minHoursPerMonth: 0, minHoursPerWeek: 0 })),
+  };
+  const weighted = {
+    ...reference, teamName: 'Installed runtime hours and weekday-weight verification',
+    employees: reference.employees.slice(0, 2).map(employee => ({
+      ...employee, minHoursPerMonth: 120, minHoursPerWeek: 14, eligibleShiftIds: ['day'],
+    })),
+    shifts: [{ ...reference.shifts[0], id: 'day', required: 1 }],
+    rules: { minRestHours: 11, maxConsecutiveDays: 5, weekdayWeights: { days: [6, 7], percent: 40 } },
+  };
+  return { coverage: resolveHoursState(coverage), reference: resolveHoursState(reference), weighted: resolveHoursState(weighted) };
+}
+
+/** Every entry point runs these against its delivered solver, then independently
+ * checks returned rosters. The coverage fixture is not the default-hours demo. */
+export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
+  const fixtures = makeBundleScheduleFixtures();
+  async function solve(name) {
+    const state = fixtures[name], requestId = `${requestIdPrefix}-${name}`;
+    const request = { protocolVersion: 1, requestId, state, options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010 } };
+    const execution = await runSolver(request), result = JSON.parse(execution.stdout);
+    assert.equal(result.protocolVersion, 1);
+    assert.equal(result.requestId, requestId);
+    assert.equal(result.engine, 'ortools-cp-sat');
+    return { state, result, execution };
+  }
+  function feasible(check, count) {
+    assert.ok(['OPTIMAL', 'FEASIBLE'].includes(check.result.status), check.result.message);
+    assert.equal(check.result.assignments.length, count);
+    assert.equal(check.result.stats.shortageCount, 0);
+    const issues = validateSchedule({ ...check.state, assignments: check.result.assignments });
+    assert.deepEqual(issues, [], 'Actual app schedule must pass independent TypeScript rules');
+    return issues;
+  }
+  const coverage = await solve('coverage');
+  assert.equal(coverage.state.employees.length, 12);
+  assert.deepEqual(coverage.state.shifts.map(shift => shift.required), [2, 2, 1]);
+  const independentRuleIssues = feasible(coverage, 155);
+
+  const reference = await solve('reference');
+  assert.ok(reference.state.employees.every(employee => employee.minHoursPerMonth === 144));
+  assert.equal(reference.result.status, 'INFEASIBLE', 'Default reference minimums exceed the demo staffing capacity');
+  assert.equal(Object.hasOwn(reference.result, 'assignments'), false, 'An infeasible model must not supply a replacement roster');
+  assert.ok(reference.result.issues.some(issue => issue.type === 'monthly-min-hours'));
+
+  const weighted = await solve('weighted');
+  const weeks = weightedWeeks(weighted.state);
+  const weightedIssues = feasible(weighted, weeks.reduce((sum, week) => sum + week.totalTarget, 0));
+  const monthlyHours = Object.fromEntries(monthlyHoursByEmployee({ ...weighted.state, assignments: weighted.result.assignments }));
+  for (const employee of weighted.state.employees) assert.ok(monthlyHours[employee.id] >= employee.minHoursPerMonth);
+  const weeklyQuotas = weeks.map(week => {
+    const assignments = weighted.result.assignments.filter(item => week.dates.includes(item.date));
+    const selectedCount = assignments.filter(item => week.selectedDates.includes(item.date)).length;
+    assert.equal(assignments.length, week.totalTarget);
+    assert.equal(selectedCount, week.selectedTarget);
+    return { week: week.id, totalTarget: week.totalTarget, selectedTarget: week.selectedTarget, assignmentCount: assignments.length, selectedCount };
+  });
+  return { ...coverage, independentRuleIssues, constraintChecks: {
+    defaultReference: { status: reference.result.status, minimumHoursPerEmployee: 144, issueTypes: reference.result.issues.map(issue => issue.type), suppliedAssignments: false },
+    positiveMinimumsAndWeights: { status: weighted.result.status, month: weighted.state.month, employeeCount: weighted.state.employees.length,
+      minHoursPerMonth: 120, minHoursPerWeek: 14, weekdayWeights: weighted.state.rules.weekdayWeights,
+      assignmentCount: weighted.result.assignments.length, shortageCount: weighted.result.stats.shortageCount,
+      monthlyHours, weeklyQuotas, independentRuleIssues: weightedIssues, elapsedSeconds: weighted.execution.elapsedSeconds },
+  } };
+}
 
 /** Keep target selection explicit: a Linux run cannot stand in for a native test. */
 export function targetConfiguration(target, platformId) {
@@ -232,22 +305,10 @@ async function main() {
     const selfTestRun = await captureFrozen(executable, ['--self-test', '--hosted'], executionOptions);
     const selfTest = parseFrozenInfo(selfTestRun, true);
     assert.equal(selfTest.version, requiredVersion);
-    const state = makeDefaultState('2026-10');
-    state.assignments = [];
-    assert.equal(state.employees.length, 12);
-    assert.deepEqual(state.shifts.map(shift => shift.required), [2, 2, 1]);
     const requestId = `bundle-${configuration.id}-${process.env.GITHUB_RUN_ID || 'local'}`;
-    const request = { protocolVersion: 1, requestId, state, options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010 } };
-    const execution = await captureFrozen(executable, ['--hosted'], { ...executionOptions, input: JSON.stringify(request) });
-    const result = JSON.parse(execution.stdout);
-    assert.equal(result.protocolVersion, 1);
-    assert.equal(result.requestId, requestId);
-    assert.equal(result.engine, 'ortools-cp-sat');
-    assert.ok(['OPTIMAL', 'FEASIBLE'].includes(result.status), result.message);
-    assert.equal(result.assignments.length, 155);
-    assert.equal(result.stats.shortageCount, 0);
-    const independentRuleIssues = validateSchedule({ ...state, assignments: result.assignments });
-    assert.deepEqual(independentRuleIssues, []);
+    const { state, result, execution, independentRuleIssues, constraintChecks } = await verifyScheduleFixtures(
+      request => captureFrozen(executable, ['--hosted'], { ...executionOptions, input: JSON.stringify(request) }), requestId,
+    );
     const nativeReport = {
       target: configuration.target, platformId: configuration.id, os: process.platform, nodeArchitecture: process.arch,
       commit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null, buildVersion, generatedAt: new Date().toISOString(),
@@ -261,10 +322,11 @@ async function main() {
     };
     const monthReport = {
       buildCommit: process.env.GITHUB_SHA || null, buildRun: process.env.GITHUB_RUN_ID || null, buildVersion,
-      target: configuration.target, platformId: configuration.id, fixture: 'Built-in demo; no user data',
+      target: configuration.target, platformId: configuration.id, fixture: '12-person staffing fixture with zero hour minimums; no user data',
       month: state.month, employeeCount: state.employees.length, shiftsPerDay: [2, 2, 1], searchLimitSeconds: 5,
       status: result.status, assignmentCount: result.assignments.length, shortageCount: result.stats.shortageCount,
       independentRuleIssues, solverStats: result.stats, elapsedSeconds: execution.elapsedSeconds,
+      constraintChecks,
       stages: execution.stages, checkedAppRuntime: true,
     };
     writeJson(join(artifacts, `${configuration.id}-native-validation.json`), nativeReport);

@@ -78,7 +78,7 @@ export function checkDesktopResult(request: SolverRequest, result: SolverResult)
   const responseIssues = Array.isArray(result.issues) ? result.issues : []
   if (result.status !== 'OPTIMAL' && result.status !== 'FEASIBLE') {
     const messages: Record<string, string> = {
-      INFEASIBLE: '当前硬性规则无法同时满足，请检查锁定安排、人员资格与每日需求。原排班未改变。',
+      INFEASIBLE: '当前硬性规则无法同时满足，请检查月/周最低工时、周最高工时、锁定安排、人员资格、上班权重与班次需求。原排班未改变。',
       UNKNOWN: '在限定时间内尚未找到可行方案，这不代表无解。可以增加求解时间或调整规则；原排班未改变。',
       MODEL_INVALID: '排班配置或约束模型无效，原排班未改变。',
       ERROR: '本地求解失败，原排班未改变。',
