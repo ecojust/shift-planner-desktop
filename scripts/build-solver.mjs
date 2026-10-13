@@ -1,8 +1,9 @@
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import { capture, captureFrozen, parseFrozenInfo, main, projectRoot, pyinstallerVersion, pythonDetails, requireVenv, run, solverRoot, venvPython } from './solver-tools.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
 import { MAC_SIGNATURE_FORMAT, sealMacSolverRuntime } from './seal-macos-runtime.mjs';
+import { cleanupRuntimeStaging, replaceRuntimeDirectory } from './runtime-directory.mjs';
 
 main(async () => {
   requireVenv();
@@ -34,7 +35,7 @@ main(async () => {
   const destination = join(tauriRoot, 'solver-runtime');
   const stagingRoot = mkdtempSync(join(tauriRoot, 'solver-runtime-stage-'));
   const staging = join(stagingRoot, 'payload'), backup = join(stagingRoot, 'previous');
-  let movedPrevious = false;
+  let failure;
   try {
     cpSync(source, staging, { recursive: true, verbatimSymlinks: true });
     writeFileSync(join(staging, '.gitkeep'), '');
@@ -51,12 +52,7 @@ main(async () => {
     console.log(`实际求解自检通过（${check.elapsedSeconds} 秒）。`);
     if (JSON.stringify(sources) !== JSON.stringify(solverSources(projectRoot, solverRoot))) throw new Error('构建期间求解器源码发生变化，请重新运行构建；旧运行目录未替换。');
     const runtime = runtimeInventory(staging);
-    if (existsSync(destination)) { renameSync(destination, backup); movedPrevious = true; }
-    try { renameSync(staging, destination); }
-    catch (error) {
-      if (movedPrevious) { renameSync(backup, destination); movedPrevious = false; }
-      throw error;
-    }
+    await replaceRuntimeDirectory(staging, destination, backup);
     const manifest = {
       generatedAt: new Date().toISOString(), format: 'onedir', target: host,
       python: python.version.join('.'), pyinstaller: pyinstallerVersion, solverInfo, selfTest,
@@ -65,8 +61,12 @@ main(async () => {
     };
     writeFileSync(join(work, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
     console.log(`\n目录版求解器已就绪：${destination}\n${JSON.stringify(solverInfo)}\n资源：${runtime.fileCount} 个文件，SHA-256：${runtime.sha256}`);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    if (movedPrevious && !existsSync(destination) && existsSync(backup)) renameSync(backup, destination);
-    rmSync(stagingRoot, { recursive: true, force: true });
+    const cleanup = await cleanupRuntimeStaging(stagingRoot, backup, { failure });
+    if (cleanup.preserved) console.warn(`构建暂存目录已保留，可检查或恢复：${stagingRoot}`);
+    if (cleanup.cleanupError) console.warn(`暂存目录清理失败（原构建错误保持不变）：${cleanup.cleanupError.message}`);
   }
 });

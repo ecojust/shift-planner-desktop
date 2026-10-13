@@ -1162,13 +1162,15 @@ mod tests {
         let observed = phases.clone();
         let progress: ProgressSink =
             Some(Arc::new(move |phase| observed.lock().unwrap().push(phase)));
-        let script = format!("printf 'SHIFTFLOW_STAGE_V1:loading\\n' >&2; sleep 0.25; printf 'SHIFTFLOW_STAGE_V1:reading\\n' >&2; cat >/dev/null; printf 'SHIFTFLOW_STAGE_V1:solving\\n' >&2; sleep 0.03; printf '%s\\n' '{}'; printf 'SHIFTFLOW_STAGE_V1:finishing\\n' >&2", SCHEDULE_RESULT);
+        // Loading must outlast the solve budget, while the solve phase keeps
+        // enough scheduling headroom for shared CI runners.
+        let script = format!("printf 'SHIFTFLOW_STAGE_V1:loading\\n' >&2; sleep 1.25; printf 'SHIFTFLOW_STAGE_V1:reading\\n' >&2; cat >/dev/null; printf 'SHIFTFLOW_STAGE_V1:solving\\n' >&2; sleep 0.03; printf '%s\\n' '{}'; printf 'SHIFTFLOW_STAGE_V1:finishing\\n' >&2", SCHEDULE_RESULT);
         let began = std::time::Instant::now();
-        let output = staged_script(&script, 2000, 150, 500, false, progress)
+        let output = staged_script(&script, 5000, 1000, 2000, false, progress)
             .await
             .unwrap();
         assert_eq!(output["status"], "FEASIBLE");
-        assert!(began.elapsed() >= Duration::from_millis(250));
+        assert!(began.elapsed() >= Duration::from_millis(1250));
         assert_eq!(
             *phases.lock().unwrap(),
             vec![
