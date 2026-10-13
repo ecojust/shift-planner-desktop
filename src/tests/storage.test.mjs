@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { unzipSync, strFromU8 } from 'fflate'
 import { backupJSON, parseBackup, scheduleCSV, scheduleXLSX } from '../storage.ts'
+import { createPayrollConfig, calculatePayroll } from '../payroll.ts'
 
 function fixture() {
   return {
@@ -88,7 +89,7 @@ test('CSV includes all dates, true shift hours, leave and formula injection prot
   assert.match(csv, /"' =HYPERLINK\(""https:\/\/evil.invalid""\)"/)
   assert.match(csv, /"'\+1\+1"/)
   assert.match(csv, /"早班","晚班","请假","休息"/)
-  assert.ok(csv.endsWith(',"22"\r\n')) // Includes six hours of January's final night.
+  assert.ok(csv.endsWith(',"22","0"\r\n')) // Includes six hours of January's final night.
 })
 test('XLSX is a real three-sheet workbook and renders hostile names only as escaped text', () => {
   const state = fixture()
@@ -195,4 +196,67 @@ test('weekday weights survive backup, reject malformed rules, and export weekly 
     state.rules.weekdayWeights = bad
     assert.throws(() => parseBackup(JSON.stringify(state)), /备份格式错误/)
   }
+})
+
+test('fixed shift allowances roundtrip, with legacy zero defaults and ignored old multipliers', () => {
+  const state = { ...fixture(), ...createPayrollConfig() }
+  state.shifts[0].normalAllowance = 20.25
+  state.shifts[1].normalAllowance = 0
+  state.payroll.dateShiftMultipliers = { '2028-02-01': { early: 0, night: 3 }, '2028-03-01': { night: 1.5 } }
+  assert.deepEqual(JSON.parse(backupJSON(state)), state)
+  const old = fixture()
+  assert.equal(calculatePayroll(parseBackup(backupJSON(old))).totalAllowance, 0)
+  const restored = parseBackup(backupJSON(state))
+  assert.equal(calculatePayroll(restored, restored).totalAllowance, 20.25)
+  assert.equal(restored.payroll.dateShiftMultipliers['2028-02-01'].early, 0)
+})
+
+test('backup rejects invalid fixed money and retains exact two-decimal amounts', () => {
+  const data = { ...fixture(), ...createPayrollConfig() }
+  for (const amount of [-1, 1e8 + 0.01, 0.001, 1e-12, '50', null]) {
+    data.shifts[0].normalAllowance = amount
+    assert.throws(() => parseBackup(JSON.stringify(data)), /备份格式错误/)
+  }
+  data.shifts[0].normalAllowance = 0.29
+  assert.equal(parseBackup(backupJSON(data)).shifts[0].normalAllowance, 0.29)
+  data.payroll.dateShiftAllowances = { '2028-02-01': { early: 100 } }
+  const restored = parseBackup(backupJSON(data))
+  assert.equal(restored.payroll.dateShiftAllowances, undefined)
+  assert.equal(calculatePayroll(restored, restored).totalAllowance, 0.29)
+})
+
+test('prototype-like valid shift IDs retain their fixed allowance', () => {
+  const data = { ...fixture(), ...createPayrollConfig() }
+  data.shifts[0].id = '__proto__'
+  data.shifts[0].normalAllowance = 40.15
+  data.employees[0].eligibleShiftIds[0] = '__proto__'
+  data.assignments.find(a => a.shiftId === 'early').shiftId = '__proto__'
+  const restored = parseBackup(backupJSON(data))
+  assert.equal(restored.shifts[0].normalAllowance, 40.15)
+  assert.equal(calculatePayroll(restored, restored).totalAllowance, 40.15)
+})
+
+test('real Excel and CSV include fixed daily allowances and numeric monthly totals', () => {
+  const data = { ...fixture(), ...createPayrollConfig() }
+  data.shifts[0].normalAllowance = 20
+  data.shifts[1].normalAllowance = 50
+  data.payroll.monthlySalary = 17400 // Salary and old multipliers must not affect fixed allowances.
+  data.payroll.dateShiftMultipliers = { '2028-02-01': { early: 3, night: 2 } }
+  const calculated = calculatePayroll(data, data)
+  assert.equal(calculated.totalAllowance, 70)
+  const csv = scheduleCSV(data)
+  assert.ok(csv.includes('早班\n+¥20.00')) // Prior-month night carries six hours, without another allowance.
+  assert.ok(csv.includes('晚班\n+¥50.00'))
+  assert.ok(csv.endsWith(',"22","70"\r\n'))
+  const archive = unzipSync(scheduleXLSX(data))
+  const roster = strFromU8(archive['xl/worksheets/sheet1.xml'])
+  const explanation = strFromU8(archive['xl/worksheets/sheet2.xml'])
+  const detail = strFromU8(archive['xl/worksheets/sheet3.xml'])
+  assert.match(roster, /额外津贴（元）/)
+  assert.match(roster, /<c r="AH2" s="0"><v>70<\/v><\/c>/)
+  assert.match(explanation, /固定班次津贴（元\/人\/班）/)
+  assert.doesNotMatch(explanation, /手动倍率|加班日期/)
+  assert.match(detail, /每日明细/)
+  assert.match(detail, /<v>70<\/v>/)
+  assert.match(strFromU8(archive['xl/styles.xml']), /wrapText="1"/)
 })

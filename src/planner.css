@@ -78,7 +78,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-legend i { display: block; height: 7px; width: 7px; border-radius: 2px; border: 1px solid #00000008; }
 .sp-leave-dot { background: #f4e3d9; }
 .sp-table-scroll { overflow: auto; max-width: 100%; scrollbar-width: thin; scrollbar-color: #d5e3d8 #f9fbf9; }
-.sp-schedule-table { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; min-width: 860px; text-align: center; }
+.sp-schedule-table { border-collapse: separate; border-spacing: 0; table-layout: fixed; width: 100%; min-width: 1060px; text-align: center; }
 .sp-schedule-table .sp-person-col { width: 177px; padding: 12px 17px 12px 21px; text-align: left; position: sticky; left: 0; z-index: 3; background: #fff; border-right: 1px solid #edf0ed; }
 .sp-schedule-table .sp-hours-col { width: 94px; }
 .sp-schedule-table th, .sp-schedule-table td { border-bottom: 1px solid #edf1ed; }
@@ -119,7 +119,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-schedule-table tfoot small { color: #b1bcb2; font-size: 9px; font-weight: 400; }
 .sp-schedule-table tfoot .sp-hours-col { color: #7b9482; }
 .sp-month-table { width: max-content; min-width: 100%; }
-.sp-month-table th:not(.sp-person-col):not(.sp-hours-col), .sp-month-table td:not(.sp-hours-col) { min-width: 96px; width: 96px; }
+.sp-month-table th:not(.sp-person-col):not(.sp-hours-col):not(.sp-allowance-col), .sp-month-table td:not(.sp-hours-col):not(.sp-allowance-col) { min-width: 106px; width: 106px; }
 .sp-month-table .sp-person-col { min-width: 177px; }
 .sp-month-table .sp-hours-col { min-width: 94px; }
 .sp-calendar-bottom { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px 12px; padding: 10px 18px; color: #6b8072; font-size: 11px; }
@@ -139,8 +139,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-subheading h2 { font-size: 17px; font-weight: 600; }
 .sp-subheading p { font-size: 11px; color: #9aa79e; margin-top: 7px; }
 .sp-subheading input { padding: 7px; background: #f7faf8; color: #637e6c; border: 1px solid #e0e9e3; border-radius: 5px; }
-.sp-payroll-table { border-collapse: collapse; width: 100%; min-width: 650px; font-size: 12px; text-align: right; }
-.sp-payroll-table th, .sp-payroll-table td { padding: 15px 20px; border-bottom: 1px solid #edf1ee; }
+.sp-payroll-table { border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 12px; text-align: right; }
+.sp-payroll-table th, .sp-payroll-table td { padding: 15px 20px; border-bottom: 1px solid #edf1ee; overflow-wrap: anywhere; }
 .sp-payroll-table tr > :first-child { text-align: left; }
 .sp-payroll-table thead { background: #f8fbf9; color: #8a9e91; font-size: 10px; }
 .sp-payroll-table th { font-weight: 500; }
@@ -270,3 +270,22 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .sp-subheading { padding: 18px 14px; flex-wrap: wrap; }.sp-subheading p { font-size: 11px; }.sp-payroll-note { padding: 12px 14px; font-size: 11px; }.sp-issues small { display: none; }.sp-issues > button { align-items: flex-start; }
 }
 @media print { .sp-main { margin: 0; }.sp-content { padding: 0; }.sp-check-status { display: none; } }
+
+/* Amounts stay readable over every shift colour; the gold glow is static. */
+.sp-shift-cell > .sp-allowance-badge { display: inline-flex; width: auto; max-width: 100%; justify-content: center; margin-top: 5px; padding: 3px 5px; border: 1px solid #e4be61; border-radius: 5px; background: #fff3c4; color: #795008; font-size: 10px; font-weight: 700; line-height: 1.4; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; box-shadow: 0 0 8px #e8ba4a65, inset 0 0 5px #ffdfa655; text-shadow: 0 0 5px #edc85555; }
+.sp-schedule-table .sp-allowance-col { width: 134px; min-width: 134px; padding-inline: 10px; background: #fffdf6; border-left: 1px solid #eedfb9; color: #805a18; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.sp-schedule-table thead .sp-allowance-col { color: #7a5a21; background: #fbf5e6; font-size: 12px; }
+.sp-allowance-col > small, .sp-allowance-col > span { display: block; margin-top: 5px; color: #967846; font-size: 10px; line-height: 1.5; }
+.sp-allowance-col > strong { display: block; color: #8c6214; font-size: 13px; text-shadow: 0 0 7px #e8ba4a40; }
+.sp-allowance-footer td { color: #91671e; font-size: 11px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.sp-allowance-legend { display: flex; align-items: flex-start; gap: 7px; margin: 0; padding: 12px 18px; background: #fffdf6; border-bottom: 1px solid #f1e9d5; color: #8c794f; font-size: 11px; line-height: 1.75; }
+.sp-allowance-legend > span { color: #cda13d; text-shadow: 0 0 5px #edd078aa; }
+.sp-text-gold { color: #91671e; }
+.sp-shift-cell.is-off > .sp-allowance-badge { color: #795008; font-size: 10px; font-weight: 700; }
+.sp-calculation-error { padding: 14px 18px; border: 1px solid #e6c19d; border-radius: 9px; background: #fff6e9; color: #925e2a; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
+.sp-edit-allowance { margin-top: 14px; padding: 13px 16px; border: 1px solid #eedda9; border-radius: 9px; background: #fffaf0; color: #876729; line-height: 1.7; }
+.sp-edit-allowance strong { font-size: 12px; }
+.sp-edit-allowance p { margin: 6px 0; font-size: 12px; }
+.sp-edit-allowance small { color: #9b855b; font-size: 11px; }
+@media(min-width:900px) { .sp-schedule-table .sp-allowance-col { position: sticky; right: 0; z-index: 2; box-shadow: -3px 0 6px #a7935310; } }
+@media(max-width:720px) { .sp-allowance-legend { padding: 11px 13px; } .sp-payroll-table th, .sp-payroll-table td { padding: 13px 10px; } }

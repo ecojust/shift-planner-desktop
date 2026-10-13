@@ -20,6 +20,8 @@ export interface Shift {
   end: string
   color: string
   required: number
+  /** Fixed yuan per person per shift, paid once on the start date; missing means 0. */
+  normalAllowance?: number
 }
 
 export interface Rules {

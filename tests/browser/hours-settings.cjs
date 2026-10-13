@@ -102,7 +102,7 @@ async function main() {
     await navigate('排班日历')
     await page.getByRole('button', { name: '月视图', exact: true }).click()
     await page.getByRole('button', { name: '设置 2025-10-09 日期类型', exact: true }).click()
-    await page.getByRole('button', { name: /^休息日 未补休/ }).click()
+    await page.getByRole('button', { name: /^休息日 / }).click()
     await page.getByRole('button', { name: '确认日期类型', exact: true }).click()
     await navigate('成员管理')
     assert.equal((await page.locator('.sp-settings-reference-summary strong').textContent()).trim(), '136')

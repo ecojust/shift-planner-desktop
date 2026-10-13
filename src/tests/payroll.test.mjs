@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { dayInfo, calculatePayroll, createPayrollConfig, payrollRows } from '../payroll.ts'
+import { calculatePayroll, createPayrollConfig, payrollRows } from '../payroll.ts'
 
 function fixture(month = '2026-10') {
   return { version: 1, teamName: '测试', month,
@@ -8,93 +8,220 @@ function fixture(month = '2026-10') {
     shifts: [{ id: 'day', name: '日班', start: '08:00', end: '16:00' }, { id: 'night', name: '夜班', start: '22:00', end: '06:00' }, { id: 'long', name: '长班', start: '08:00', end: '18:00' }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5, balanceWeekends: true }, assignments: [] }
 }
-function add(state, date, shiftId = 'day') { state.assignments.push({employeeId: 'a', date, shiftId, locked: false}) }
-function config() { const value = createPayrollConfig(); value.payroll.monthlySalary = 17400; return value }
-test('2026 has thirteen statutory dates, holiday days and adjusted workdays are distinct', () => {
-  let total = 0
-  for (let day = Date.UTC(2026,0,1); day < Date.UTC(2027,0,1); day += 86400000) if (dayInfo(new Date(day).toISOString().slice(0,10)).kind === 'statutory') total++
-  assert.equal(total,13)
-  for (const date of ['2026-01-04','2026-02-14','2026-02-28','2026-05-09','2026-09-20','2026-10-10']) assert.equal(dayInfo(date).kind,'workday')
-  assert.equal(dayInfo('2026-02-16').kind,'statutory')
-  assert.equal(dayInfo('2026-02-20').kind,'restday')
-  assert.equal(dayInfo('2026-05-02').kind,'statutory')
-  assert.equal(dayInfo('2026-05-04').kind,'restday')
-  assert.equal(dayInfo('2026-04-06').kind,'restday')
+function add(state, date, shiftId = 'day', employeeId = 'a') { state.assignments.push({ employeeId, date, shiftId, locked: false }) }
+function normal(state, shiftId = 'night', amount = 50) { state.shifts.find(shift => shift.id === shiftId).normalAllowance = amount }
+
+// Fixed money per assigned shift is independent of salary, calendar and duration.
+test('a configured shift pays its fixed amount once without any wage or multiplier calculation', () => {
+  const state = fixture(); normal(state, 'day', 50); add(state, '2026-10-01')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].normalAllowance, 50)
+  assert.equal(result.rows[0].customAllowance, 0)
+  assert.equal(result.rows[0].statutoryAllowance, 0)
+  assert.equal(result.rows[0].restdayAllowance, 0)
+  assert.equal(result.rows[0].ordinaryAllowance, 0)
+  assert.equal(result.totalAllowance, 50)
+  assert.equal(result.dailyRows[0].totalAllowance, 50)
+  assert.equal(result.rows[0].totalHours, 8)
 })
-test('unconfigured years are clearly unverified and manual day types take precedence', () => {
-  assert.equal(dayInfo('2027-01-01').verified,false)
-  assert.match(dayInfo('2027-01-01').label,/待核对/)
-  assert.equal(dayInfo('2026-10-01',{'2026-10-01':'workday'}).kind,'workday')
-  assert.equal(dayInfo('2026-02-31').verified,false)
+
+test('short and long versions of a shift earn the same fixed allowance', () => {
+  const state = fixture(); normal(state, 'day'); normal(state, 'long'); add(state, '2026-10-09'); add(state, '2026-10-10', 'long')
+  state.shifts.find(shift => shift.id === 'day').end = '08:01'
+  const result = calculatePayroll(state)
+  assert.deepEqual(result.dailyRows.map(day => day.totalAllowance), [50, 50])
+  assert.equal(result.totalAllowance, 100)
+  assert.equal(result.rows[0].totalHours, 10.02)
 })
-test('statutory 3x is paid in full, restday 2x and working-day overtime 1.5x', () => {
-  const state = fixture(); add(state,'2026-10-01'); add(state,'2026-10-04'); add(state,'2026-10-10','long')
-  const result = calculatePayroll(state,config()), row = result.rows[0]
-  assert.equal(row.hourlyRate,100)
-  assert.equal(row.statutoryAllowance,2400)
-  assert.equal(row.restdayAllowance,1600)
-  assert.equal(row.ordinaryAllowance,300)
-  assert.equal(row.ordinaryOvertimeHours,2)
-  assert.equal(result.totalAllowance,4300)
+
+test('the same shift assigned to multiple employees pays each employee the fixed amount', () => {
+  const state = fixture(); normal(state, 'day', 40.15)
+  state.employees.push({ ...state.employees[0], id: 'b', name: '另一员工' })
+  add(state, '2026-10-01'); add(state, '2026-10-01', 'day', 'b')
+  const result = calculatePayroll(state)
+  assert.deepEqual(result.rows.map(row => row.totalAllowance), [40.15, 40.15])
+  assert.equal(result.totalAllowance, 80.3)
 })
-test('overnight shift splits at midnight and statutory/restday do not double-count', () => {
-  const state = fixture(); add(state,'2026-10-03','night')
-  const row = calculatePayroll(state,config()).rows[0]
-  assert.equal(row.statutoryHours,2); assert.equal(row.restdayHours,6)
-  assert.equal(row.statutoryAllowance,600); assert.equal(row.restdayAllowance,1200)
-  assert.equal(row.totalHours,8)
+
+test('historic salary, date multipliers including zero, compensation and calendar classification have no effect', () => {
+  const state = fixture(); normal(state, 'day'); normal(state, 'long'); add(state, '2026-10-01'); add(state, '2026-10-04'); add(state, '2026-10-10', 'long')
+  const cfg = createPayrollConfig(), before = calculatePayroll(state, cfg)
+  cfg.payroll.monthlySalary = 1000000; cfg.payroll.employeeSalaries.a = 17400
+  cfg.payroll.monthlyWorkdays = 0; cfg.payroll.hoursPerDay = 0
+  cfg.payroll.statutoryMultiplier = 10; cfg.payroll.restdayMultiplier = 9; cfg.payroll.ordinaryMultiplier = 8
+  cfg.payroll.restdayCompensated = true
+  cfg.payroll.dateShiftMultipliers = { '2026-10-01': { day: 3 }, '2026-10-04': { day: 0 }, '2026-10-10': { long: 0.1 } }
+  cfg.calendar = { '2026-10-01': 'workday', '2026-10-04': 'statutory' }
+  const after = calculatePayroll(state, cfg)
+  assert.deepEqual(after.rows, before.rows)
+  assert.deepEqual(after.dailyRows, before.dailyRows)
+  assert.equal(after.totalAllowance, 150)
 })
-test('natural-month accounting includes prior-month tail and excludes next-month tail', () => {
-  const state = fixture(); add(state,'2026-09-30','night'); add(state,'2026-10-31','night')
-  const row = calculatePayroll(state,config()).rows[0]
-  assert.equal(row.totalHours,8); assert.equal(row.statutoryHours,6); assert.equal(row.restdayHours,2)
+
+test('canceled date-fixed-allowance draft data is also ignored', () => {
+  const state = fixture(); normal(state, 'day'); add(state, '2026-10-01')
+  const cfg = createPayrollConfig()
+  cfg.payroll.dateShiftAllowances = { '2026-10-01': { day: 300 } }
+  assert.equal(calculatePayroll(state, cfg).totalAllowance, 50)
 })
-test('restday compensation removes only restday payment, employee salary overrides base', () => {
-  const state = fixture(); add(state,'2026-10-01'); add(state,'2026-10-04')
-  const cfg = config(); cfg.payroll.restdayCompensated = true; cfg.payroll.employeeSalaries.a = 8700
-  const row = calculatePayroll(state,cfg).rows[0]
-  assert.equal(row.hourlyRate,50); assert.equal(row.statutoryAllowance,1200); assert.equal(row.restdayAllowance,0)
-  assert.equal(row.restdayHours,8)
+
+test('overnight shifts pay only on their start date and show zero on the carried work day', () => {
+  const state = fixture(); normal(state); add(state, '2026-10-03', 'night')
+  const result = calculatePayroll(state)
+  assert.equal(result.totalAllowance, 50)
+  assert.deepEqual(result.dailyRows.map(row => [row.date, row.totalHours, row.totalAllowance]), [
+    ['2026-10-03', 2, 50], ['2026-10-04', 6, 0],
+  ])
+  assert.deepEqual(result.dailyRows[1].carriedShiftIds, ['night'])
+  assert.deepEqual(result.dailyRows[1].sources, [{ shiftId: 'night', assignmentDate: '2026-10-03', hours: 6 }])
 })
-test('duplicate overlaps cannot inflate allowances and result exports numeric rows', () => {
-  const state = fixture(); add(state,'2026-10-01'); add(state,'2026-10-01')
-  const result = calculatePayroll(state,config())
-  assert.equal(result.statutoryHours,8); assert.match(result.warnings.join(' '),/重叠/)
-  assert.equal(payrollRows(result)[1][9],2400)
+
+test('a month includes the whole allowance for each shift starting in it, without prorating or repeating night work', () => {
+  const state = fixture(); normal(state); add(state, '2026-09-30', 'night'); add(state, '2026-10-31', 'night')
+  const october = calculatePayroll(state)
+  assert.equal(october.rows[0].totalHours, 8)
+  assert.equal(october.totalAllowance, 50)
+  assert.deepEqual(october.dailyRows.map(row => [row.date, row.totalHours, row.totalAllowance]), [
+    ['2026-10-01', 6, 0], ['2026-10-31', 2, 50],
+  ])
+  state.month = '2026-11'
+  const november = calculatePayroll(state)
+  assert.equal(november.rows[0].totalHours, 6)
+  assert.equal(november.totalAllowance, 0)
+  state.month = '2026-09'
+  const september = calculatePayroll(state)
+  assert.equal(september.rows[0].totalHours, 2)
+  assert.equal(september.totalAllowance, 50)
 })
-test('working-day carried overnight hours and new shift are aggregated before overtime', () => {
-  const state = fixture(); add(state,'2026-10-08','night'); add(state,'2026-10-09','day')
-  const row = calculatePayroll(state,config()).rows[0]
-  assert.equal(row.totalHours,16); assert.equal(row.ordinaryOvertimeHours,6); assert.equal(row.ordinaryAllowance,900)
+
+test('carried work in an unknown-calendar year creates no allowance or holiday warning', () => {
+  const state = fixture('2027-01'); normal(state); add(state, '2026-12-31', 'night')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalHours, 6)
+  assert.equal(result.totalAllowance, 0)
+  assert.doesNotMatch(result.warnings.join(' '), /未覆盖|历史年份|待核对|法定/)
 })
-test('Spring Festival eve is paid at 3x but its ordinary holiday extension stays at 2x', () => {
-  const state = fixture('2026-02'); add(state, '2026-02-16'); add(state, '2026-02-20'); add(state, '2026-02-28', 'long')
-  const row = calculatePayroll(state, config()).rows[0]
-  assert.equal(row.statutoryHours, 8); assert.equal(row.statutoryAllowance, 2400)
-  assert.equal(row.restdayHours, 8); assert.equal(row.restdayAllowance, 1600)
-  assert.equal(row.ordinaryOvertimeHours, 2); assert.equal(row.ordinaryAllowance, 300)
+
+test('duplicate employee-date-shift records never multiply hours or fixed allowances', () => {
+  const state = fixture(); normal(state, 'day', 40.15); add(state, '2026-10-01'); add(state, '2026-10-01')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalHours, 8)
+  assert.equal(result.totalAllowance, 40.15)
+  assert.match(result.warnings.join(' '), /重复班次/)
 })
-test('previous-year overnight tail uses the new year calendar without repeating the December hours', () => {
-  const state = fixture('2026-01'); add(state, '2025-12-31', 'night')
-  const january = calculatePayroll(state, config())
-  assert.equal(january.rows[0].totalHours, 6)
-  assert.equal(january.rows[0].statutoryHours, 6)
-  assert.equal(january.totalAllowance, 1800)
-  state.month = '2025-12'
-  const december = calculatePayroll(state, config())
-  assert.equal(december.rows[0].totalHours, 2)
-  assert.equal(december.rows[0].statutoryHours, 0)
-  assert.equal(december.totalAllowance, 0)
-  assert.doesNotMatch(december.warnings.join(' '), /未覆盖|历史年份|待核对/)
+
+test('different assigned shifts receive separate fixed amounts even if their hours overlap entirely', () => {
+  const state = fixture(); normal(state, 'day', 50); normal(state, 'long', 30)
+  state.shifts.find(shift => shift.id === 'long').end = '16:00'
+  add(state, '2026-10-01', 'long'); add(state, '2026-10-01')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalHours, 8)
+  assert.equal(result.totalAllowance, 80)
+  assert.match(result.warnings.join(' '), /重叠班次/)
+  assert.match(result.warnings.join(' '), /固定津贴分别计算/)
+  state.assignments.reverse()
+  const reversed = calculatePayroll(state)
+  assert.deepEqual(reversed.dailyRows, result.dailyRows)
+  assert.deepEqual(reversed.rows, result.rows)
 })
-test('future dates stay provisional until manually confirmed, including year-crossing payroll', () => {
-  const state = fixture('2027-01'); add(state, '2026-12-31', 'night')
-  const cfg = config()
-  const preliminary = calculatePayroll(state, cfg)
-  assert.match(preliminary.warnings.join(' '), /未覆盖/)
-  assert.equal(preliminary.statutoryHours, 0)
-  cfg.calendar['2027-01-01'] = 'statutory'
-  const confirmed = calculatePayroll(state, cfg)
-  assert.equal(confirmed.statutoryHours, 6)
-  assert.equal(confirmed.totalAllowance, 1800)
+
+test('the next assigned shift earns its allowance even if all its hours overlap a preceding overnight shift', () => {
+  const state = fixture(); normal(state); normal(state, 'day', 20)
+  Object.assign(state.shifts.find(shift => shift.id === 'day'), { start: '04:00', end: '05:00' })
+  add(state, '2026-10-03', 'night'); add(state, '2026-10-04', 'day')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalHours, 8)
+  assert.equal(result.rows[0].normalAllowance, 70)
+  assert.equal(result.dailyRows[1].totalAllowance, 20)
+})
+
+test('an invalid time is warned and excluded from hours without changing the assigned fixed amount', () => {
+  const state = fixture(); normal(state, 'day', 50); add(state, '2026-10-01')
+  state.shifts.find(shift => shift.id === 'day').start = 'invalid'
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalHours, 0)
+  assert.equal(result.totalAllowance, 50)
+  assert.match(result.warnings.join(' '), /未计入工时；固定津贴仍按该排班记录计算/)
+})
+
+test('missing or zero normal allowance produces no implicit wage payment', () => {
+  const state = fixture(); add(state, '2026-10-01'); add(state, '2026-10-09', 'long'); normal(state, 'long', 0)
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].normalAllowance, 0)
+  assert.equal(result.totalAllowance, 0)
+  assert.equal(result.rows[0].totalHours, 18)
+  assert.ok(result.dailyRows.every(row => row.totalAllowance === 0))
+})
+
+test('fixed cents add exactly by day, employee and team, including binary-sensitive decimal values', () => {
+  const state = fixture(); normal(state, 'day', 40.15)
+  state.employees.push({ ...state.employees[0], id: 'b', name: '另一员工' })
+  for (let day = 1; day <= 31; day++) {
+    const date = `2026-10-${String(day).padStart(2, '0')}`
+    add(state, date); add(state, date, 'day', 'b')
+  }
+  const result = calculatePayroll(state)
+  assert.equal(result.dailyRows.length, 62)
+  assert.ok(result.dailyRows.every(day => day.totalAllowance === 40.15))
+  assert.ok(result.rows.every(row => row.totalAllowance === 1244.65))
+  assert.equal(result.totalAllowance, 2489.3)
+  assert.equal(payrollRows(result).find(row => row[0] === '合计')[2], 2489.3)
+  normal(state, 'day', 0.1)
+  assert.equal(calculatePayroll(state).totalAllowance, 6.2)
+})
+
+test('export uses fixed numeric allowance columns and includes start dates in daily sources', () => {
+  const state = fixture(); normal(state); add(state, '2026-10-03', 'night')
+  const exported = payrollRows(calculatePayroll(state))
+  assert.deepEqual(exported[0], ['员工', '本月工时', '额外津贴（固定元/人/班）'])
+  assert.equal(exported[1][2], 50)
+  const carried = exported.find(row => row[1] === '2026-10-04')
+  assert.equal(carried[3], 0)
+  assert.match(carried[4], /2026-10-03 night 6h/)
+  assert.doesNotMatch(exported[0].join(' '), /工资|倍率|节假/)
+})
+
+test('invalid fixed values are rejected including scientific sub-cent amounts and values above the limit', () => {
+  const state = fixture(); add(state, '2026-10-01')
+  for (const amount of [-1, NaN, Infinity, 100000000.01]) {
+    normal(state, 'day', amount)
+    assert.throws(() => calculatePayroll(state), /普通津贴必须在/)
+  }
+  for (const amount of [1.005, 40.155, 1e-7]) {
+    normal(state, 'day', amount)
+    assert.throws(() => calculatePayroll(state), /最多保留两位小数/)
+  }
+  normal(state, 'day', 1e8)
+  assert.equal(calculatePayroll(state).totalAllowance, 100000000)
+})
+
+test('off days, invalid dates and deleted shifts have no hours or allowance', () => {
+  const state = fixture(); normal(state, 'day'); add(state, '2026-10-01', 'off'); add(state, '2026-10-02', 'deleted'); add(state, '2026-02-31')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalHours, 0)
+  assert.equal(result.totalAllowance, 0)
+  assert.deepEqual(result.dailyRows, [])
+})
+
+test('employee IDs resembling inherited object keys are normal recipients of fixed allowances', () => {
+  const state = fixture(); normal(state, 'day'); state.employees[0].id = 'constructor'; add(state, '2026-10-01', 'day', 'constructor')
+  const result = calculatePayroll(state)
+  assert.equal(result.rows[0].totalAllowance, 50)
+})
+
+test('calculation does not mutate inputs and canceled configuration remains irrelevant', () => {
+  const state = fixture(); normal(state, 'day'); add(state, '2026-10-04')
+  const cfg = createPayrollConfig(); cfg.payroll.dateShiftMultipliers = { '2026-10-04': { day: 3 } }
+  const original = JSON.stringify({ state, cfg })
+  assert.equal(calculatePayroll(state, cfg).totalAllowance, 50)
+  assert.equal(JSON.stringify({ state, cfg }), original)
+})
+
+test('early-year month boundaries do not report later-month conflicts or allowances', () => {
+  const state = fixture('0099-10'); normal(state, 'day')
+  add(state, '0099-11-01'); add(state, '0099-11-01')
+  const result = calculatePayroll(state)
+  assert.equal(result.totalAllowance, 0)
+  assert.deepEqual(result.dailyRows, [])
+  assert.doesNotMatch(result.warnings.join(' '), /重复班次/)
 })
