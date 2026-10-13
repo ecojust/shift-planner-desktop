@@ -3,7 +3,8 @@ import { computed, reactive, ref, watch } from 'vue'
 import type { Employee, PlannerState, Rules, Shift } from './domain.ts'
 import type { PayrollSettings } from './payroll.ts'
 import type { DayKind } from './calendar.ts'
-import { hoursToMinutes, minimumMonthHours, monthlyHoursReference } from './hours.ts'
+import LeaveCalendarDialog from './LeaveCalendarDialog.vue'
+import { hoursToMinutes, monthlyHoursReference } from './hours.ts'
 import { weightedDayRange, weightedWeeks, weekdayWeightCapacity, weekdayWeightRuleError } from './weekday-weights.ts'
 import type { WeightedWeek } from './weekday-weights.ts'
 
@@ -17,16 +18,74 @@ const editor = ref<'employee' | 'shift' | 'separation' | null>(null)
 const allowanceShiftId = ref('')
 const allowanceDraft = ref<number | string>(0)
 const pendingDelete = ref<{ type: 'employee' | 'shift' | 'separation'; id: string; name: string } | null>(null)
-const leaveStart = ref('')
-const leaveEnd = ref('')
+const leaveEmployeeId = ref('')
+const leaveEmployee = computed(() => props.state.employees.find(employee => employee.id === leaveEmployeeId.value))
 const employeeDraft = reactive<Employee>({ id: '', name: '', role: '', group: '', color: '#d7e8f8', minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: [], unavailableDates: [] })
-const followMonthlyReference = ref(true)
-const employeeMonthHours = ref<number | string>(0)
 const monthReference = computed(() => monthlyHoursReference(props.state))
 const referenceDraft = ref<number | string>(monthReference.value.hours)
 watch([() => props.state.month, () => monthReference.value.hours, () => monthReference.value.custom], () => {
   referenceDraft.value = monthReference.value.hours
 })
+type HoursDraft = { followReference: boolean; month: number | string; weekMin: number | string; weekMax: number | string; eligibleShiftIds: string[]; source: string; error: string }
+const hoursDrafts = reactive<Record<string, HoursDraft>>(Object.create(null))
+function hoursSource(employee: Employee) { return JSON.stringify([employee.minHoursPerMonth ?? null, employee.minHoursPerWeek ?? 0, employee.maxHoursPerWeek, [...employee.eligibleShiftIds].sort()]) }
+function resetEmployeeHours(employee: Employee) {
+  hoursDrafts[employee.id] = { followReference: employee.minHoursPerMonth == null, month: employee.minHoursPerMonth ?? monthReference.value.hours, weekMin: employee.minHoursPerWeek ?? 0, weekMax: employee.maxHoursPerWeek, eligibleShiftIds: [...employee.eligibleShiftIds], source: hoursSource(employee), error: '' }
+}
+watch(() => props.state.employees.map(employee => [employee.id, hoursSource(employee)]), () => {
+  const employeeIds = new Set(props.state.employees.map(employee => employee.id))
+  for (const id of Object.keys(hoursDrafts)) if (!employeeIds.has(id)) delete hoursDrafts[id]
+  for (const employee of props.state.employees) {
+    if (!Object.hasOwn(hoursDrafts, employee.id) || hoursDrafts[employee.id]!.source !== hoursSource(employee)) resetEmployeeHours(employee)
+  }
+}, { immediate: true, flush: 'sync' })
+watch(() => props.state, () => {
+  // Importing a different document must not carry pending edits across, even
+  // when its member IDs and saved hour values happen to match the old one.
+  for (const id of Object.keys(hoursDrafts)) delete hoursDrafts[id]
+  for (const employee of props.state.employees) resetEmployeeHours(employee)
+}, { flush: 'sync' })
+function equalHours(value: number | string, reference: number) { return String(value).trim() !== '' && Number.isFinite(Number(value)) && Number(value) === reference }
+function hoursDirty(employee: Employee) {
+  const draft = hoursDrafts[employee.id]!
+  return draft.followReference !== (employee.minHoursPerMonth == null) || (!draft.followReference && !equalHours(draft.month, employee.minHoursPerMonth ?? monthReference.value.hours)) || !equalHours(draft.weekMin, employee.minHoursPerWeek ?? 0) || !equalHours(draft.weekMax, employee.maxHoursPerWeek) || JSON.stringify([...draft.eligibleShiftIds].sort()) !== JSON.stringify([...employee.eligibleShiftIds].sort())
+}
+function toggleEmployeeShift(employee: Employee, shiftId: string) {
+  const draft = hoursDrafts[employee.id]!
+  draft.eligibleShiftIds = draft.eligibleShiftIds.includes(shiftId) ? draft.eligibleShiftIds.filter(id => id !== shiftId) : [...draft.eligibleShiftIds, shiftId]
+  draft.error = ''
+}
+function setHoursFollow(employee: Employee, event: Event) {
+  const draft = hoursDrafts[employee.id]!, checked = (event.target as HTMLInputElement).checked
+  if (draft.followReference && !checked) draft.month = monthReference.value.hours
+  draft.followReference = checked; draft.error = ''
+}
+function saveEmployeeHours(employee: Employee) {
+  const draft = hoursDrafts[employee.id]!
+  const fields: [number | string, number, string][] = [[draft.weekMin, 168, '每周最低工时'], [draft.weekMax, 168, '每周最高工时']]
+  if (!draft.followReference) fields.unshift([draft.month, 744, '每月最低工时'])
+  for (const [value, max, label] of fields) {
+    if (String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > max) { draft.error = `${label}需要填写 0–${max} 小时之间的有效数值。`; return }
+  }
+  const minimum = Number(draft.weekMin), maximum = Number(draft.weekMax)
+  if (minimum > maximum || hoursToMinutes(minimum, 'ceil') > hoursToMinutes(maximum, 'floor')) { draft.error = '每周最低工时不能高于最高工时；精确到分钟时，最低向上取整、最高向下取整。'; return }
+  // Replace only hours on the latest employee; profile and leave edits remain intact.
+  const current = props.state.employees.find(item => item.id === employee.id)
+  if (!current) { draft.error = '该成员已不存在，请刷新人员列表。'; return }
+  const updated: Employee = { ...current, minHoursPerMonth: draft.followReference ? null : Number(draft.month), minHoursPerWeek: minimum, maxHoursPerWeek: maximum, eligibleShiftIds: [...new Set(draft.eligibleShiftIds)].filter(id => props.state.shifts.some(shift => shift.id === id)) }
+  props.state.employees.splice(props.state.employees.indexOf(current), 1, updated)
+  resetEmployeeHours(updated)
+  notice(`${updated.name}的工时与可上班次已保存，已有排班会重新检查冲突。`)
+}
+function openLeave(employee: Employee) { leaveEmployeeId.value = employee.id; error.value = ''; feedback.value = '' }
+function saveLeave(dates: string[]) {
+  const employee = leaveEmployee.value
+  if (!employee) { leaveEmployeeId.value = ''; return }
+  if (dates.length > limits.leaveDates || dates.some(date => !validDate(date))) { error.value = `请假日期需为有效日期，最多 ${limits.leaveDates} 天。`; return }
+  employee.unavailableDates = [...new Set(dates)].sort()
+  leaveEmployeeId.value = ''
+  notice(`${employee.name}的请假已保存；已有排班（含锁定安排）保持不变，请检查请假冲突。`)
+}
 const shiftDraft = reactive<Shift>({ id: '', name: '', shortName: '', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, normalAllowance: 0 })
 const rulesDraft = reactive<Rules>({ ...props.state.rules })
 const weekdayOptions = [
@@ -73,7 +132,7 @@ const shiftDuration = computed(() => {
   return Number((minutes / 60).toFixed(2))
 })
 watch([() => props.section, () => props.state, () => props.payroll], () => {
-  editor.value = null; allowanceShiftId.value = ''; pendingDelete.value = null; feedback.value = ''; error.value = ''
+  editor.value = null; allowanceShiftId.value = ''; leaveEmployeeId.value = ''; pendingDelete.value = null; feedback.value = ''; error.value = ''
   resetRules()
 })
 function notice(message: string) { feedback.value = message; error.value = ''; emit('change') }
@@ -117,34 +176,21 @@ function resetReferenceHours() {
 function openEmployee(employee?: Employee) {
   if (!employee && props.state.employees.length >= limits.employees) { error.value = `最多支持 ${limits.employees} 位员工，请先删除不再使用的人员。`; return }
   Object.assign(employeeDraft, employee ? { ...employee, minHoursPerMonth: employee.minHoursPerMonth ?? null, minHoursPerWeek: employee.minHoursPerWeek ?? 0, eligibleShiftIds: [...employee.eligibleShiftIds], unavailableDates: [...employee.unavailableDates] } : { id: '', name: '', role: '', group: '', color: '#d7e8f8', minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: props.state.shifts.map(shift => shift.id), unavailableDates: [] })
-  followMonthlyReference.value = employeeDraft.minHoursPerMonth == null
-  employeeMonthHours.value = employeeDraft.minHoursPerMonth ?? monthReference.value.hours
-  leaveStart.value = `${props.state.month}-01`; leaveEnd.value = `${props.state.month}-01`
   editor.value = 'employee'; error.value = ''; feedback.value = ''; pendingDelete.value = null
-}
-function addLeave() {
-  const start = Date.parse(`${leaveStart.value}T00:00:00Z`), end = Date.parse(`${leaveEnd.value}T00:00:00Z`)
-  if (!validDate(leaveStart.value) || !validDate(leaveEnd.value) || end < start) { error.value = '请选择有效的请假起止日期，年份为 0001–9999，结束日不能早于开始日。'; return }
-  if ((end - start) / 86400000 >= limits.leaveDates) { error.value = `每位员工最多设置 ${limits.leaveDates} 天请假，请缩短区间。`; return }
-  const dates = new Set(employeeDraft.unavailableDates)
-  for (let day = start; day <= end; day += 86400000) dates.add(new Date(day).toISOString().slice(0, 10))
-  if (dates.size > limits.leaveDates) { error.value = `每位员工累计最多设置 ${limits.leaveDates} 天请假，请先移除不再需要的日期。`; return }
-  employeeDraft.unavailableDates = [...dates].sort(); error.value = ''
 }
 function saveEmployee() {
   if (!employeeDraft.id && props.state.employees.length >= limits.employees) { error.value = `最多支持 ${limits.employees} 位员工。`; return }
   if (!validText(employeeDraft.name, limits.employeeText, '员工姓名') || !validText(employeeDraft.role, limits.employeeText, '岗位', true) || !validText(employeeDraft.group, limits.employeeText, '分组', true)) return
-  if (employeeDraft.unavailableDates.length > limits.leaveDates || employeeDraft.unavailableDates.some(date => !validDate(date))) { error.value = `请假日期需为有效日期，且最多 ${limits.leaveDates} 天。`; return }
   if (props.state.employees.some(employee => employee.id !== employeeDraft.id && employee.name === employeeDraft.name.trim())) { error.value = '已有同名员工，请在姓名后增加标识以便区分。'; return }
-  if (!followMonthlyReference.value && !validHours(employeeMonthHours.value, 744, '每月最低工时')) return
-  if (!validHours(employeeDraft.minHoursPerWeek, 168, '每周最低工时') || !validHours(employeeDraft.maxHoursPerWeek, 168, '每周最高工时')) return
-  const minimumWeekHours = Number(employeeDraft.minHoursPerWeek), maximumWeekHours = Number(employeeDraft.maxHoursPerWeek)
-  if (minimumWeekHours > maximumWeekHours || hoursToMinutes(minimumWeekHours, 'ceil') > hoursToMinutes(maximumWeekHours, 'floor')) { error.value = '每周最低工时不能高于每周最高工时；排班精确到分钟，最低向上、最高向下取整。'; return }
-  const employee: Employee = { ...employeeDraft, id: employeeDraft.id || `employee-${crypto.randomUUID()}`, name: employeeDraft.name.trim(), role: employeeDraft.role.trim(), group: employeeDraft.group.trim(), minHoursPerMonth: followMonthlyReference.value ? null : Number(employeeMonthHours.value), minHoursPerWeek: Number(employeeDraft.minHoursPerWeek), maxHoursPerWeek: Number(employeeDraft.maxHoursPerWeek), eligibleShiftIds: [...employeeDraft.eligibleShiftIds], unavailableDates: [...employeeDraft.unavailableDates] }
-  const existing = props.state.employees.findIndex(item => item.id === employee.id)
+  const existing = props.state.employees.findIndex(item => item.id === employeeDraft.id)
+  if (employeeDraft.id && existing < 0) { error.value = '该成员已不存在，请关闭编辑后重新添加。'; return }
+  // Basic-profile forms deliberately merge the latest hours, eligibility and leave. Saving
+  // an older open profile must never undo card edits or a leave-dialog save.
+  const current = existing >= 0 ? props.state.employees[existing]! : { id: `employee-${crypto.randomUUID()}`, minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 40, unavailableDates: [], eligibleShiftIds: props.state.shifts.map(shift => shift.id) }
+  const employee: Employee = { ...current, name: employeeDraft.name.trim(), role: employeeDraft.role.trim(), group: employeeDraft.group.trim(), color: employeeDraft.color, eligibleShiftIds: [...current.eligibleShiftIds], unavailableDates: [...current.unavailableDates] }
   if (existing >= 0) props.state.employees.splice(existing, 1, employee)
   else props.state.employees.push(employee)
-  editor.value = null; notice('人员设置已保存。请回到排班日历检查冲突，或重新生成排班。')
+  editor.value = null; notice(existing >= 0 ? '成员基本资料已保存，工时、可上班次与请假日期保持不变。' : '成员已添加。可直接在成员卡片设置工时、可上班次，并打开日历设置请假。')
 }
 function openShift(shift?: Shift) {
   if (!shift && props.state.shifts.length >= limits.shifts) { error.value = `最多支持 ${limits.shifts} 个班次，请先删除不再使用的班次。`; return }
@@ -293,26 +339,28 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
           <label class="sp-settings-field">员工姓名<input v-model="employeeDraft.name" :maxlength="limits.employeeText" required placeholder="例如：陈晨" /></label>
           <label class="sp-settings-field">岗位<input v-model="employeeDraft.role" :maxlength="limits.employeeText" placeholder="例如：值班主管" /></label>
           <label class="sp-settings-field">所属分组<input v-model="employeeDraft.group" :maxlength="limits.employeeText" placeholder="例如：一组" /></label>
-          <div class="sp-settings-field sp-settings-month-minimum">
-            <span>每月最低工时</span>
-            <label class="sp-settings-checkbox"><input v-model="followMonthlyReference" type="checkbox" aria-label="月最低工时跟随月参考值" /><span>跟随月参考值 · {{ monthReference.hours }} 小时</span></label>
-            <span v-if="!followMonthlyReference" class="sp-settings-input-unit"><input id="sp-employee-month-hours" v-model.number="employeeMonthHours" type="number" min="0" max="744" step="any" required aria-label="个人每月最低工时" /><span>小时</span></span>
-            <p v-else class="sp-settings-hint">随排班月份与参考值自动更新。</p>
-          </div>
-          <label class="sp-settings-field">每周最低工时<span class="sp-settings-input-unit"><input v-model.number="employeeDraft.minHoursPerWeek" type="number" min="0" max="168" step="any" required aria-label="每周最低工时" /><span>小时</span></span></label>
-          <label class="sp-settings-field">每周最高工时<span class="sp-settings-input-unit"><input v-model.number="employeeDraft.maxHoursPerWeek" type="number" min="0" max="168" step="any" required aria-label="每周最高工时" /><span>小时</span></span></label>
         </div>
-        <p class="sp-settings-soft-note">周工时按周一至周日计算。月初、月末不足一周时，周最低按当月所占天数 ÷ 7 折算；周最高仍计入已知的跨月排班。月最低和周最低均按实际落在本月的工作时段计算，包括上月跨夜进入本月的工时。排班精确到分钟，最低向上、最高向下取整；最低设为 0 时不限制。</p>
-        <fieldset class="sp-settings-fieldset"><legend>可上班次</legend><div class="sp-settings-choice-row"><label v-for="shift in state.shifts" :key="shift.id" class="sp-settings-checkbox"><input v-model="employeeDraft.eligibleShiftIds" type="checkbox" :value="shift.id"/><span class="sp-settings-dot" :style="{ background: shift.color }"/>{{ shift.name }} <small>{{ shift.start }}–{{ shift.end }}</small></label></div><p class="sp-settings-hint">不勾选任何班次时，该员工不会被自动排班。</p></fieldset>
-        <fieldset class="sp-settings-fieldset"><legend>请假 / 不可排班日期</legend><div class="sp-settings-leave-row"><label class="sp-settings-field">开始日期<input v-model="leaveStart" type="date" min="0001-01-01" max="9999-12-31" /></label><label class="sp-settings-field">结束日期<input v-model="leaveEnd" type="date" min="0001-01-01" max="9999-12-31" /></label><button type="button" class="sp-settings-button" @click="addLeave">添加区间</button></div><div v-if="employeeDraft.unavailableDates.length" class="sp-settings-leave-dates"><button v-for="date in employeeDraft.unavailableDates" :key="date" type="button" :aria-label="`取消 ${date} 请假`" @click="employeeDraft.unavailableDates = employeeDraft.unavailableDates.filter(item => item !== date)">{{ date }} <span>×</span></button></div><div class="sp-settings-leave-summary"><small>{{ employeeDraft.unavailableDates.length ? `已设置 ${employeeDraft.unavailableDates.length} / ${limits.leaveDates} 天，点击日期可移除` : '暂无请假安排' }}</small><button v-if="employeeDraft.unavailableDates.length" type="button" class="sp-settings-link" @click="employeeDraft.unavailableDates = []">清除全部</button></div></fieldset>
+        <p class="sp-settings-soft-note">{{ employeeDraft.id ? '这里修改基本资料。工时和可上班次直接在成员卡片设置，请假日期通过卡片上的日历按钮设置。' : '新成员默认跟随月参考工时、每周最低 0 小时 / 最高 40 小时，默认可上全部班次。保存后可在成员卡片直接调整，并设置请假。' }}</p>
         <div class="sp-settings-form-footer"><p>保存后检查已有排班，锁定安排不会自动删除。</p><div class="sp-settings-actions"><button type="button" class="sp-settings-button" @click="editor = null">取消</button><button type="submit" class="sp-settings-button sp-settings-primary">保存人员</button></div></div>
       </form>
+      <p class="sp-settings-inline-guide">直接调整卡片里的工时或可上班次，点击「保存设置」生效。周工时按周一至周日计算；月初、月末周最低按当月所占天数折算，周最高计入已知跨月排班。最低工时设为 0 时不限制。</p>
       <div class="sp-settings-employee-grid">
         <article v-for="employee in displayedEmployees" :key="employee.id" class="sp-settings-employee-card">
           <div class="sp-settings-person"><span class="sp-settings-avatar" :style="{ background: employee.color }">{{ employee.name.slice(-2) }}</span><div><h3>{{ employee.name }}</h3><p>{{ employee.role || '未设岗位' }}<span v-if="employee.group"> · {{ employee.group }}</span></p></div><button class="sp-settings-edit" :aria-label="`编辑${employee.name}`" @click="openEmployee(employee)">编辑</button></div>
-          <div class="sp-settings-badges"><span v-for="shift in state.shifts.filter(item => employee.eligibleShiftIds.includes(item.id))" :key="shift.id" :style="{ background: shift.color }">{{ shift.name }}</span><span v-if="!employee.eligibleShiftIds.length">暂不排班</span></div>
-          <dl class="sp-settings-employee-hours"><div><dt>每月最低</dt><dd>{{ minimumMonthHours(state, employee) }} 小时 <small>{{ employee.minHoursPerMonth == null ? '跟随参考' : '自定义' }}</small></dd></div><div><dt>每周工时</dt><dd>{{ employee.minHoursPerWeek ?? 0 }}–{{ employee.maxHoursPerWeek }} 小时</dd></div></dl>
-          <div class="sp-settings-card-bottom"><span>{{ employee.unavailableDates.length ? `请假 ${employee.unavailableDates.length} 天` : '未设置请假' }}</span><button class="sp-settings-remove" :aria-label="`删除${employee.name}`" @click="requestDelete('employee', employee.id, employee.name)">删除</button></div>
+          <form class="sp-settings-inline-hours" :aria-label="`${employee.name}工时与班次设置`" novalidate @submit.prevent="saveEmployeeHours(employee)">
+            <fieldset class="sp-settings-inline-shifts"><legend>可上班次</legend><div class="sp-settings-inline-shift-options"><button v-for="shift in state.shifts" :key="shift.id" type="button" :class="{ selected: hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id) }" :style="{ '--shift-color': shift.color }" :aria-label="`${employee.name}可上${shift.name}`" :aria-pressed="hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id)" @click="toggleEmployeeShift(employee, shift.id)"><span aria-hidden="true">{{ hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id) ? '✓' : '＋' }}</span>{{ shift.name }}</button></div><p v-if="!hoursDrafts[employee.id]!.eligibleShiftIds.length" class="sp-settings-inline-hint">未选择班次，保存后不参与自动排班。</p></fieldset>
+            <div class="sp-settings-inline-month">
+              <label class="sp-settings-checkbox sp-settings-inline-reference"><input :checked="hoursDrafts[employee.id]!.followReference" type="checkbox" :aria-label="`${employee.name}月最低工时跟随月参考值`" @change="setHoursFollow(employee, $event)" /><span>月最低跟随参考值</span></label>
+              <label class="sp-settings-field">每月最低工时<span class="sp-settings-input-unit"><input :value="hoursDrafts[employee.id]!.followReference ? monthReference.hours : hoursDrafts[employee.id]!.month" type="number" min="0" max="744" step="any" :disabled="hoursDrafts[employee.id]!.followReference" :aria-label="`${employee.name}每月最低工时`" @input="hoursDrafts[employee.id]!.month = ($event.target as HTMLInputElement).value; hoursDrafts[employee.id]!.error = ''" /><span>小时</span></span></label>
+            </div>
+            <div class="sp-settings-inline-week">
+              <label class="sp-settings-field">每周最低工时<span class="sp-settings-input-unit"><input v-model="hoursDrafts[employee.id]!.weekMin" type="number" min="0" max="168" step="any" :aria-label="`${employee.name}每周最低工时`" @input="hoursDrafts[employee.id]!.error = ''" /><span>小时</span></span></label>
+              <label class="sp-settings-field">每周最高工时<span class="sp-settings-input-unit"><input v-model="hoursDrafts[employee.id]!.weekMax" type="number" min="0" max="168" step="any" :aria-label="`${employee.name}每周最高工时`" @input="hoursDrafts[employee.id]!.error = ''" /><span>小时</span></span></label>
+            </div>
+            <p v-if="hoursDrafts[employee.id]!.error" class="sp-settings-inline-error" role="alert">{{ hoursDrafts[employee.id]!.error }}</p>
+            <div v-if="hoursDirty(employee)" class="sp-settings-inline-actions"><span>有未保存修改</span><div><button type="button" class="sp-settings-button" :aria-label="`取消${employee.name}设置修改`" @click="resetEmployeeHours(employee)">取消</button><button type="submit" class="sp-settings-button sp-settings-primary" :aria-label="`保存${employee.name}设置`">保存设置</button></div></div>
+          </form>
+          <div class="sp-settings-card-bottom sp-settings-member-bottom"><button type="button" class="sp-settings-leave-trigger" :aria-label="`设置${employee.name}请假`" @click="openLeave(employee)"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="16" rx="3"/><path d="M8 3v5m8-5v5M4 11h16m-12 4h2m4 0h2"/></svg><span>{{ employee.unavailableDates.length ? `请假 ${employee.unavailableDates.length} 天` : '设置请假' }}</span></button><button class="sp-settings-remove" :aria-label="`删除${employee.name}`" @click="requestDelete('employee', employee.id, employee.name)">删除</button></div>
         </article>
       </div>
       <div v-if="!displayedEmployees.length" class="sp-settings-empty"><strong>{{ state.employees.length ? '没有找到匹配的成员' : '添加第一位团队成员' }}</strong><p>{{ state.employees.length ? '试试其他姓名、岗位或分组。' : '先建立人员名单，再为大家生成合适的排班。' }}</p></div>
@@ -402,6 +450,7 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
       </div>
       <p class="sp-settings-footnote">津贴金额与「班次设置」共用，修改后会更新已有排班的金额。未排班或排为休息时不领取；月末跨夜班的整笔津贴计入本月，不拆到下月。</p>
     </template>
+    <LeaveCalendarDialog v-if="leaveEmployee" :key="leaveEmployee.id" :employee="leaveEmployee" :initial-month="state.month" @save="saveLeave" @close="leaveEmployeeId = ''" />
   </section>
 </template>
 
@@ -424,4 +473,7 @@ function separationShifts(group: SeparationGroup) { return group.shiftIds.length
 @media(prefers-reduced-motion:reduce){.sp-settings button,.sp-settings-switch>span,.sp-settings-switch>span:after{transition:none}}
 .sp-settings-shift-allowance{margin:-8px 0 20px!important;font-size:12px;color:#81908f;line-height:1.8}.sp-settings-shift-allowance strong{color:#966c23;margin-left:8px;font-weight:600}.sp-settings-shift-allowance>span{font-size:11px}
 .sp-settings-allowance-heading>div{flex:1;min-width:0}.sp-settings-allowance-heading p{margin-top:8px}.sp-settings-allowance-heading>.sp-settings-field{width:185px;flex-shrink:0}.sp-settings-allowance-value{font-size:27px;line-height:1.5;font-weight:600;color:#99722f;margin:24px 0!important;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.sp-settings-allowance-value>span{font-size:18px;font-weight:500}.sp-settings-allowance-value>small{display:block;margin-top:5px;color:#99a59f;font-size:11px;font-weight:400}.sp-settings-allowance-form{margin-top:21px}.sp-settings-allowance-form>.sp-settings-actions{margin-top:17px;justify-content:flex-end;flex-wrap:wrap}.sp-settings-allowance-form .sp-settings-button{font-size:11px!important;padding:9px 12px}.sp-settings-allowance-card .sp-settings-card-bottom>.sp-settings-edit{padding:4px 0;margin-left:0}@media(max-width:720px){.sp-settings-allowance-heading{flex-wrap:wrap}.sp-settings-allowance-heading>div,.sp-settings-allowance-heading>.sp-settings-field{width:100%;flex-basis:100%}.sp-settings-allowance-form>.sp-settings-actions>.sp-settings-button{flex:1}}
+
+.sp-settings-inline-guide{font-size:12px;color:#788d88;line-height:1.85;margin:0 0 18px!important}.sp-settings-inline-hours{margin-top:20px}.sp-settings-inline-shifts{border:0;padding:0;margin:0 0 18px;min-width:0}.sp-settings-inline-shifts legend{font-size:11px;font-weight:600;color:#6b8278;margin-bottom:10px}.sp-settings-inline-shift-options{display:flex;flex-wrap:wrap;gap:6px}.sp-settings-inline-shift-options>button{display:inline-flex;align-items:center;gap:5px;border:1px solid #dce7e1;border-radius:6px;background:#f8fbf9;color:#809389;font-size:11px;padding:7px 9px;min-height:34px;max-width:100%;overflow-wrap:anywhere;text-align:left}.sp-settings-inline-shift-options>button.selected{background:var(--shift-color);border-color:#a8c5b8;color:#3f6c58}.sp-settings-inline-shift-options>button>span{font-size:12px;flex-shrink:0}.sp-settings-inline-hint{font-size:10px;line-height:1.8;color:#8a9a91;margin-top:8px!important}.sp-settings-inline-month{padding-top:15px;border-top:1px solid #edf1ee}.sp-settings-inline-reference{font-size:11px;line-height:1.6;margin-bottom:13px}.sp-settings-inline-reference input{width:15px;height:15px}.sp-settings-inline-hours .sp-settings-field{font-size:11px;gap:7px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:38px;padding-right:9px}.sp-settings-inline-hours .sp-settings-input-unit input{padding:9px 10px;font-size:13px}.sp-settings-inline-hours input:disabled{color:#8f9f98;background:#f0f5f2;cursor:default}.sp-settings-inline-hours .sp-settings-input-unit>span{font-size:10px}.sp-settings-inline-week{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.sp-settings-inline-error{font-size:11px;line-height:1.75;color:#ab5745;background:#fff3ee;border:1px solid #f2d9cc;border-radius:6px;padding:9px 10px;margin-top:12px!important}.sp-settings-inline-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:14px;padding-top:12px;border-top:1px dashed #dce6df}.sp-settings-inline-actions>span{font-size:10px;color:#967549}.sp-settings-inline-actions>div{display:flex;gap:6px;margin-left:auto}.sp-settings-inline-actions .sp-settings-button{padding:7px 10px;font-size:11px!important;min-height:34px}.sp-settings-member-bottom{margin-top:18px}.sp-settings-leave-trigger{display:inline-flex;align-items:center;gap:7px;border:0;padding:5px 0;background:none;color:#5c8a74;font-size:11px!important;min-height:30px;text-align:left}.sp-settings-leave-trigger svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.6;fill:none;flex-shrink:0}.sp-settings-leave-trigger:hover{color:#245b4e}
+@media(max-width:720px){.sp-settings-inline-hours .sp-settings-input-unit input{font-size:16px}.sp-settings-inline-hours{margin-top:18px}.sp-settings-inline-shift-options>button{min-height:38px;padding:8px 10px}.sp-settings-inline-actions .sp-settings-button{min-height:38px}.sp-settings-leave-trigger{min-height:36px;font-size:12px!important}.sp-settings-inline-guide{font-size:11px}.sp-settings-inline-week{gap:12px}}
 </style>
