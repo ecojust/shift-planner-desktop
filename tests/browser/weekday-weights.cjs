@@ -25,8 +25,8 @@ function fixture(employeeCount = 12, weights) {
   }
 }
 
-// These targets are independently specified from the requirement, not imported
-// from the production helper. Missing days retain their share outside the month.
+// These are explicitly displayed calculation examples for W=35, not hard
+// staffing targets. Actual schedules may need larger totals to cover minima.
 const OCTOBER = [
   { monday: '2025-09-29', selected: ['2025-10-04'], other: ['2025-10-01', '2025-10-02', '2025-10-03', '2025-10-05'], selectedTarget: 7, otherTarget: 17 },
   ...['06', '13', '20'].map(day => {
@@ -39,18 +39,29 @@ function verifyOctober(assignments) {
   const current = assignments.filter(a => a.date.startsWith('2025-10') && a.shiftId !== 'off')
   assert.equal(new Set(current.map(a => `${a.date}:${a.employeeId}`)).size, current.length, 'No employee may work two shifts on one date')
   assert.ok(current.every(a => a.shiftId === 'day'))
+  const audited = []
   for (const week of OCTOBER) {
-    for (const [dates, target] of [[week.selected, week.selectedTarget], [week.other, week.otherTarget]]) {
+    const selected = current.filter(a => week.selected.includes(a.date)).length
+    const other = current.filter(a => week.other.includes(a.date)).length
+    const candidates = []
+    for (let fullTotal = 35; fullTotal <= 12 * 7; fullTotal++) {
+      const fullSelected = Math.ceil(fullTotal * .4)
+      if (Math.ceil(fullSelected * week.selected.length / 2) === selected && Math.ceil((fullTotal - fullSelected) * week.other.length / 5) === other) candidates.push(fullTotal)
+    }
+    assert.ok(candidates.length, `${week.monday}: ${selected}+${other} must represent the configured actual-total share`)
+    for (const [dates, target] of [[week.selected, selected], [week.other, other]]) {
       const actual = current.filter(a => dates.includes(a.date)).length
       assert.equal(actual, target, `${week.monday} ${dates.join(',')} quota`)
       for (const date of dates) {
         const count = current.filter(a => a.date === date).length
+        assert.ok(count >= 5, `${date}: daily minimum must not be reduced by weekday weights`)
         assert.ok(count >= Math.floor(target / dates.length) && count <= Math.ceil(target / dates.length), `${date}: ${count} outside group distribution`)
       }
     }
+    audited.push({ monday: week.monday, selected, other, total: selected + other, fullWeekCountCandidates: candidates })
   }
-  assert.equal(current.length, 153)
-  return OCTOBER.map(week => ({ monday: week.monday, selected: week.selectedTarget, other: week.otherTarget, total: week.selectedTarget + week.otherTarget }))
+  assert.ok(current.length > 155, '40% on Monday/Saturday requires additional staffing to preserve all daily minima')
+  return audited
 }
 
 async function main() {
@@ -96,17 +107,18 @@ async function main() {
     const weightedFixture = fixture(12, { days: [1, 6], percent: 40 })
     await importDocument(weightedFixture)
     await generate()
-    const generated = await persisted(s => s.assignments.filter(a => a.date.startsWith('2025-10')).length === 153)
-    record('real-worker-weighted-quotas', { weeks: verifyOctober(generated.assignments), total: 153 })
-    await page.getByText('153 个班位已排满', { exact: true }).waitFor()
+    const generated = await persisted(s => s.assignments.filter(a => a.date.startsWith('2025-10')).length > 155)
+    record('real-worker-weighted-quotas-and-daily-minima', { weeks: verifyOctober(generated.assignments), total: generated.assignments.length })
+    await page.getByText('155 个最低班位已满足', { exact: true }).waitFor()
     await page.getByRole('button', { name: '月视图', exact: true }).click()
-    const footer = await page.locator('.sp-schedule-table tfoot td').allInnerTexts()
-    assert.match(footer[0], /[45]\s*\/\s*4–5/)
-    assert.match(footer[3], /7\s*\/\s*7/)
-    assert.match(footer[5], /7\s*\/\s*7/)
-    assert.match(footer[30], /[45]\s*\/\s*4–5/)
+    const footer = await page.locator('.sp-schedule-table tfoot tr').first().locator('td').allInnerTexts()
+    for (let index = 0; index < 31; index++) {
+      const date = `2025-10-${String(index + 1).padStart(2, '0')}`
+      const count = generated.assignments.filter(item => item.date === date && item.shiftId === 'day').length
+      assert.equal(footer[index].replace(/\s/g, ''), `${count}/5`)
+    }
     await page.getByRole('button', { name: '自动排班', exact: true }).click()
-    assert.match(await page.locator('.sp-generation-summary').innerText(), /需要安排 153 个班位/)
+    assert.match(await page.locator('.sp-generation-summary').innerText(), /至少需要 155 个班位/)
     await page.getByRole('button', { name: '关闭自动排班', exact: true }).click()
     await page.screenshot({ path: path.join(output, '01-weighted-roster.png') })
     record('weighted-calendar-footer-total-and-generation-summary')
@@ -159,14 +171,25 @@ async function main() {
     for (const week of OCTOBER) await preview(week.monday, week.selectedTarget, week.otherTarget, week.selectedTarget + week.otherTarget)
     assert.equal(Number.parseInt(await page.locator('.sp-settings-weight-month-total').innerText(), 10), 153)
     record('controls-replace-weekend-switch-and-save-team-rule')
-    record('october-preview-full-and-partial-weeks', { totals: [24, 35, 35, 35, 24], month: 153 })
-    assert.match(await page.locator('.sp-settings-weight-capacity').innerText(), /68%/)
+    record('october-example-full-and-partial-weeks', { exampleFullWeek: 35, totals: [24, 35, 35, 35, 24], monthExample: 153 })
+    assert.match(await page.locator('.sp-settings-weight-capacity').innerText(), /48%/)
     const firstWeek = page.locator('.sp-settings-weight-preview article').first()
     await firstWeek.locator('summary').click()
     assert.equal((await firstWeek.locator('li.selected strong').innerText()).trim(), '7 班')
     assert.deepEqual(await firstWeek.locator('li:not(.selected) strong').allInnerTexts(), ['4–5 班', '4–5 班', '4–5 班', '4–5 班'])
     await firstWeek.locator('summary').click()
     record('capacity-reference-and-expanded-daily-range')
+    const exampleTotal = page.getByLabel('完整周演示总班数', { exact: true })
+    assert.equal(await exampleTotal.inputValue(), '35')
+    assert.match(await page.locator('.sp-settings-weight-formula').innerText(), /低于每日最少人数/)
+    const savedBeforeExample = await state()
+    await exampleTotal.fill('42')
+    await preview('2025-09-29', 9, 20, 29)
+    await preview('2025-10-06', 17, 25, 42)
+    assert.equal(Number.parseInt(await page.locator('.sp-settings-weight-month-total').innerText(), 10), 184)
+    assert.deepEqual(await state(), savedBeforeExample, 'Changing a worked example must not change scheduling rules')
+    await exampleTotal.fill('35')
+    record('editable-example-is-not-fixed-capacity-or-persisted-rule')
     await widthCheck('desktop-rules-page-no-overflow')
     if (await page.getByRole('button', { name: '关闭提示', exact: true }).isVisible()) await page.getByRole('button', { name: '关闭提示', exact: true }).click()
     await page.getByRole('heading', { name: '上班权重', exact: true }).scrollIntoViewIfNeeded()
@@ -233,9 +256,9 @@ async function main() {
     await page.getByRole('button', { name: '保存规则', exact: true }).click()
     await persisted(s => s.rules.weekdayWeights === undefined)
     await generate()
-    const unweighted = await persisted(s => s.assignments.filter(a => a.date.startsWith('2025-10')).length === 155)
-    for (let day = 1; day <= 31; day++) assert.equal(unweighted.assignments.filter(a => a.date === `2025-10-${String(day).padStart(2, '0')}` && a.shiftId === 'day').length, 5)
-    record('disabling-weight-restores-daily-demand', { month: 155, daily: 5 })
+    const unweighted = await persisted(s => s.assignments.filter(a => a.date.startsWith('2025-10')).length >= 155)
+    for (let day = 1; day <= 31; day++) assert.ok(unweighted.assignments.filter(a => a.date === `2025-10-${String(day).padStart(2, '0')}` && a.shiftId === 'day').length >= 5)
+    record('disabling-weight-keeps-daily-minimum', { actual: unweighted.assignments.length, monthMinimum: 155, dailyMinimum: 5 })
     await importDocument(backup)
     await navigate('排班规则')
     assert.equal(await enabled.isChecked(), true)

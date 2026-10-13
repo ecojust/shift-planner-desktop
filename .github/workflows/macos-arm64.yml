@@ -219,7 +219,7 @@ jobs:
           shift-planner-source.zip 为本次构建提交的精确源码；无需重复下载 Actions 中的 App ZIP。
           release-SHA256SUMS 可用于校验安装包和源码 ZIP。原生资源、求解验证和构建清单等 JSON 报告保存在本次 Actions 的 shift-flow-macos-arm64 artifact 中（保留 14 天），不作为 Release 下载附件。
 
-          发布前已通过前端、Python 与 Rust 测试、最终 App 原生资源审计及完整月份真实求解验证：12 人、155 条安排、0 缺员、独立规则检查无问题。
+          发布前已通过前端、Python 与 Rust 测试、最终 App 原生资源审计及完整月份真实求解验证：12 人、至少 155 条安排、0 缺员，逐日逐班最低人数与独立规则检查通过。
           原生依赖最低系统版本已核对；这不代表已在每个 macOS 14+ 系统版本上进行实机测试。
 
           源码提交：${GITHUB_SHA}
