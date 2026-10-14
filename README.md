@@ -2,7 +2,7 @@
 
 按月管理成员、班次与休假，自动排班、统计班次津贴，支持 Excel、CSV 导出和 JSON 备份。桌面版可离线使用。
 
-[下载 Windows / Intel Mac / M 芯片 Mac 版](https://github.com/ecojust/shift-planner-desktop/releases/latest)
+[下载 Windows / Intel Mac / M 芯片 Mac 版](https://github.com/ecojust/shift-schedule-expert/releases/latest)
 
 ![29 位成员、8 种班次的 2026 年 10 月排班](docs/screenshots/calendar.png)
 

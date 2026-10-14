@@ -2,7 +2,7 @@
 
 ## 2026-10-14：1.3.6 三平台正式发布
 
-[构建任务 38579751481](https://github.com/ecojust/shift-planner-desktop/actions/runs/38579751481) 全部成功，Windows x64、Intel Mac、Apple Silicon Mac 安装包已公开为 [1.3.6](https://github.com/ecojust/shift-planner-desktop/releases/tag/desktop-v1.3.6-38579751481)。三平台统一构建号 `2026.1014.2221`，源提交 `a019acbe578d6bd550f15663a2985aed5818cac4`，包含本页此前仅完成源码验证的班次弹窗、生成进度、姓名头像及跨月工时等改动。
+[构建任务 38579751481](https://github.com/ecojust/shift-schedule-expert/actions/runs/38579751481) 全部成功，Windows x64、Intel Mac、Apple Silicon Mac 安装包已公开为 [1.3.6](https://github.com/ecojust/shift-schedule-expert/releases/tag/desktop-v1.3.6-38579751481)。三平台统一构建号 `2026.1014.2221`，源提交 `a019acbe578d6bd550f15663a2985aed5818cac4`，包含本页此前仅完成源码验证的班次弹窗、生成进度、姓名头像及跨月工时等改动。
 
 三个原生任务的前端、Python 约束、Rust 生命周期、真实集成求解及包内资源验证步骤均成功；Windows 静默安装、Mac 架构与签名资源检查步骤成功。正式附件为三个安装包、对应源码 ZIP 与 `SHA256SUMS`，共 5 项。所有安装包的 GitHub 上传资产 SHA-256 摘要与清单相符；本地下载源码 ZIP 和清单再次计算摘要，源码 146 个文件与发行提交逐字节一致，五处版本号均为 1.3.6。README 截图与精简说明随后以文档提交更新，不改变安装包源码对应关系。
 
@@ -142,7 +142,7 @@ README 主图为自然周视图 `docs/screenshots/calendar.png`。完整请求�
 - 新成员交互 Chromium 检查 **20 项通过**，覆盖独立草稿、班次标签多选／清空／取消、请假跨月与闰日、仅清本月、3660 天上限、键盘与焦点恢复、基本资料保存及导入草稿隔离。桌面 1440、手机 390／320 均无页面横向溢出；两套浏览器检查均无控制台或页面错误。
 - 独立运行实际 Vue 组件逻辑，核对旧基本资料编辑不覆盖新字段、其他成员修改不丢失本卡草稿、非法工时不写入，以及请假跨月跨年、闰日、年份边界、3660 天上限。
 
-上一版 1.3.0 已在三个原生平台完整构建、验证包内求解器并发布：[Actions 38408398541](https://github.com/ecojust/shift-planner-desktop/actions/runs/38408398541)。1.3.1 的原生验证以其独立发布构建记录为准。
+上一版 1.3.0 已在三个原生平台完整构建、验证包内求解器并发布：[Actions 38408398541](https://github.com/ecojust/shift-schedule-expert/actions/runs/38408398541)。1.3.1 的原生验证以其独立发布构建记录为准。
 
 脚本：`tests/browser/hours-settings.cjs`、`tests/browser/member-interactions.cjs`；本地截图与报告在 `test-results/hours-ui/`、`test-results/member-interactions-ui/`。
 
@@ -175,13 +175,13 @@ README 主图为自然周视图 `docs/screenshots/calendar.png`。完整请求�
 
 ## 1.1.1：Mac 签名资源封印修复
 
-已发布 1.1.0 的原生下载诊断 [38281252565](https://github.com/ecojust/shift-planner-desktop/actions/runs/38281252565) 确认 DMG 完整、App 无隔离直接启动正常，但严格签名检查发现主程序和 Python.framework 两处缺少资源封印。此证据不代表 Gatekeeper 放行或用户 M5 实测。
+已发布 1.1.0 的原生下载诊断 [38281252565](https://github.com/ecojust/shift-schedule-expert/actions/runs/38281252565) 确认 DMG 完整、App 无隔离直接启动正常，但严格签名检查发现主程序和 Python.framework 两处缺少资源封印。此证据不代表 Gatekeeper 放行或用户 M5 实测。
 
 新流程为 Python.framework 和最终 App 完整签名，并将逐个原生代码的严格签名检查纳入发布门槛。源码版本更新为 1.1.1；新的原生构建与下载复验结果以对应 Actions 记录为准。JSON 签名报告只保存在 Actions Artifacts，公开附件仍为安装包、源码和校验文件。
 
 ## 2026-10-13 更新：三平台构建、开发启动与日历
 
-- `desktop-build.yml` 新增并固定 Windows x64、Intel Mac x64、Mac ARM64 三个原生任务，默认全部成功后自动发布；取消 `publish_release` 可只验证构建。三平台原生构建 [38277333420](https://github.com/ecojust/shift-planner-desktop/actions/runs/38277333420) 已全部通过并发布：Windows 通过 NSIS 静默安装验证；三个最终资源目录均生成 155 个班位、零缺员、独立规则检查零问题。
+- `desktop-build.yml` 新增并固定 Windows x64、Intel Mac x64、Mac ARM64 三个原生任务，默认全部成功后自动发布；取消 `publish_release` 可只验证构建。三平台原生构建 [38277333420](https://github.com/ecojust/shift-schedule-expert/actions/runs/38277333420) 已全部通过并发布：Windows 通过 NSIS 静默安装验证；三个最终资源目录均生成 155 个班位、零缺员、独立规则检查零问题。
 - 开发启动链路的 Python 依赖加载检查统一为 120 秒，加入模块导入位置及 20 秒一次性线程栈。源码加载与 CP-SAT 自检在本工作环境约 0.48 秒完成；这不代表已确认用户 M5 上的具体阻塞原因。
 - 日历接入 `lunar-typescript@1.8.6`，删除程序内的 2026 公历日期表，保留独立法定计薪规则与人工日历优先级。当前完整自动核算 2025/2026，未来未覆盖年度保持待核对。
 - 本地完整前端测试 65 项通过（包含 2026 全年 365 天独立官方日期对照与跨年津贴），类型检查和 Vite 构建通过；新增 3 项启动诊断、8 项 Mach-O 架构审计测试通过。
@@ -191,7 +191,7 @@ README 主图为自然周视图 `docs/screenshots/calendar.png`。完整请求�
 
 ## Mac 原生构建与最终 App 验证
 
-原始构建：[38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)，对应源码提交 `e1e6df1dac5134b6ea6bef69bcc58b7c52fcb095`。随后在同类 macOS 15 ARM64 运行器上完成 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 审计，没有重建或修改原始应用字节。
+原始构建：[38271663345](https://github.com/ecojust/shift-schedule-expert/actions/runs/38271663345)，对应源码提交 `e1e6df1dac5134b6ea6bef69bcc58b7c52fcb095`。随后在同类 macOS 15 ARM64 运行器上完成 [38273409897](https://github.com/ecojust/shift-schedule-expert/actions/runs/38273409897) 审计，没有重建或修改原始应用字节。
 
 - 前端测试 57 项、Python OR-Tools 测试 21 项、Rust 普通测试 16 项全部通过；另两项真实集成测试单独执行并通过。
 - 源码 Python 与发行 onedir 两条真实集成路径均返回 OPTIMAL、29 条安排、零缺员，完成进程回收与临时目录清理。
@@ -201,7 +201,7 @@ README 主图为自然周视图 `docs/screenshots/calendar.png`。完整请求�
 
 审计发现 NumPy 扩展声明的最高最低系统版本为 macOS 14.0。该历史构建的 Info.plist 仍声明 11.0，不能据此承诺支持 macOS 11–13；现有包按 **macOS 14+** 交付。后续 Mac 构建配置已明确提高至 14.0，自动发布前也会校验应用声明和实际依赖最低版本。macOS 14 的运行兼容性尚未单独实测。
 
-当前包已作为 [macOS Apple Silicon 测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0) 公开，未进行 Apple Developer ID 签名或 Apple 公证。新的 `macos-arm64.yml` 由用户手动启动，在全部检查成功后自动发布 prerelease；当前三平台 `desktop-build.yml` 已扩展为 Windows x64、Intel Mac 与 Apple Silicon 原生构建，全部成功后可自动发布；新增平台的实际结果以本轮 Actions 记录为准。
+当前包已作为 [macOS Apple Silicon 测试发行版](https://github.com/ecojust/shift-schedule-expert/releases/tag/macos-arm64-1.1.0) 公开，未进行 Apple Developer ID 签名或 Apple 公证。新的 `macos-arm64.yml` 由用户手动启动，在全部检查成功后自动发布 prerelease；当前三平台 `desktop-build.yml` 已扩展为 Windows x64、Intel Mac 与 Apple Silicon 原生构建，全部成功后可自动发布；新增平台的实际结果以本轮 Actions 记录为准。
 
 ## 定位与调整
 

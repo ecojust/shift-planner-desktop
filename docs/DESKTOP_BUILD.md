@@ -155,7 +155,7 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 只有三个构建任务都成功，后续 Release 任务才运行：先聚合验证报告、核对提交与 run ID，公开附件仅选择三个安装包、精确源码 ZIP、SHA256SUMS，上传完整后公开测试版。JSON 报告仍须全部通过验证，并保留在 Actions artifact。标签为 `desktop-v<版本>-<run ID>`。任一平台失败不会发布残缺版本；成功平台的产物仍保留在各自 Actions artifact，保留期为 14 天。两个 Mac 架构不会覆盖彼此的附件。此入口已包含 M 芯片构建，无需同时再运行专用 ARM64 工作流。
 
-Mac 原生构建 [38271663345](https://github.com/ecojust/shift-planner-desktop/actions/runs/38271663345)（源码 `e1e6df1`）及最终 App 审计/完整月求解 [38273409897](https://github.com/ecojust/shift-planner-desktop/actions/runs/38273409897) 均成功，现有包已发布为 [测试发行版](https://github.com/ecojust/shift-planner-desktop/releases/tag/macos-arm64-1.1.0)。验证环境为 macOS 15 ARM64；依赖要求 macOS 14+，不代表已遍历测试所有兼容系统版本。该历史记录仅针对 ARM64。后续三平台构建 [38277333420](https://github.com/ecojust/shift-planner-desktop/actions/runs/38277333420) 已全部通过并发布，包含 Windows NSIS 静默安装和三个最终运行目录的整月求解；桌面图形界面、Mac 人工安装/卸载及文件对话框仍未实测。详细证据与此前 Linux 窗口测试见 [验证记录](VERIFICATION.md)。
+Mac 原生构建 [38271663345](https://github.com/ecojust/shift-schedule-expert/actions/runs/38271663345)（源码 `e1e6df1`）及最终 App 审计/完整月求解 [38273409897](https://github.com/ecojust/shift-schedule-expert/actions/runs/38273409897) 均成功，现有包已发布为 [测试发行版](https://github.com/ecojust/shift-schedule-expert/releases/tag/macos-arm64-1.1.0)。验证环境为 macOS 15 ARM64；依赖要求 macOS 14+，不代表已遍历测试所有兼容系统版本。该历史记录仅针对 ARM64。后续三平台构建 [38277333420](https://github.com/ecojust/shift-schedule-expert/actions/runs/38277333420) 已全部通过并发布，包含 Windows NSIS 静默安装和三个最终运行目录的整月求解；桌面图形界面、Mac 人工安装/卸载及文件对话框仍未实测。详细证据与此前 Linux 窗口测试见 [验证记录](VERIFICATION.md)。
 
 本地构建同样需要匹配架构的 Python 与 Rust；不能在 M 芯片运行器上重命名文件冒充 Intel 版本。新三平台流程的实际运行结果应以对应 Actions 日志及 Release 附带报告为准。
 

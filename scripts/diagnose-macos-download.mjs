@@ -11,7 +11,7 @@ import { runtimeInventory } from './runtime-files.mjs';
 // quarantine metadata or bytes. Signing/Gatekeeper failures are diagnostic data.
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const defaults = {
-  repo: 'ecojust/shift-planner-desktop', tag: '',
+  repo: 'ecojust/shift-schedule-expert', tag: '',
   asset: 'shift-schedule-expert-macos-arm64.dmg', output: 'artifacts/macos-download-diagnostics', launch: 'true',
 };
 const sleep = milliseconds => new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds));
