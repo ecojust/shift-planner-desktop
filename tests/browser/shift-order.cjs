@@ -1,4 +1,5 @@
-/* Real Vue acceptance checks for chronological shift cards and staffing labels.
+/* Real Vue acceptance checks for chronological shift cards, staffing labels,
+ * and the shift editing modal's validation, scrolling and focus lifecycle.
  * Start Vite, then run with PLAYWRIGHT_MODULE_PATH and (optionally)
  * PLAYWRIGHT_EXECUTABLE_PATH. SHIFT_ORDER_TEST_URL defaults to localhost:5193.
  * Checks the browser worker for zero-minimum / zero-fixed behavior; no native
@@ -59,6 +60,28 @@ async function noOverflow(page) {
   for (const card of sizes.cards) assert.ok(card.left >= 0 && card.right <= sizes.width + 1 && card.scroll <= card.width + 1, JSON.stringify(card));
   return sizes;
 }
+async function focused(locator) {
+  assert.equal(await locator.evaluate(node => node === document.activeElement), true, 'expected control has focus');
+}
+async function modalTrap(page, modal) {
+  const first = modal.getByRole('button', { name: '关闭班次编辑', exact: true });
+  const last = modal.getByRole('button', { name: '保存班次', exact: true });
+  await first.focus(); await page.keyboard.press('Shift+Tab'); await focused(last);
+  await page.keyboard.press('Tab'); await focused(first);
+}
+async function modalFits(page, modal) {
+  const viewport = page.viewportSize(), bounds = await modal.boundingBox();
+  assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= viewport.width + 1 && bounds.y + bounds.height <= viewport.height + 1, JSON.stringify({ viewport, bounds }));
+  const save = modal.getByRole('button', { name: '保存班次', exact: true }), button = await save.boundingBox();
+  assert.ok(button && button.height >= 40 && button.y >= 0 && button.y + button.height <= viewport.height + 1, JSON.stringify(button));
+  await save.click({ trial: true });
+  const overflow = await modal.evaluate(node => ({ scroll: node.scrollWidth, width: node.clientWidth }));
+  assert.ok(overflow.scroll <= overflow.width + 1, JSON.stringify(overflow));
+}
+async function closedWithFocus(modal, trigger) {
+  await modal.waitFor({ state: 'hidden' });
+  await focused(trigger);
+}
 
 (async () => {
   await fs.mkdir(out, { recursive: true });
@@ -94,21 +117,66 @@ async function noOverflow(page) {
     await noOverflow(page);
     await screenshot(page, 'shift-order-desktop');
 
-    await page.getByRole('button', { name: '编辑午间固定', exact: true }).click();
-    await page.getByLabel('开始时间', { exact: true }).fill('05:30');
-    await page.getByRole('button', { name: '保存班次', exact: true }).click();
+    const editTrigger = page.getByRole('button', { name: '编辑午间固定', exact: true });
+    const editing = page.getByRole('dialog', { name: '编辑班次', exact: true });
+    await editTrigger.click(); await editing.waitFor();
+    await focused(editing.getByLabel('班次名称', { exact: true }));
+    assert.equal(await editing.getAttribute('aria-modal'), 'true');
+    await modalFits(page, editing); await modalTrap(page, editing);
+    assert.equal(await page.locator('.sp-settings-editor').count(), 0, 'shift editor no longer expands inline');
+    record('editing opens a labeled modal with initial name focus and keyboard focus wrapping');
+    const beforeCancel = await state(page);
+    await editing.getByLabel('班次名称', { exact: true }).fill('不保存的班次');
+    await editing.getByLabel('开始时间', { exact: true }).fill('05:15');
+    await editing.getByRole('button', { name: '取消', exact: true }).click();
+    await closedWithFocus(editing, editTrigger); await page.waitForTimeout(450);
+    assert.deepEqual(await state(page), beforeCancel);
+    await editTrigger.click();
+    assert.equal(await editing.getByLabel('班次名称', { exact: true }).inputValue(), '午间固定');
+    await editing.getByLabel('班次津贴', { exact: true }).fill('88');
+    await page.keyboard.press('Escape');
+    await closedWithFocus(editing, editTrigger); await page.waitForTimeout(450);
+    assert.deepEqual(await state(page), beforeCancel);
+    record('cancel and Escape discard shift drafts and restore focus without changing persisted data');
+
+    await editTrigger.click();
+    await editing.getByLabel('结束时间', { exact: true }).fill('12:00');
+    await editing.getByRole('button', { name: '保存班次', exact: true }).click();
+    const validation = editing.getByRole('alert'); await validation.waitFor();
+    assert.match(await validation.innerText(), /开始和结束不能相同/);
+    const errorBounds = await validation.boundingBox(), viewport = page.viewportSize();
+    assert.ok(errorBounds && errorBounds.y >= 0 && errorBounds.y + errorBounds.height <= viewport.height + 1, JSON.stringify(errorBounds));
+    assert.deepEqual(await state(page), beforeCancel);
+    await screenshot(page, 'shift-modal-validation-desktop');
+    record('invalid equal start and end times keep the modal open with visible error and no data write');
+    await editing.getByLabel('结束时间', { exact: true }).fill('20:00');
+    await editing.getByLabel('开始时间', { exact: true }).fill('05:30');
+    await editing.getByRole('button', { name: '保存班次', exact: true }).click();
+    await closedWithFocus(editing, editTrigger);
     await persisted(page, value => value.shifts.find(item => item.id === 'fixed').start === '05:30');
     const editedOrder = ['fixed', 'zero-minimum', 'tie-z', 'tie-a', 'zero-fixed', 'night'];
     assert.deepEqual(await cardOrder(page), editedOrder);
     assert.deepEqual((await state(page)).shifts.map(item => item.id), originalIds);
     record('editing the start time repositions the card without reordering stored shifts');
 
-    await page.getByRole('button', { name: '新建班次', exact: false }).first().click();
-    await page.getByLabel('班次名称', { exact: true }).fill('新增上午班');
-    await page.getByLabel('日历简称', { exact: true }).fill('新');
-    await page.getByLabel('开始时间', { exact: true }).fill('10:30');
-    await page.getByLabel('结束时间', { exact: true }).fill('18:30');
-    await page.getByRole('button', { name: '保存班次', exact: true }).click();
+    const newTrigger = page.getByRole('button', { name: '新建班次', exact: false }).first();
+    const creating = page.getByRole('dialog', { name: '新建班次', exact: true });
+    await newTrigger.click(); await creating.waitFor();
+    await focused(creating.getByLabel('班次名称', { exact: true }));
+    await creating.getByLabel('班次名称', { exact: true }).fill('取消的新班');
+    await creating.getByRole('button', { name: '取消', exact: true }).click();
+    await closedWithFocus(creating, newTrigger);
+    assert.equal((await state(page)).shifts.length, original.length);
+    await newTrigger.click();
+    assert.equal(await creating.getByLabel('班次名称', { exact: true }).inputValue(), '');
+    await creating.getByLabel('班次名称', { exact: true }).fill('新增上午班');
+    await creating.getByLabel('日历简称', { exact: true }).fill('新');
+    await creating.getByLabel('开始时间', { exact: true }).fill('10:30');
+    await creating.getByLabel('结束时间', { exact: true }).fill('18:30');
+    await screenshot(page, 'shift-modal-new-desktop');
+    await creating.getByRole('button', { name: '保存班次', exact: true }).click();
+    await closedWithFocus(creating, newTrigger);
+    record('new shift uses its own modal, resets cancelled drafts and restores focus after save');
     const updated = await persisted(page, value => value.shifts.length === original.length + 1);
     const newId = updated.shifts.find(item => item.name === '新增上午班').id;
     const finalOrder = ['fixed', 'zero-minimum', 'tie-z', 'tie-a', newId, 'zero-fixed', 'night'];
@@ -123,18 +191,33 @@ async function noOverflow(page) {
     record('reloading retains edits and stable chronological display without rewriting persisted order');
 
     for (const width of [390, 320]) {
-      await page.setViewportSize({ width, height: 900 });
+      await page.setViewportSize({ width, height: width === 390 ? 844 : 640 });
       await page.evaluate(() => scrollTo(0, 0));
       await noOverflow(page);
       assert.deepEqual(await cardOrder(page), finalOrder);
       assert.match(await page.locator('#shift-tie-a').innerText(), /≥.*每日最少|每日最少.*≥/s);
       assert.match(await page.locator('#shift-fixed').innerText(), /=.*每日固定|每日固定.*=/s);
       await screenshot(page, `shift-order-${width}`);
-      await page.getByRole('button', { name: '编辑旧版早班', exact: true }).click();
+      const mobileTrigger = page.getByRole('button', { name: '编辑旧版早班', exact: true });
+      const beforeMobile = await state(page);
+      await mobileTrigger.click(); await editing.waitFor();
       await noOverflow(page);
-      assert.equal(await page.getByRole('radio', { name: '人数模式：每日最少人数', exact: true }).isChecked(), true);
-      await page.getByRole('button', { name: '取消', exact: true }).click();
-      record(`${width}px cards and editor fit the viewport; staffing modes remain identifiable`);
+      await modalFits(page, editing); await modalTrap(page, editing);
+      assert.equal(await editing.getByRole('radio', { name: '人数模式：每日最少人数', exact: true }).isChecked(), true);
+      const scrollBody = editing.locator('.sp-shift-dialog-body'), header = editing.locator('header'), footer = editing.locator('footer');
+      const beforeScroll = { top: (await header.boundingBox()).y, bottom: (await footer.boundingBox()).y, pageY: await page.evaluate(() => scrollY) };
+      assert.equal(await scrollBody.evaluate(node => node.scrollHeight > node.clientHeight), true, 'mobile body can scroll independently');
+      await scrollBody.evaluate(node => { node.scrollTop = node.scrollHeight; });
+      assert.ok(await scrollBody.evaluate(node => node.scrollTop > 0));
+      assert.equal((await header.boundingBox()).y, beforeScroll.top);
+      assert.equal((await footer.boundingBox()).y, beforeScroll.bottom);
+      assert.equal(await page.evaluate(() => scrollY), beforeScroll.pageY);
+      await modalFits(page, editing);
+      await screenshot(page, `shift-modal-${width}`);
+      await editing.getByLabel('班次津贴', { exact: true }).fill('99');
+      await page.keyboard.press('Escape'); await closedWithFocus(editing, mobileTrigger);
+      await page.waitForTimeout(450); assert.deepEqual(await state(page), beforeMobile);
+      record(`${width}px modal body scrolls independently with fixed header, reachable footer and keyboard focus containment`);
     }
 
     // With no coverage floor, the eight-hour minimum can only be met by the

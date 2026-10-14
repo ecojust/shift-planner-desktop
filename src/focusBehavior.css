@@ -2,7 +2,8 @@
    extra ring; keep normal borders, selected states, errors and card shadows. */
 html[data-focus-mode="pointer"] :focus,
 html[data-focus-mode="pointer"] .sp-settings-switch input:focus + span,
-html[data-focus-mode="pointer"] .sp-employee-avatar-upload:focus-within {
+html[data-focus-mode="pointer"] .sp-employee-avatar-upload:focus-within,
+html[data-focus-mode="pointer"] .sp-settings-staffing-options > label:focus-within {
   outline: none !important;
 }
 

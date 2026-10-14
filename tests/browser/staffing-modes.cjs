@@ -59,7 +59,7 @@ async function main() {
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     return persisted(value => value.teamName === document.teamName && JSON.stringify(modes(value)) === JSON.stringify(modes(document)) && JSON.stringify(value.assignments) === JSON.stringify(document.assignments))
   }
-  const editor = () => page.locator('.sp-settings-editor')
+  const editor = () => page.getByRole('dialog', { name: /^(编辑|新建)班次$/ })
   const radio = mode => page.getByRole('radio', { name: mode === 'fixed' ? '人数模式：每日固定人数' : '人数模式：每日最少人数', exact: true })
   const amount = mode => page.getByLabel(mode === 'fixed' ? '每日固定人数' : '每日最少人数', { exact: true })
   const card = name => page.locator('.sp-settings-shift-card').filter({ has: page.getByRole('heading', { name, exact: true }) })
@@ -110,7 +110,7 @@ async function main() {
     await card('早班').getByRole('button', { name: '编辑早班', exact: true }).click()
     assert.equal(await radio('minimum').isChecked(), true)
     assert.equal(await amount('minimum').inputValue(), '1')
-    assert.match(await card('早班').innerText(), /每日最少\s*1\s*人/)
+    assert.match(await card('早班').innerText(), /每日最少\s*≥\s*1\s*人/)
     record('legacy-mode-missing-opens-as-minimum-with-original-number')
 
     const beforeCancel = await state()
@@ -132,7 +132,7 @@ async function main() {
     await amount('fixed').fill('2')
     await editor().getByRole('button', { name: '保存班次', exact: true }).click()
     await persisted(value => value.shifts.some(shift => shift.name === '支援班' && shift.staffingMode === 'fixed' && shift.required === 2))
-    assert.match(await card('支援班').innerText(), /每日固定\s*2\s*人/)
+    assert.match(await card('支援班').innerText(), /每日固定\s*=\s*2\s*人/)
     record('new-shift-defaults-to-minimum-and-can-save-fixed-mode')
 
     await importDocument(legacy)
@@ -140,8 +140,8 @@ async function main() {
     record('legacy-all-minimum-high-hour-roster-remains-feasible', audit(minimum))
     await navigate('班次设置')
     await editShift('早班', 'fixed', 1)
-    assert.match(await card('早班').innerText(), /每日固定\s*1\s*人/)
-    assert.match(await card('晚班').innerText(), /每日最少\s*1\s*人/)
+    assert.match(await card('早班').innerText(), /每日固定\s*=\s*1\s*人/)
+    assert.match(await card('晚班').innerText(), /每日最少\s*≥\s*1\s*人/)
     record('editing-mode-persists-and-cards-distinguish-fixed-from-minimum')
     await page.screenshot({ path: path.join(output, '01-mixed-mode-settings.png') })
 
@@ -164,9 +164,9 @@ async function main() {
     await editShift('早班', 'minimum', 1)
     await page.reload({ waitUntil: 'networkidle' })
     await navigate('班次设置')
-    assert.match(await card('早班').innerText(), /每日最少\s*1\s*人/)
+    assert.match(await card('早班').innerText(), /每日最少\s*≥\s*1\s*人/)
     await importDocument(backup)
-    assert.match(await card('早班').innerText(), /每日固定\s*1\s*人/)
+    assert.match(await card('早班').innerText(), /每日固定\s*=\s*1\s*人/)
     record('mode-survives-refresh-and-json-backup-import')
 
     await navigate('排班日历')

@@ -197,7 +197,7 @@ async function main() {
 
     await page.getByRole('button', { name: '编辑夜班', exact: true }).click()
     await normal.fill('80')
-    await page.locator('.sp-settings-editor').getByRole('button', { name: '取消', exact: true }).click()
+    await page.getByRole('dialog', { name: /^(编辑|新建)班次$/ }).getByRole('button', { name: '取消', exact: true }).click()
     assert.equal((await state()).shifts.find(shift => shift.id === 'night').normalAllowance, 50)
     await page.getByRole('button', { name: '编辑夜班', exact: true }).click()
     await normal.fill('55')
