@@ -1,4 +1,5 @@
 const { selectGlobalMonth } = require('./helpers/month-picker.cjs')
+const { openSelect, selectOption } = require('./helpers/select-option.cjs')
 /* Real browser acceptance checks for per-member shift sequence/frequency rules.
  * Start Vite first, then run from the project root:
  * SHIFT_FLOW_PYTHON=/path/to/python PLAYWRIGHT_MODULE_PATH=/path/to/playwright node tests/browser/shift-rules.cjs
@@ -20,7 +21,7 @@ const repo = path.resolve(__dirname, '../..');
 const out = path.resolve(process.env.SHIFT_RULES_TEST_OUTPUT || path.join(repo, 'test-results/shift-rules'));
 const url = process.env.SHIFT_RULES_TEST_URL || 'http://127.0.0.1:5193/';
 const python = process.env.SHIFT_FLOW_PYTHON || path.join(repo, 'solver/.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-const report = { url, startedAt: new Date().toISOString(), scope: 'Vue UI, browser worker and real CP-SAT; excludes native packaging', checks: [], errors: [], screenshots: [] };
+const report = { url, startedAt: new Date().toISOString(), scope: process.env.SHIFT_RULES_UI_ONLY || process.env.SHIFT_RULES_GROUPS_ONLY ? 'Actual Chromium Vue UI and saved rule configuration; no solving or native packaging' : 'Vue UI, browser worker and real CP-SAT; excludes native packaging', checks: [], errors: [], screenshots: [] };
 const clone = value => JSON.parse(JSON.stringify(value));
 const fixture = {
   version: 1, teamName: '班次规则验收', month: '2026-10',
@@ -141,16 +142,21 @@ async function main() {
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 }, acceptDownloads: true, locale: 'zh-CN', timezoneId: 'Asia/Shanghai' });
   const card = kind => page.locator(`[data-rule-kind="${kind}"]`);
   const short = kind => kind === 'nonConsecutiveShifts' ? '不相连' : '周次数';
-  const select = (kind, index) => card(kind).getByLabel(`第 ${index} 条${short(kind)}规则班次`, { exact: true });
+  const select = (kind, index) => card(kind).getByRole('combobox', { name: `第 ${index} 条${short(kind)}规则班次`, exact: true });
   const cap = index => card('weeklyShiftLimits').getByLabel(`第 ${index} 条周次数规则每周最多次数`, { exact: true });
   const save = (kind, index) => card(kind).getByRole('button', { name: `保存第 ${index} 条${short(kind)}规则`, exact: true }).click();
   const cancel = (kind, index) => card(kind).getByRole('button', { name: `取消第 ${index} 条${short(kind)}规则修改`, exact: true }).click();
-  const remove = (kind, index) => card(kind).getByRole('button', { name: `删除第 ${index} 条${short(kind)}规则`, exact: true }).click();
+  const remove = async (kind, index) => {
+    await card(kind).getByRole('button', { name: `删除第 ${index} 条${short(kind)}规则`, exact: true }).click();
+    const confirmation = page.getByRole('alertdialog');
+    await confirmation.getByRole('button', { name: '确认删除', exact: true }).click();
+    await confirmation.waitFor({ state: 'detached' });
+  };
   const add = kind => card(kind).getByRole('button', { name: `添加${kind === 'nonConsecutiveShifts' ? '班次不相连' : '周班次限制'}规则`, exact: true });
   async function addRule(kind, shiftId, maximum) {
     await add(kind).click();
     const index = await card(kind).locator('.sp-shift-rule-row').count();
-    await select(kind,index).selectOption(shiftId);
+    await selectOption(page, select(kind,index), shiftId);
     if (maximum !== undefined) await cap(index).fill(String(maximum));
     await save(kind,index);
     await persisted(page, state => state.rules[kind]?.some(rule => rule.shiftId === shiftId && (maximum === undefined || rule.maxPerWeek === maximum)));
@@ -161,6 +167,41 @@ async function main() {
     assert.equal(await card('nonConsecutiveShifts').locator('.sp-shift-rule-row').count(), 0);
     assert.equal(await card('weeklyShiftLimits').locator('.sp-shift-rule-row').count(), 0);
     record('legacy documents have both new restrictions disabled');
+
+    const unsorted = clone(fixture);
+    unsorted.teamName = '班次下拉排序验收';
+    unsorted.shifts.reverse();
+    await importDocument(page, unsorted);
+    await add('nonConsecutiveShifts').click();
+    const firstShift = select('nonConsecutiveShifts', 1);
+    let options = await openSelect(page, firstShift);
+    assert.deepEqual(await options.getByRole('option').evaluateAll(items => items.map(item => item.getAttribute('data-value'))), ['morning', 'evening', 'night']);
+    const optionText = await options.getByRole('option').allTextContents();
+    assert.match(optionText[0], /早班[\s\S]*08:00[\s\S]*16:00/);
+    assert.match(optionText[1], /晚班[\s\S]*14:00[\s\S]*22:00/);
+    assert.match(optionText[2], /夜班[\s\S]*22:00[\s\S]*06:00/);
+    assert.match(optionText[2], /次日/);
+    await screenshot(page, 'shift-picker-desktop');
+    await page.keyboard.press('Escape');
+    await options.waitFor({ state: 'detached' });
+    assert.equal(await firstShift.evaluate(element => element === document.activeElement), true);
+    await firstShift.press('ArrowDown');
+    await page.getByRole('listbox').waitFor();
+    await page.keyboard.press('Home');
+    await page.keyboard.press('End');
+    await page.keyboard.press('ArrowUp');
+    await page.keyboard.press('Enter');
+    assert.equal(await firstShift.getAttribute('data-value'), 'evening');
+    assert.match(await firstShift.innerText(), /14:00[\s\S]*22:00/);
+    assert.equal((await currentState(page)).rules.nonConsecutiveShifts, undefined, 'Choosing an option must not save an unsaved rule');
+    options = await openSelect(page, firstShift);
+    await page.keyboard.press('End');
+    await page.keyboard.press('Escape');
+    await options.waitFor({ state: 'detached' });
+    assert.equal(await firstShift.getAttribute('data-value'), 'evening', 'Escape must discard the highlighted option');
+    await cancel('nonConsecutiveShifts', 1);
+    await importDocument(page, fixture);
+    record('shift dropdown sorts unsorted inputs by start time, shows overnight times and supports keyboard draft selection');
 
     await page.getByLabel('班间最短休息小时数', { exact: true }).fill('1');
     await page.evaluate(() => { window.qaRandomUUID = crypto.randomUUID; crypto.randomUUID = undefined; });
@@ -178,12 +219,25 @@ async function main() {
     record('both kinds add unique rules when secure-context randomUUID is unavailable');
 
     for (const kind of ['nonConsecutiveShifts','weeklyShiftLimits']) {
-      assert.equal(await select(kind,1).locator('option[value="morning"]').evaluate(option => option.disabled), true);
-      assert.equal(await select(kind,2).locator('option[value="night"]').evaluate(option => option.disabled), true);
+      for (const [index, duplicate] of [[1, 'morning'], [2, 'night']]) {
+        const list = await openSelect(page, select(kind,index));
+        const disabled = list.locator(`[role="option"][data-value="${duplicate}"]`);
+        assert.equal(await disabled.getAttribute('aria-disabled'), 'true');
+        const previous = await select(kind,index).getAttribute('data-value');
+        const bounds = await disabled.boundingBox();
+        await page.mouse.click(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+        assert.equal(await select(kind,index).getAttribute('data-value'), previous, 'A disabled duplicate cannot be picked by clicking');
+        await page.keyboard.press('Escape');
+        await list.waitFor({ state: 'detached' });
+      }
     }
-    await select('nonConsecutiveShifts',1).selectOption('evening');
+    await select('nonConsecutiveShifts',1).press('ArrowDown');
+    await page.getByRole('listbox').waitFor();
+    await page.keyboard.press('Home');
+    await page.keyboard.press('Enter');
+    assert.equal(await select('nonConsecutiveShifts',1).getAttribute('data-value'), 'evening', 'Keyboard selection skips the duplicate morning option');
     await cancel('nonConsecutiveShifts',1);
-    assert.equal(await select('nonConsecutiveShifts',1).inputValue(), 'night');
+    assert.equal(await select('nonConsecutiveShifts',1).getAttribute('data-value'), 'night');
     await cap(1).fill('4'); await save('weeklyShiftLimits',1);
     await persisted(page, state => state.rules.weeklyShiftLimits[0].maxPerWeek === 4);
     await cap(1).fill('2'); await save('weeklyShiftLimits',1);
@@ -208,7 +262,7 @@ async function main() {
     await persisted(page, state => state.rules.nonConsecutiveShifts.length === 2);
     assert.equal(await add('nonConsecutiveShifts').isEnabled(), true);
     await add('weeklyShiftLimits').click();
-    assert.equal(await select('weeklyShiftLimits',3).inputValue(), 'evening');
+    assert.equal(await select('weeklyShiftLimits',3).getAttribute('data-value'), 'evening');
     await cancel('weeklyShiftLimits',3);
     assert.equal((await currentState(page)).rules.weeklyShiftLimits.length, 2);
     record('add/delete/draft-cancel maintain distinct saved rows and available choices');
@@ -241,11 +295,11 @@ async function main() {
     await remove('nonConsecutiveShifts',1); await remove('weeklyShiftLimits',1);
     await persisted(page, state => state.rules.nonConsecutiveShifts.length === 1 && state.rules.weeklyShiftLimits.length === 1);
     await importDocument(page, backup.data);
-    assert.equal(await select('nonConsecutiveShifts',1).inputValue(), 'night');
+    assert.equal(await select('nonConsecutiveShifts',1).getAttribute('data-value'), 'night');
     assert.equal(await cap(1).inputValue(), '2');
-    await select('nonConsecutiveShifts',1).selectOption('evening'); await cap(1).fill('7');
+    await selectOption(page, select('nonConsecutiveShifts',1), 'evening'); await cap(1).fill('7');
     await importDocument(page,backup.data);
-    assert.equal(await select('nonConsecutiveShifts',1).inputValue(),'night'); assert.equal(await cap(1).inputValue(),'2');
+    assert.equal(await select('nonConsecutiveShifts',1).getAttribute('data-value'),'night'); assert.equal(await cap(1).inputValue(),'2');
     record('importing unchanged IDs/values resets unsaved drafts in both groups');
 
     const sameIds = clone(backup.data);
@@ -276,7 +330,14 @@ async function main() {
           assert.ok(box && box.x >= 0 && box.x + box.width <= width && box.height >= 44, `touch control outside ${width}px viewport: ${JSON.stringify(box)}`);
         }
         await screenshot(page, `${kind}-${width}`);
-        record(`${width}px ${kind} controls fit and have touch-sized targets`,size);
+        const list = await openSelect(page, select(kind,1));
+        const bounds = await list.boundingBox();
+        assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= width && bounds.y + bounds.height <= 844, `${width}px dropdown exceeds viewport: ${JSON.stringify(bounds)}`);
+        assert.equal(await list.evaluate(element => { const box = element.getBoundingClientRect(); return element.contains(document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2)); }), true, 'The dropdown is not clipped by the settings card');
+        await screenshot(page, `${kind}-dropdown-${width}`);
+        await page.keyboard.press('Escape');
+        await list.waitFor({ state: 'detached' });
+        record(`${width}px ${kind} controls and dropdown fit and have touch-sized targets`, { ...size, dropdown: bounds });
       }
       await cap(1).fill('3'); await cancel('weeklyShiftLimits',1);
       assert.equal(await cap(1).inputValue(), '2');
@@ -286,7 +347,7 @@ async function main() {
 
     await navigate(page,'班次设置');
     await page.getByRole('button', { name: '删除夜班', exact: true }).click();
-    await page.getByRole('button', { name: '确认删除', exact: true }).click();
+    await page.getByRole('alertdialog').getByRole('button', { name: '确认删除', exact: true }).click();
     const cleaned = await persisted(page, state => !state.shifts.some(shift => shift.id === 'night'));
     assert.deepEqual(cleaned.rules.nonConsecutiveShifts.map(rule => rule.shiftId), ['morning']);
     assert.deepEqual(cleaned.rules.weeklyShiftLimits.map(rule => rule.shiftId), ['morning']);
@@ -375,7 +436,7 @@ async function main() {
   } catch (error) {
     report.ok = false; report.failure = error.stack || String(error);
     report.failureState = await currentState(page).catch(()=>null);
-    report.failureControls = await page.locator('[data-rule-kind]').evaluateAll(cards => cards.map(card => ({ kind: card.dataset.ruleKind, rows: [...card.querySelectorAll('form')].map(row => ({ id: row.id, select: row.querySelector('select')?.value, options: [...row.querySelectorAll('option')].map(option => ({ value: option.value, disabled: option.disabled })) })) }))).catch(()=>[]);
+    report.failureControls = await page.locator('[data-rule-kind]').evaluateAll(cards => cards.map(card => ({ kind: card.dataset.ruleKind, rows: [...card.querySelectorAll('form')].map(row => ({ id: row.id, selectedShift: row.querySelector('[role="combobox"]')?.getAttribute('data-value'), expanded: row.querySelector('[role="combobox"]')?.getAttribute('aria-expanded') })) }))).catch(()=>[]);
     await screenshot(page,'failure').catch(()=>{});
     throw error;
   } finally {
@@ -506,7 +567,7 @@ async function groupRegression() {
     await page.getByLabel('班间最短休息小时数',{exact:true}).fill('2');
     await page.getByLabel('最大连续工作天数',{exact:true}).fill('4');
     await page.getByRole('button',{name:'添加班次不相连规则',exact:true}).click();
-    await page.getByLabel('第 1 条不相连规则班次',{exact:true}).selectOption('night');
+    await selectOption(page, page.getByRole('combobox',{name:'第 1 条不相连规则班次',exact:true}), 'night');
     await team().click();
     await page.getByLabel('启用上班权重',{exact:true}).check();
     await page.getByLabel('所选星期合计占比',{exact:true}).fill('40');
@@ -516,7 +577,7 @@ async function groupRegression() {
     await personal().click();
     assert.equal(await page.getByLabel('班间最短休息小时数',{exact:true}).inputValue(),'2');
     assert.equal(await page.getByLabel('最大连续工作天数',{exact:true}).inputValue(),'4');
-    assert.equal(await page.getByLabel('第 1 条不相连规则班次',{exact:true}).inputValue(),'night');
+    assert.equal(await page.getByRole('combobox',{name:'第 1 条不相连规则班次',exact:true}).getAttribute('data-value'),'night');
     record('team save leaves personal basic and new-row drafts uncommitted and intact');
     await page.getByRole('button',{name:'保存个人规则',exact:true}).click();
     const second = await persisted(page,state=>state.rules.minRestHours===2&&state.rules.maxConsecutiveDays===4);
@@ -544,14 +605,14 @@ async function groupRegression() {
     record('disabling team weights does not overwrite personal rules or cross-save pending changes');
 
     await personal().click();await page.getByRole('button',{name:'添加周班次限制规则',exact:true}).click();
-    await page.getByLabel('第 1 条周次数规则班次',{exact:true}).selectOption('night');
+    await selectOption(page, page.getByRole('combobox',{name:'第 1 条周次数规则班次',exact:true}), 'night');
     await team().click();await page.getByRole('button',{name:/添加互斥组/}).click();
     await page.getByLabel('规则名称',{exact:true}).fill('测试错班');
     await page.locator('.sp-settings-member-options input').nth(0).check();await page.locator('.sp-settings-member-options input').nth(1).check();
     await page.getByRole('button',{name:'保存互斥组',exact:true}).click();
     const sixth = await persisted(page,state=>state.rules.separationGroups?.[0].name==='测试错班');
     assert.equal(sixth.rules.weeklyShiftLimits,undefined);
-    await personal().click();assert.equal(await page.getByLabel('第 1 条周次数规则班次',{exact:true}).inputValue(),'night');
+    await personal().click();assert.equal(await page.getByRole('combobox',{name:'第 1 条周次数规则班次',exact:true}).getAttribute('data-value'),'night');
     await page.getByRole('button',{name:'保存第 1 条周次数规则',exact:true}).click();
     const seventh = await persisted(page,state=>state.rules.weeklyShiftLimits?.[0].shiftId==='night');
     assert.deepEqual(seventh.rules.separationGroups,sixth.rules.separationGroups);

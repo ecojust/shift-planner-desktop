@@ -5,6 +5,8 @@ import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import MonthPicker from './MonthPicker.vue'
+import AppSelect from './AppSelect.vue'
+import ConfirmDialog from './ConfirmDialog.vue'
 import { makeDefaultState } from './defaults'
 import { datesOfMonth, shiftHours, validateSchedule } from './scheduler'
 import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP_BYTES } from './storage'
@@ -42,6 +44,9 @@ const showIssues = ref(false)
 const showBackup = ref(false)
 const showGenerate = ref(false)
 const showHelp = ref(false)
+const monthDeletion = ref<{ month: string; count: number; revision: number } | null>(null)
+const deleteMonthButton = ref<HTMLButtonElement | null>(null)
+const cancelMonthDeletionButton = ref<HTMLButtonElement | null>(null)
 const generating = ref(false)
 const cancelling = ref(false)
 const solveTimeLimit = ref(15)
@@ -72,7 +77,8 @@ const importCandidate = ref<Document | null>(null)
 const editing = ref<{ employee: Employee; date: string; shiftId: string; locked: boolean } | null>(null)
 const calendarDate = ref('')
 const calendarKind = ref<DayKind>('workday')
-const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]> }[]>([])
+const calendarReset = ref<{ date: string; revision: number } | null>(null)
+const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]>; source: string }[]>([])
 const savedAt = ref('')
 const navigation: { key: Section; label: string; icon: string }[] = [
   { key: 'calendar', label: '排班日历', icon: 'calendar' }, { key: 'team', label: '成员管理', icon: 'people' },
@@ -87,6 +93,7 @@ const groups = computed(() => [...new Set(state.value.employees.map(e => e.group
 const employees = computed(() => state.value.employees.filter(e => (!groupFilter.value || e.group === groupFilter.value) && `${e.name}${e.role}`.includes(employeeQuery.value.trim())))
 const assignments = computed(() => new Map(state.value.assignments.map(a => [`${a.employeeId}:${a.date}`, a])))
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
+const monthEntryCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(`${state.value.month}-`)).length)
 const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
 const payrollCalculation = computed<{ result: PayrollResult; error: string }>(() => {
   try { return { result: calculatePayroll(state.value, { payroll: state.value.payroll, calendar: state.value.calendar }), error: '' } }
@@ -110,6 +117,7 @@ const dayAllowances = computed(() => new Map(payroll.value.dailyRows.map(row => 
 const employeeAllowances = computed(() => new Map(payroll.value.rows.map(row => [row.employeeId, row])))
 const filteredAllowanceTotal = computed(() => employees.value.reduce((sum, employee) => sum + Math.round((employeeAllowances.value.get(employee.id)?.totalAllowance ?? 0) * 100), 0) / 100)
 const monthTitle = computed(() => `${state.value.month.slice(0, 4)} 年 ${Number(state.value.month.slice(5))} 月`)
+const deletionMonthTitle = computed(() => monthDeletion.value ? `${monthDeletion.value.month.slice(0, 4)} 年 ${Number(monthDeletion.value.month.slice(5))} 月` : '')
 const period = computed(() => view.value === 'month' ? '整月总览' : `${Number(visibleDates.value[0]?.slice(8))} 日 — ${Number(visibleDates.value.at(-1)?.slice(8))} 日`)
 
 function info(date: string) { return dayInfo(date, state.value.calendar) }
@@ -139,8 +147,36 @@ function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) }
 // Request correlation does not require a secure-context-only randomUUID API.
 function solverRequestId() { return `${Array.from(crypto.getRandomValues(new Uint8Array(12)), value => value.toString(16).padStart(2, '0')).join('')}-${Date.now()}` }
 function flash(message: string) { notice.value = formatUserMessage(message); window.clearTimeout(noticeTimer); noticeTimer = window.setTimeout(() => notice.value = '', 5500) }
-function remember() { history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])) }); if (history.value.length > 10) history.value.shift() }
-function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; flash('已撤销上一次排班调整') } }
+function remember() { history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value }); if (history.value.length > 10) history.value.shift() }
+function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; scheduleSource.value = previous.source; solverFeedback.value = null; expandedFeedback.value = false; flash('已撤销上一次排班调整') } }
+function requestMonthDeletion() {
+  if (generating.value || !monthEntryCount.value) return
+  monthDeletion.value = { month: state.value.month, count: monthEntryCount.value, revision }
+}
+function closeMonthDeletion(restoreFocus = true) {
+  monthDeletion.value = null
+  if (!restoreFocus) return
+  void nextTick(() => {
+    if (disposed || generating.value || monthDeletion.value) return
+    const target = deleteMonthButton.value && !deleteMonthButton.value.disabled ? deleteMonthButton.value : document.querySelector<HTMLElement>('.sp-calendar-card')
+    target?.focus({ preventScroll: true })
+  })
+}
+function confirmMonthDeletion() {
+  const target = monthDeletion.value
+  if (!target) return
+  if (generating.value || target.month !== state.value.month || target.revision !== revision) { closeMonthDeletion(false); return }
+  const remaining = state.value.assignments.filter(assignment => !assignment.date.startsWith(`${target.month}-`))
+  if (remaining.length === state.value.assignments.length) { closeMonthDeletion(); return }
+  const title = deletionMonthTitle.value
+  remember()
+  closeMonthDeletion()
+  state.value.assignments = remaining
+  solverFeedback.value = null; expandedFeedback.value = false; activeAttempt = null
+  showIssues.value = false; editing.value = null; calendarDate.value = ''
+  scheduleSource.value = `${title}排班已删除`
+  flash(`已删除 ${title}的 ${target.count} 条排班记录，可撤销上次调整恢复。`)
+}
 function chooseSection(value: Section) { section.value = value; mobileNav.value = false }
 function changeMonth(value: string) { if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value) || Number(value.slice(0, 4)) < 1) return; state.value.month = value; weekIndex.value = 0; history.value = [] }
 function navigateMonth(direction: number) {
@@ -165,7 +201,19 @@ function saveCell() {
   flash(conflict ? `已保存，请处理冲突：${conflict.message}` : '班次已更新，锁定班次会在重新生成时保留')
 }
 function openDate(date: string) { calendarDate.value = date; calendarKind.value = info(date).kind }
-function saveCalendar(reset = false) { if (reset) delete state.value.calendar[calendarDate.value]; else state.value.calendar[calendarDate.value] = calendarKind.value; calendarDate.value = ''; flash('日期类型已更新，自动月参考工时已重新计算；津贴按排班领取固定金额') }
+function saveCalendar() { state.value.calendar[calendarDate.value] = calendarKind.value; calendarDate.value = ''; flash('日期类型已更新，自动月参考工时已重新计算；津贴按排班领取固定金额') }
+function requestCalendarReset() {
+  if (generating.value || !Object.hasOwn(state.value.calendar, calendarDate.value)) return
+  calendarReset.value = { date: calendarDate.value, revision }
+}
+function confirmCalendarReset() {
+  const target = calendarReset.value
+  calendarReset.value = null
+  if (!target || generating.value || target.revision !== revision || target.date !== calendarDate.value) return
+  delete state.value.calendar[target.date]
+  calendarDate.value = ''
+  flash(`${target.date} 已恢复默认日期类型，自动月参考工时已重新计算。`)
+}
 let worker: Worker | null = null
 let workerTimer = 0
 let revision = 0
@@ -366,7 +414,7 @@ function confirmImport() { if (!importCandidate.value) return; state.value = imp
 function jumpToIssue(date?: string) { if (!date) return; if (!date.startsWith(state.value.month)) changeMonth(date.slice(0, 7)); weekIndex.value = weekOf(date); view.value = 'week' }
 let noticeTimer = 0
 let saveTimer = 0
-watch(state, () => { revision++; if (solverFeedback.value && !solverFeedback.value.success) solverFeedback.value.stale = true; window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
+watch(state, () => { revision++; if (monthDeletion.value) closeMonthDeletion(false); calendarReset.value = null; if (solverFeedback.value && !solverFeedback.value.success) solverFeedback.value.stale = true; window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
   if (saveError.value.startsWith('原有数据读取失败')) return
   try { saveLocal(state.value); savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); saveError.value = '' }
   catch { saveError.value = '自动保存失败，请导出 JSON 备份，避免刷新丢失。' }
@@ -379,6 +427,7 @@ function flushSave() {
   if (!saveError.value.startsWith('原有数据读取失败')) { try { saveLocal(state.value) } catch { /* The visible save warning covers storage errors. */ } }
 }
 function escapeKey(event: KeyboardEvent) {
+  if (event.key === 'Escape' && monthDeletion.value) { event.preventDefault(); closeMonthDeletion(); return }
   if (event.key === 'Escape' && showGenerate.value && generating.value) { event.preventDefault(); return }
   if (event.key === 'Escape') { editing.value = null; calendarDate.value = ''; showGenerate.value = false; showBackup.value = false; showHelp.value = false; importCandidate.value = null; mobileNav.value = false }
   if (event.key === 'Tab') {
@@ -394,6 +443,9 @@ function escapeKey(event: KeyboardEvent) {
 onMounted(() => { if (desktop) void checkEngine(); document.title = 'Shift Schedule Expert'; window.addEventListener('keydown', escapeKey); window.addEventListener('pagehide', flushSave) })
 onUnmounted(() => { disposed = true; unlistenProgress?.(); unlistenProgress = null; if (activeRequestId) void cancelDesktop(activeRequestId).catch(() => {}); window.clearInterval(generationTimer); flushSave(); window.removeEventListener('keydown', escapeKey); window.removeEventListener('pagehide', flushSave); worker?.terminate(); window.clearTimeout(workerTimer); window.clearTimeout(saveTimer); window.clearTimeout(noticeTimer) })
 watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidate], async () => { await nextTick(); (document.querySelector('.sp-modal input, .sp-modal select, .sp-modal button') as HTMLElement | null)?.focus() })
+watch(monthDeletion, async target => { if (target) { await nextTick(); cancelMonthDeletionButton.value?.focus({ preventScroll: true }) } })
+watch([generating, section, importCandidate], () => { if (monthDeletion.value) closeMonthDeletion(false); calendarReset.value = null }, { flush: 'sync' })
+watch(calendarDate, () => { calendarReset.value = null }, { flush: 'sync' })
 watch([generating, cancelling], async () => {
   await nextTick()
   if (!showGenerate.value || !generating.value) return
@@ -458,9 +510,9 @@ watch([generating, cancelling], async () => {
           <section class="sp-calendar-card" aria-label="人员排班表" tabindex="-1">
             <div class="sp-calendar-toolbar">
               <div class="sp-date-controls"><span class="sp-month-label"><Icon name="calendar" :size="19" /><span>{{ monthTitle }}</span></span><div v-if="view === 'week'" class="sp-arrows"><button class="sp-icon-button" aria-label="上一时段" title="本月上一周" :disabled="weekIndex === 0" @click="navigatePeriod(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button><button class="sp-icon-button" aria-label="下一时段" title="本月下一周" :disabled="weekIndex >= weekCount - 1" @click="navigatePeriod(1)"><Icon name="arrow" :size="16" /></button></div><span class="sp-period">{{ period }}</span></div>
-              <div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div>
+              <div class="sp-calendar-actions"><div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div><button ref="deleteMonthButton" type="button" class="sp-icon-button sp-delete-month" aria-label="删除本月排班" :title="`删除 ${monthTitle}的排班`" :disabled="generating || !monthEntryCount" @click="requestMonthDeletion"><Icon name="trash" :size="18" /></button></div>
             </div>
-            <div class="sp-filterbar"><div class="sp-filters"><label class="sp-search"><Icon name="search" :size="16" /><input v-model="employeeQuery" placeholder="搜索成员" aria-label="搜索成员" /></label><select v-model="groupFilter" aria-label="按工作组筛选"><option value="">全部工作组</option><option v-for="g in groups" :key="g" :value="g">{{ g }}</option></select></div><div class="sp-legend"><span v-for="s in state.shifts" :key="s.id"><i :style="{ background: s.color }"></i>{{ s.name }}</span><span><i class="sp-leave-dot"></i>请假</span><button class="sp-icon-button" :disabled="!history.length" aria-label="撤销上次调整" @click="undo"><Icon name="undo" :size="16" /></button></div></div>
+            <div class="sp-filterbar"><div class="sp-filters"><label class="sp-search"><Icon name="search" :size="16" /><input v-model="employeeQuery" placeholder="搜索成员" aria-label="搜索成员" /></label><AppSelect v-model="groupFilter" class="sp-group-filter" label="按工作组筛选" :options="[{ value: '', label: '全部工作组' }, ...groups.map(group => ({ value: group, label: group }))]" /></div><div class="sp-legend"><span v-for="s in state.shifts" :key="s.id"><i :style="{ background: s.color }"></i>{{ s.name }}</span><span><i class="sp-leave-dot"></i>请假</span><button class="sp-icon-button" :disabled="!history.length" aria-label="撤销上次调整" @click="undo"><Icon name="undo" :size="16" /></button></div></div>
             <div class="sp-table-scroll" tabindex="0" aria-label="可横向滚动的排班表">
               <table class="sp-schedule-table" :class="{ 'sp-month-table': view === 'month' }">
                 <thead><tr>
@@ -505,9 +557,21 @@ watch([generating, cancelling], async () => {
     <input v-if="!desktop" ref="importer" class="sp-hidden" type="file" accept=".json,application/json" @change="selectImport" />
     <div v-if="notice" class="sp-toast" role="status"><Icon name="info" :size="18" />{{ notice }}<button aria-label="关闭提示" @click="notice = ''"><Icon name="close" :size="15" /></button></div>
 
+    <div v-if="monthDeletion" class="sp-overlay" @click.self="closeMonthDeletion()">
+      <section class="sp-modal sp-delete-month-modal" role="dialog" aria-modal="true" aria-labelledby="sp-delete-month-title" aria-describedby="sp-delete-month-description">
+        <div class="sp-modal-heading"><h2 id="sp-delete-month-title">删除 {{ deletionMonthTitle }}排班？</h2><button type="button" class="sp-icon-button" aria-label="关闭删除排班确认" @click="closeMonthDeletion()"><Icon name="close" /></button></div>
+        <p id="sp-delete-month-description" class="sp-modal-copy">将删除该月的 <strong>{{ monthDeletion.count }} 条</strong>排班记录，包括其中已锁定的安排和休息记录。</p>
+        <p class="sp-modal-copy">按班次开始日期归属月份，跨夜班也归入开始的月份。请假日期、成员、班次、规则和其他月份的排班均保留。</p>
+        <p class="sp-modal-note">删除后可以通过排班表中的“撤销上次调整”恢复。</p>
+        <div class="sp-modal-actions"><button ref="cancelMonthDeletionButton" type="button" class="sp-button" @click="closeMonthDeletion()">取消</button><button type="button" class="sp-button sp-delete-month-confirm" :disabled="generating" @click="confirmMonthDeletion">确认删除</button></div>
+      </section>
+    </div>
+
+    <ConfirmDialog v-if="calendarReset" :title="`恢复 ${calendarReset.date} 的默认日期类型？`" description="将删除这一天的手动日期设置，恢复系统日历判定；可能改变所在月份的自动参考工时。已有排班保持不变。" confirm-label="确认恢复" @cancel="calendarReset = null" @confirm="confirmCalendarReset" />
+
     <div v-if="editing" class="sp-overlay" @click.self="editing = null"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-edit-title"><div class="sp-modal-heading"><div><h2 id="sp-edit-title">调整班次</h2><p>{{ editing.employee.name }} · {{ editing.date }} · 周{{ weekday(editing.date) }}</p></div><button class="sp-icon-button" aria-label="关闭班次编辑" @click="editing = null"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="s in state.shifts" :key="s.id" :disabled="!editing.employee.eligibleShiftIds.includes(s.id)" :class="{ selected: editing.shiftId === s.id }" @click="editing.shiftId = s.id"><span class="sp-shift-swatch" :style="{ background: s.color }">{{ s.shortName }}</span><span><strong>{{ s.name }}</strong><small>{{ s.start }}–{{ s.end }} · {{ shiftHours(s) }} 小时{{ editing.employee.eligibleShiftIds.includes(s.id) ? '' : ' · 未获得该班资格' }}</small></span><Icon v-if="editing.shiftId === s.id" name="check" /></button><button :class="{ selected: editing.shiftId === 'off' }" @click="editing.shiftId = 'off'"><span class="sp-shift-swatch">休</span><span><strong>安排休息</strong><small>锁定后，自动排班不会占用这一天</small></span></button><button :class="{ selected: editing.shiftId === 'leave' }" @click="editing.shiftId = 'leave'"><span class="sp-shift-swatch sp-leave-swatch">假</span><span><strong>全天请假</strong><small>作为不可排班日期保存</small></span></button></div><div class="sp-edit-allowance" role="note"><strong>已保存排班的当日津贴</strong><p>{{ allowanceDescription(editing.employee.id, editing.date) }}</p><small>保存班次调整后会重新计算。</small></div><label v-if="editing.shiftId !== 'leave'" class="sp-lock-toggle"><input v-model="editing.locked" type="checkbox" /><Icon name="lock" :size="15" /><span>锁定本次安排，重新排班时保留</span></label><div class="sp-modal-actions"><button class="sp-button" @click="editing = null">取消</button><button class="sp-button sp-primary" @click="saveCell">保存安排</button></div></section></div>
 
-    <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" @click="saveCalendar(true)">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
+    <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" :disabled="!Object.hasOwn(state.calendar, calendarDate)" @click="requestCalendarReset">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
 
     <div v-if="showGenerate" class="sp-overlay" @click.self="!generating && (showGenerate = false)">
       <section class="sp-modal sp-generate-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title" tabindex="-1">
@@ -533,14 +597,14 @@ watch([generating, cancelling], async () => {
           <details class="sp-generation-advanced"><summary>高级选项<span>最长等待 {{ solveTimeLimit }} 秒</span></summary>
             <div class="sp-solver-options">
               <div class="sp-solver-time">
-                <div class="sp-solver-time-caption"><label for="sp-solve-time-limit">最长等待时间</label><InfoTip label="最长等待时间说明">
+                <div class="sp-solver-time-caption"><span>最长等待时间</span><InfoTip label="最长等待时间说明">
                   <strong>给排班搜索多少时间？</strong>
                   <p>这是搜索和优化排班的时间上限，提前完成会提前返回。启动和结果校验还需额外时间。</p>
                   <p>延长时间可能找到更均衡的工时和班次分配，但不保证结果更好，15 秒与 60 秒也可能得到相同结果。</p>
                   <p>休息间隔、连续工作天数等规则始终必须满足；延长时间不会放宽规则，也无法解决规则本身的冲突。</p>
                   <p>建议先用 15 秒；提示暂未找到方案时，再试 60 秒。</p>
                 </InfoTip></div>
-                <select id="sp-solve-time-limit" v-model.number="solveTimeLimit" aria-label="最长等待时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select>
+                <AppSelect class="sp-solve-time-select" :model-value="String(solveTimeLimit)" label="最长等待时间" :options="[5,15,30,60].map(seconds => ({ value: String(seconds), label: `${seconds} 秒` }))" @update:model-value="solveTimeLimit = Number($event)" />
               </div>
             </div>
           </details>

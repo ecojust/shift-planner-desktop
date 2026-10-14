@@ -49,6 +49,7 @@ async function main() {
   async function ready(){await page.waitForFunction(()=>!document.querySelector('.sp-employee-dialog footer button[type=submit]')?.disabled)}
   async function put(file){await upload().setInputFiles(file);await ready();assert.equal(await dialog().getByRole('alert').count(),0);return source()}
   async function save(){await dialog().getByRole('button',{name:'保存人员',exact:true}).click();await dialog().waitFor({state:'hidden'})}
+  async function removeAvatar(){await dialog().getByRole('button',{name:'移除头像',exact:true}).click();const confirmation=page.getByRole('alertdialog',{name:'移除头像？',exact:true});await confirmation.getByRole('button',{name:'确认移除',exact:true}).click();await confirmation.waitFor({state:'detached'})}
   async function screenshot(name){const file=path.join(output,name+'.png');await page.screenshot({path:file,fullPage:false});report.screenshots.push(file)}
   async function width(){const s=await page.evaluate(()=>({width:innerWidth,html:document.documentElement.scrollWidth,body:document.body.scrollWidth}));assert.ok(s.html<=s.width&&s.body<=s.width,JSON.stringify(s));return s}
   async function download(button,file){const pending=page.waitForEvent('download');await button.click();const item=await pending;const target=path.join(output,file);await item.saveAs(target);return JSON.parse(await fs.readFile(target,'utf8'))}
@@ -96,8 +97,9 @@ async function main() {
     await edit();const webpThumb=await put(webp);assert.notEqual(webpThumb,jpegThumb);await checkThumb(webpThumb);await save();await persisted(s=>s.employees[0].avatar===webpThumb)
     record('JPEG and WebP replacements are stored as bounded square JPEG thumbnails')
 
-    await edit();await dialog().getByRole('button',{name:'移除头像',exact:true}).click();assert.equal(await preview().count(),0);await page.keyboard.press('Escape');assert.equal((await state()).employees[0].avatar,webpThumb)
-    await edit();await dialog().getByRole('button',{name:'移除头像',exact:true}).click();await save();await persisted(s=>s.employees[0].avatar==null)
+    await edit();await dialog().getByRole('button',{name:'移除头像',exact:true}).click();await page.getByRole('alertdialog',{name:'移除头像？',exact:true}).getByRole('button',{name:'保留头像',exact:true}).click();assert.equal(await source(),webpThumb)
+    await removeAvatar();assert.equal(await preview().count(),0);await page.keyboard.press('Escape');assert.equal((await state()).employees[0].avatar,webpThumb)
+    await edit();await removeAvatar();await save();await persisted(s=>s.employees[0].avatar==null)
     assert.equal(await member('测试成员甲').locator('.sp-settings-avatar img').count(),0)
     assert.equal(await member('测试成员甲').locator('.sp-avatar-initials').innerText(),'员甲')
     record('avatar removal is cancellable and only committed when the profile is saved')
@@ -128,7 +130,7 @@ async function main() {
     record('out-of-order image decoding keeps the last selected picture and blocks premature save')
 
     await edit();await page.evaluate(()=>{window.qaHoldBitmaps=true});await upload().setInputFiles({...png,name:'removed-red.png'});await page.waitForFunction(()=>window.qaHeldBitmaps.some(job=>job.name==='removed-red.png'))
-    await dialog().getByRole('button',{name:'移除头像',exact:true}).click();await ready();assert.equal(await preview().count(),0)
+    await removeAvatar();await ready();assert.equal(await preview().count(),0)
     await page.evaluate(()=>window.qaReleaseBitmap('removed-red.png'));await page.waitForFunction(()=>window.qaBitmapCompleted.includes('removed-red.png'));assert.equal(await preview().count(),0)
     await page.evaluate(()=>{window.qaHoldBitmaps=false});await save();await persisted(s=>s.employees[0].avatar==null)
     record('removing during image processing prevents a late result from restoring the image')
@@ -142,7 +144,7 @@ async function main() {
     await page.getByRole('button',{name:'备份与恢复',exact:true}).click()
     const backup=await download(page.getByRole('button',{name:/^导出完整备份/}),'avatar-backup.json')
     assert.equal(backup.employees[0].avatar,webpThumb);assert.deepEqual(backup.rules,fixture.rules)
-    await edit();await dialog().getByRole('button',{name:'移除头像',exact:true}).click();await save();await persisted(s=>s.employees[0].avatar==null)
+    await edit();await removeAvatar();await save();await persisted(s=>s.employees[0].avatar==null)
     await importDocument(backup);assert.equal(await member('测试成员甲').locator('.sp-settings-avatar img').getAttribute('src'),webpThumb)
     record('full JSON backup export and reimport preserve uploaded avatars and rules')
 

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
 import type { Employee } from './domain.ts'
+import ConfirmDialog from './ConfirmDialog.vue'
 
 const props = defineProps<{ employee: Employee; initialMonth: string }>()
 const emit = defineEmits<{ save: [dates: string[]]; close: [] }>()
@@ -25,6 +26,7 @@ function civilDate(value: string) { return new Date(`${value}T00:00:00Z`) }
 const initialMonth = validMonth(props.initialMonth) ? props.initialMonth : new Date().toISOString().slice(0, 7)
 const month = ref(initialMonth)
 const selected = ref(new Set(props.employee.unavailableDates))
+const pendingRemoval = ref<{ kind: 'date'; date: string } | { kind: 'month'; month: string; count: number } | null>(null)
 const focusedDate = ref(`${initialMonth}-01`)
 const monthLabel = computed(() => `${Number(month.value.slice(0, 4))} 年 ${Number(month.value.slice(5))} 月`)
 const firstWeekday = computed(() => (civilDate(`${month.value}-01`).getUTCDay() + 6) % 7)
@@ -57,7 +59,7 @@ function stepMonth(direction: number) {
 }
 function toggleDate(date: string) {
   focusedDate.value = date
-  if (selected.value.has(date)) selected.value.delete(date)
+  if (selected.value.has(date)) { pendingRemoval.value = { kind: 'date', date }; return }
   else {
     if (selected.value.size >= maxDates) { error.value = `每位成员累计最多设置 ${maxDates} 天请假，请先移除不再需要的日期。`; return }
     selected.value.add(date)
@@ -65,9 +67,28 @@ function toggleDate(date: string) {
   error.value = ''
 }
 function clearMonth() {
-  selected.value = new Set([...selected.value].filter(date => !date.startsWith(`${month.value}-`)))
+  if (monthCount.value) pendingRemoval.value = { kind: 'month', month: month.value, count: monthCount.value }
+}
+function confirmRemoval() {
+  const pending = pendingRemoval.value
+  pendingRemoval.value = null
+  if (!pending) return
+  if (pending.kind === 'date') {
+    if (!selected.value.has(pending.date)) return
+    selected.value = new Set([...selected.value].filter(date => date !== pending.date))
+  } else {
+    if (pending.month !== month.value || pending.count !== monthCount.value) return
+    selected.value = new Set([...selected.value].filter(date => !date.startsWith(`${pending.month}-`)))
+  }
   error.value = ''
 }
+const removalDescription = computed(() => {
+  const pending = pendingRemoval.value
+  if (!pending) return ''
+  const change = pending.kind === 'date' ? `将取消 ${props.employee.name} 在 ${pending.date} 的请假。` : `将清空 ${props.employee.name} 在 ${Number(pending.month.slice(0, 4))} 年 ${Number(pending.month.slice(5))} 月的 ${pending.count} 天请假，保留其他月份。`
+  return `${change}本次仅修改编辑内容，点击“保存请假”后才会生效；已有排班会保留。`
+})
+watch([selected, month, () => props.employee, () => props.initialMonth], () => { pendingRemoval.value = null }, { deep: true, flush: 'sync' })
 function dateLabel(date: string) {
   const weekday = weekdays[(civilDate(date).getUTCDay() + 6) % 7]
   return `${date} 星期${weekday}，${selected.value.has(date) ? '已请假' : '未请假'}`
@@ -86,6 +107,7 @@ async function navigateDate(event: KeyboardEvent, value: string) {
   dialog.value?.querySelector<HTMLButtonElement>(`[data-leave-date="${nextDate}"]`)?.focus()
 }
 function save() {
+  if (pendingRemoval.value) return
   const dates = [...selected.value].sort()
   if (dates.length > maxDates || dates.some(date => !validDate(date))) {
     error.value = `请假日期必须为有效日期，累计最多 ${maxDates} 天。`
@@ -102,6 +124,7 @@ function focusableElements() {
     .filter(element => element.tabIndex >= 0 && element.getClientRects().length > 0 && !element.closest('[inert]'))
 }
 function onKeydown(event: KeyboardEvent) {
+  if (pendingRemoval.value) return
   if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); emit('close'); return }
   if (event.key !== 'Tab') return
   // Keep this dialog's tab order independent of the application's other dialogs.
@@ -116,7 +139,7 @@ function onKeydown(event: KeyboardEvent) {
   }
 }
 function containFocus(event: FocusEvent) {
-  if (mounted && dialog.value && !dialog.value.contains(event.target as Node)) closeButton.value?.focus()
+  if (!pendingRemoval.value && mounted && dialog.value && !dialog.value.contains(event.target as Node)) closeButton.value?.focus()
 }
 onMounted(() => {
   mounted = true
@@ -139,10 +162,10 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <div class="sp-leave-backdrop" @click.self="emit('close')">
-      <section ref="dialog" class="sp-leave-dialog" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-describedby="descriptionId" tabindex="-1">
+    <div class="sp-leave-backdrop" @click.self="!pendingRemoval && emit('close')">
+      <section ref="dialog" class="sp-leave-dialog" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-describedby="descriptionId" :inert="!!pendingRemoval" :aria-hidden="pendingRemoval ? true : undefined" tabindex="-1">
         <header class="sp-leave-heading">
-          <div><h2 :id="titleId">{{ employee.name }} · 请假日历</h2><p :id="descriptionId">点击日期设置全天请假，再次点击取消。</p></div>
+          <div><h2 :id="titleId">{{ employee.name }} · 请假日历</h2><p :id="descriptionId">点击日期设置全天请假，再次点击并确认后取消。</p></div>
           <button ref="closeButton" type="button" class="sp-leave-icon-button" aria-label="关闭请假日历" @click="emit('close')"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" /></svg></button>
         </header>
 
@@ -173,6 +196,7 @@ onBeforeUnmount(() => {
       </section>
     </div>
   </Teleport>
+  <ConfirmDialog v-if="pendingRemoval" :title="pendingRemoval.kind === 'date' ? '取消该日请假？' : '清空本月请假？'" :description="removalDescription" :confirm-label="pendingRemoval.kind === 'date' ? '确认取消请假' : '确认清空'" cancel-label="保留请假" @confirm="confirmRemoval" @cancel="pendingRemoval = null" />
 </template>
 
 <style scoped>

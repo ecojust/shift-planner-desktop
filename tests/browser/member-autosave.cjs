@@ -405,8 +405,11 @@ async function main() {
     assert.deepEqual((await member()).unavailableDates, replacement.employees[0].unavailableDates)
     record('import-with-same-member-id-cancels-old-pending-draft-and-timer')
 
+    // Begin the edit while the card is interactive. The confirmation is modal,
+    // so deletion must never rely on injecting input into its inert background.
+    await minWeek().fill('30')
     await page.getByRole('button', { name: `删除${firstName}`, exact: true }).click()
-    await inputThen(`${firstName}每周最低工时`, '30', { button: '确认删除' })
+    await page.getByRole('alertdialog').getByRole('button', { name: '确认删除', exact: true }).click()
     await persisted(value => !value.employees.some(employee => employee.id === 'qa-1'))
     await page.waitForTimeout(settleMs)
     assert.equal((await state()).employees.some(employee => employee.id === 'qa-1'), false)

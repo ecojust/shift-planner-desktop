@@ -14,6 +14,7 @@ const paths: Record<string, string> = {
   shield: 'm12 2 9 4v6c0 6-9 10-9 10S3 18 3 12V6l9-4Zm-5 10 3 3 7-7',
   search: 'm21 21-5-5M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0Z',
   close: 'm6 6 12 12M6 18 18 6',
+  trash: 'M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7m4-7v7',
   lock: 'M7 10V7a5 5 0 0 1 10 0v3M5 10h14v12H5V10Zm7 5v3',
   undo: 'M3 10h11a7 7 0 0 1 0 14M3 10l6-6M3 10l6 6',
   info: 'M12 11v6m0-10h.01M22 12a10 10 0 1 1-20 0 10 10 0 0 1 20 0Z',

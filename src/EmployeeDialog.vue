@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, useId } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, useId, watch } from 'vue'
 import type { Employee } from './domain.ts'
 import { createAvatarThumbnail } from './avatar.ts'
+import ConfirmDialog from './ConfirmDialog.vue'
 
 const props = defineProps<{ employee: Employee; error?: string }>()
 const emit = defineEmits<{ save: [profile: { name: string; role: string; group: string; avatarChanged: boolean; avatar: string | null }]; close: [] }>()
@@ -15,6 +16,7 @@ const avatarLoading = ref(false)
 const avatarError = ref('')
 const avatarBroken = ref(false)
 const avatarInitials = computed(() => Array.from(draft.name.trim()).slice(-2).join(''))
+const pendingAvatarRemoval = ref<{ request: number; avatar: string | null; loading: boolean } | null>(null)
 let avatarRequest = 0
 async function selectAvatar(event: Event) {
   const input = event.target as HTMLInputElement, file = input.files?.[0]
@@ -30,8 +32,19 @@ async function selectAvatar(event: Event) {
     if (mounted && request === avatarRequest) avatarError.value = error instanceof Error ? error.message : '头像处理失败，请重新选择图片。'
   } finally { if (mounted && request === avatarRequest) avatarLoading.value = false }
 }
-function removeAvatar() { avatarRequest++; avatar.value = null; avatarChanged.value = true; avatarLoading.value = false; avatarError.value = ''; avatarBroken.value = false }
-function save() { if (!avatarLoading.value) emit('save', { ...draft, avatarChanged: avatarChanged.value, avatar: avatar.value }) }
+function requestAvatarRemoval() {
+  pendingAvatarRemoval.value = { request: avatarRequest, avatar: avatar.value, loading: avatarLoading.value }
+}
+function removeAvatar() {
+  const pending = pendingAvatarRemoval.value
+  pendingAvatarRemoval.value = null
+  if (!pending || pending.request !== avatarRequest || pending.avatar !== avatar.value || pending.loading !== avatarLoading.value) return
+  avatarRequest++; avatar.value = null; avatarChanged.value = true; avatarLoading.value = false; avatarError.value = ''; avatarBroken.value = false
+}
+// Opening or cancelling confirmation must not cancel an upload in progress.
+// A newly resolved image or changed member makes an older confirmation stale.
+watch([avatar, avatarLoading, () => props.employee], () => { pendingAvatarRemoval.value = null }, { deep: true, flush: 'sync' })
+function save() { if (!avatarLoading.value && !pendingAvatarRemoval.value) emit('save', { ...draft, avatarChanged: avatarChanged.value, avatar: avatar.value }) }
 let opener: HTMLElement | null = null
 let previousOverflow = ''
 let mounted = false
@@ -39,6 +52,7 @@ function focusables() {
   return [...(dialog.value?.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),[tabindex]') ?? [])].filter(element => element.tabIndex >= 0 && element.getClientRects().length > 0)
 }
 function keydown(event: KeyboardEvent) {
+  if (pendingAvatarRemoval.value) return
   if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); emit('close'); return }
   if (event.key !== 'Tab') return
   event.stopPropagation()
@@ -47,7 +61,7 @@ function keydown(event: KeyboardEvent) {
   if (event.shiftKey && (document.activeElement === first || !dialog.value?.contains(document.activeElement))) { event.preventDefault(); last.focus() }
   else if (!event.shiftKey && (document.activeElement === last || !dialog.value?.contains(document.activeElement))) { event.preventDefault(); first.focus() }
 }
-function containFocus(event: FocusEvent) { if (mounted && dialog.value && !dialog.value.contains(event.target as Node)) nameInput.value?.focus() }
+function containFocus(event: FocusEvent) { if (!pendingAvatarRemoval.value && mounted && dialog.value && !dialog.value.contains(event.target as Node)) nameInput.value?.focus() }
 onMounted(() => {
   mounted = true
   opener = document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -66,13 +80,13 @@ onBeforeUnmount(() => {
 
 <template>
   <Teleport to="body">
-    <div class="sp-employee-backdrop" @click.self="emit('close')">
-      <form ref="dialog" class="sp-employee-dialog" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-describedby="descriptionId" tabindex="-1" novalidate @submit.prevent="save">
+    <div class="sp-employee-backdrop" @click.self="!pendingAvatarRemoval && emit('close')">
+      <form ref="dialog" class="sp-employee-dialog" role="dialog" aria-modal="true" :aria-labelledby="titleId" :aria-describedby="descriptionId" :inert="!!pendingAvatarRemoval" :aria-hidden="pendingAvatarRemoval ? true : undefined" tabindex="-1" novalidate @submit.prevent="save">
         <header><div><h2 :id="titleId">{{ employee.id ? '编辑成员资料' : '添加员工' }}</h2><p :id="descriptionId">{{ employee.id ? '修改姓名、岗位与分组，保存后生效。' : '填写基本资料，创建后可在卡片上调整工时和可上班次。' }}</p></div><button type="button" class="sp-employee-close" aria-label="关闭人员编辑" @click="emit('close')">×</button></header>
         <div class="sp-employee-content">
           <div class="sp-employee-avatar-editor">
             <span class="sp-employee-avatar-preview" :style="{ background: employee.color }"><img v-if="avatar && !avatarBroken" :src="avatar" alt="头像预览" @error="avatarBroken = true" /><span v-else class="sp-employee-avatar-initials" aria-hidden="true">{{ avatarInitials }}</span></span>
-            <div class="sp-employee-avatar-controls"><div><label class="sp-employee-avatar-upload"><input type="file" accept="image/jpeg,image/png,image/webp" aria-label="上传成员头像" @change="selectAvatar"/><span>{{ avatar ? '更换头像' : '上传头像' }}</span></label><button v-if="avatar || avatarLoading" type="button" class="sp-employee-avatar-remove" @click="removeAvatar">移除头像</button></div><p v-if="avatarLoading" role="status">正在处理头像…</p><p v-else>JPG / PNG / WebP，最多 10 MB</p></div>
+            <div class="sp-employee-avatar-controls"><div><label class="sp-employee-avatar-upload"><input type="file" accept="image/jpeg,image/png,image/webp" aria-label="上传成员头像" @change="selectAvatar"/><span>{{ avatar ? '更换头像' : '上传头像' }}</span></label><button v-if="avatar || avatarLoading" type="button" class="sp-employee-avatar-remove" @click="requestAvatarRemoval">移除头像</button></div><p v-if="avatarLoading" role="status">正在处理头像…</p><p v-else>JPG / PNG / WebP，最多 10 MB</p></div>
           </div>
           <p v-if="avatarError" class="sp-employee-error sp-employee-avatar-error" role="alert">{{ avatarError }}</p>
           <label>员工姓名<input ref="nameInput" v-model="draft.name" maxlength="80" required autocomplete="off" placeholder="例如：陈晨" /></label>
@@ -84,6 +98,7 @@ onBeforeUnmount(() => {
       </form>
     </div>
   </Teleport>
+  <ConfirmDialog v-if="pendingAvatarRemoval" title="移除头像？" :description="`${pendingAvatarRemoval.loading ? '将取消正在处理的头像，并移除编辑中的头像。' : '将移除编辑中的头像，改为显示姓名。'}点击“保存人员”后才会更新成员资料。`" confirm-label="确认移除" cancel-label="保留头像" @confirm="removeAvatar" @cancel="pendingAvatarRemoval = null" />
 </template>
 
 <style scoped>

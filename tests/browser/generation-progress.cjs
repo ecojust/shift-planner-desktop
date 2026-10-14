@@ -1,3 +1,4 @@
+const { selectOption } = require('./helpers/select-option.cjs')
 /* Run against a built preview with GENERATION_PROGRESS_TEST_URL, optionally
  * PLAYWRIGHT_MODULE_PATH / PLAYWRIGHT_EXECUTABLE_PATH / SHIFT_FLOW_PYTHON.
  * Desktop lifecycle and progress events use a controlled Tauri bridge in Chromium;
@@ -119,7 +120,7 @@ async function preparePage(state, desktop = false, viewport = { width: 1440, hei
 async function openGenerate(page, seconds) {
   await page.getByRole('button', { name: '自动排班', exact: true }).click()
   const dialog = page.getByRole('dialog')
-  if (seconds) { await dialog.locator('.sp-generation-advanced summary').click(); await dialog.getByLabel('最长等待时间', { exact: true }).selectOption(String(seconds)) }
+  if (seconds) { await dialog.locator('.sp-generation-advanced summary').click(); await selectOption(page, dialog.getByLabel('最长等待时间', { exact: true }), String(seconds)) }
   return dialog
 }
 async function start(page, control, seconds, repeatStart = false) {

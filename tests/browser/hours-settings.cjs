@@ -112,6 +112,7 @@ async function main() {
     await month('2025-10')
     assert.equal(await page.getByLabel('手动月参考工时', { exact: true }).inputValue(), '152')
     await page.getByRole('button', { name: '恢复自动', exact: true }).click()
+    await page.getByRole('alertdialog').getByRole('button', { name: '确认恢复', exact: true }).click()
     await persisted(s => s.monthlyReferenceHours?.['2025-10'] === undefined && s.monthlyReferenceHours?.['2025-11'] === 168)
     assert.equal((await page.locator('.sp-settings-reference-summary strong').textContent()).trim(), '144')
     assert.equal(await monthHours('工时测试员').inputValue(), '144')
