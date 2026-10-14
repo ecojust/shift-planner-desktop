@@ -64,7 +64,7 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
       assert.equal(signature.allNativeObjectsVerified, true);
       assert.equal(signature.checks.pythonFramework.strictDeepVerified, true);
     }
-    const installer = `shift-flow-${id}.${extension}`;
+    const installer = `shift-schedule-expert-${id}.${extension}`;
     const bytes = readFileSync(join(directory, installer));
     assert.ok(bytes.length > 512, `Empty installer: ${installer}`);
     if (extension === 'exe') assert.equal(bytes.subarray(0, 2).toString(), 'MZ');
@@ -82,10 +82,14 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
   const files = names.sort().map(describe);
   writeFileSync(join(directory, 'SHA256SUMS'), files.map(file => `${file.sha256}  ${file.name}\n`).join(''));
   files.push(describe('SHA256SUMS'));
-  const notes = `排班 plus ${version} · Windows 与 macOS 测试发行版
+  const notes = `Shift Schedule Expert ${version} · Windows 与 macOS 测试发行版
 
-本版新增排班规则导出和具体冲突诊断，便于调整配置及复现求解问题。
+软件名称更新为 Shift Schedule Expert；本版完善跨月工时核算、成员设置和班次规则，并保留排班规则导出与具体冲突诊断。
 
+- 修正月初、月末周最低工时：已知月外工时抵扣整周最低，本月要求取按天折算值和剩余缺口的较小值，周最高及月最低仍独立检查。
+- 新增「班次不相连」和「周班次限制」，可分别逐条配置；规则按个人／团队分类，班次按开始时间排序并区分每日最少与固定人数。
+- 成员工时和可上班次自动保存，新成员周工时默认 40–48 小时；修改周工时的上下限至少相差 8 小时。资料弹窗支持上传、更换和移除头像，完整备份保留头像，求解请求不含图片。
+- 精简成员卡片，指针点击不出现额外焦点边框，键盘导航保留可见焦点；排班成功和失败提示仅在日历显示。
 - 排班日历新增「导出规则」，成员、班次、规则、已解析的月参考工时、锁定及跨月安排、求解参数统一保存在一个 JSON 文件中。
 - 排班失败后可「导出本次规则」，保留失败当次的随机种子和时限；修改设置后仍可复现原输入，并明确标记旧诊断。
 - 求解器新增 --input 文件入口，可直接读取导出的 JSON，无需手动结束标准输入。
@@ -99,9 +103,9 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
 
 | 电脑 | 安装包 |
 | --- | --- |
-| Windows 10/11，Intel/AMD 64 位 | shift-flow-windows-x64.exe |
-| Intel Mac，macOS 14+ | shift-flow-macos-x64.dmg |
-| M 系列 Mac，macOS 14+ | shift-flow-macos-arm64.dmg |
+| Windows 10/11，Intel/AMD 64 位 | shift-schedule-expert-windows-x64.exe |
+| Intel Mac，macOS 14+ | shift-schedule-expert-macos-x64.dmg |
+| M 系列 Mac，macOS 14+ | shift-schedule-expert-macos-arm64.dmg |
 
 Windows 在 Windows Server 2022 x64 云端构建机上完成 NSIS 静默安装和包内求解验证；两个 Mac 版本分别在 macOS 15 Intel/Apple Silicon 原生构建并验证最终 App。三个版本均已完成前端、Python、Rust 与真实集成检查，固定津贴计算、备份和 Excel 导出包含在前端回归中。各平台还使用最终安装包资源目录中的 OR-Tools 完成以下验证：
 

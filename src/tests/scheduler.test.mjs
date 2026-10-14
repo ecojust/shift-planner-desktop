@@ -231,13 +231,17 @@ test('prorated weekly minimum is rounded up to one minute instead of down to a f
   assert.ok(minimumIssues(value).some(issue => issue.date === '2026-10-01'))
 })
 
-test('previous-month hours do not satisfy the in-month weekly minimum, except their in-month overnight tail', () => {
+test('known previous-month hours reduce the boundary target without double counting their overnight carry-in', () => {
   const value = state({ employees: [employee('a', { minHoursPerWeek: 7 })], assignments: [assignment('2026-09-28'), assignment('2026-09-29'), assignment('2026-09-30', 'night')] })
   assert.ok(!minimumIssues(value).some(issue => issue.date === '2026-10-01')) // 6 carried hours meets 4-hour target.
   value.employees[0].minHoursPerWeek = 14
+  assert.ok(!minimumIssues(value).some(issue => issue.date === '2026-10-01')) // 18 known outside hours already attain the full-week minimum.
+  value.employees[0].minHoursPerWeek = 26
   const issue = minimumIssues(value).find(issue => issue.date === '2026-10-01')
   assert.match(issue.message, /实际工时 6 小时/)
   assert.match(issue.message, /周最低工时 8 小时/)
+  assert.match(issue.message, /月外已知工时 18 小时/)
+  value.employees[0].minHoursPerWeek = 14
   value.employees[0].maxHoursPerWeek = 24
   value.assignments.push(assignment('2026-10-02'))
   assert.ok(types(value).includes('weekly-hours')) // All full-week history still counts toward the maximum.

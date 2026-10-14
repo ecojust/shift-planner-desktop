@@ -410,7 +410,7 @@ class SolverTest(unittest.TestCase):
         self.assertGreaterEqual(total, 2)
         self.assertTrue(all(weekly.get(week, 0) >= 2 for week in ['2026-09-28', '2026-10-05', '2026-10-12', '2026-10-19', '2026-10-26']))
 
-    def test_outside_month_work_cannot_satisfy_prorated_week_minimum(self):
+    def test_outside_month_work_reduces_but_does_not_erase_remaining_week_minimum(self):
         outside = [assignment('a', f'2026-09-{day}', locked=False) for day in (28, 29, 30)]
         leaves = [f'2026-10-{day:02d}' for day in (1, 2, 3, 4)]
         s = state(employees=[employee('a', cap=168, minimum_week=28, leave=leaves), employee('b', cap=168)], assignments=outside)
@@ -420,6 +420,8 @@ class SolverTest(unittest.TestCase):
         first = [i for i in result['issues'] if i['type'] == 'weekly-min-hours' and i.get('date') == '2026-09-28']
         self.assertTrue(first)
         self.assertIn('16 小时', first[0]['message'])
+        self.assertIn('月外已排 24 小时', first[0]['message'])
+        self.assertIn('本月实际最低要求为 4 小时', first[0]['message'])
         self.assertIn('0 小时', first[0]['message'])
 
     def test_overnight_month_minimum_counts_carry_in_excludes_carry_out(self):

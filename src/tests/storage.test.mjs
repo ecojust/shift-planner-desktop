@@ -88,7 +88,7 @@ test('rejects unsafe or malformed imported configuration', () => {
   rejected(s => s.employees[0].maxHoursPerWeek = -1)
   rejected(s => s.employees[0].name = 'A\nB')
   assert.throws(() => parseBackup('{"version":1'), /JSON/)
-  assert.throws(() => parseBackup(' '.repeat(2 * 1024 * 1024 + 1)), /2 MB/)
+  assert.throws(() => parseBackup(' '.repeat(8 * 1024 * 1024 + 1)), /8 MB/)
   assert.throws(() => backupJSON({ ...fixture(), rules: { minRestHours: NaN } }), /备份格式错误/)
 })
 test('rejects duplicate and dangling entity references', () => {

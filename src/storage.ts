@@ -2,11 +2,12 @@ import { strToU8, zipSync } from 'fflate'
 import { dayInfo, calculatePayroll, createPayrollConfig, payrollRows as makePayrollRows } from './payroll.ts'
 import type { DayKind, PlannerDocument, PayrollSettings, PayrollResult } from './payroll'
 import type { Shift } from './domain.ts'
+import { isAvatarData } from './avatarData.ts'
 import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
 import { findWeightedWeek, weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
 
 export const STORAGE_KEY = 'shift-planner:v1'
-const MAX_BYTES = 2 * 1024 * 1024
+export const MAX_BACKUP_BYTES = 8 * 1024 * 1024
 type RecordValue = Record<string, unknown>
 type Cell = string | number
 
@@ -72,7 +73,7 @@ function unique(values: string[], label: string): void {
 
 /** Parse untrusted manual backups into fresh objects; never merge imported keys into live state. */
 export function parseBackup(text: string): PlannerDocument {
-  if (typeof text !== 'string' || text.length > MAX_BYTES || new TextEncoder().encode(text).length > MAX_BYTES) fail('文件超过 2 MB')
+  if (typeof text !== 'string' || text.length > MAX_BACKUP_BYTES || new TextEncoder().encode(text).length > MAX_BACKUP_BYTES) fail('文件超过 8 MB')
   let decoded: unknown
   try { decoded = JSON.parse(text.replace(/^\uFEFF/, '')) } catch { fail('无法读取 JSON 文件') }
   const root = object(decoded, '备份')
@@ -91,6 +92,7 @@ export function parseBackup(text: string): PlannerDocument {
   const shiftIds = new Set(shifts.map(s => s.id))
   const employees = list(root.employees, 200, '员工').map((entry, index) => {
     const e = object(entry, `员工 ${index + 1}`)
+    if (e.avatar !== undefined && e.avatar !== null && !isAvatarData(e.avatar)) fail('员工头像必须为不超过 8 KB 的本地 JPEG 缩略图')
     const eligibleShiftIds = list(e.eligibleShiftIds, 24, '可上班次').map(value => id(value, '可上班次 ID'))
     unique(eligibleShiftIds, '可上班次')
     if (eligibleShiftIds.some(value => !shiftIds.has(value))) fail('员工引用了不存在的班次')
@@ -100,7 +102,7 @@ export function parseBackup(text: string): PlannerDocument {
     const minHoursPerWeek = e.minHoursPerWeek === undefined ? 0 : number(e.minHoursPerWeek, 0, 168, '每周最低工时')
     const maxHoursPerWeek = number(e.maxHoursPerWeek, 0, 168, '每周最高工时')
     if (minHoursPerWeek > maxHoursPerWeek || hoursToMinutes(minHoursPerWeek, 'ceil') > hoursToMinutes(maxHoursPerWeek, 'floor')) fail('每周最低工时不能超过最高工时（按分钟核算）')
-    return { id: id(e.id, '员工 ID'), name: string(e.name, 80, '姓名'), role: string(e.role, 80, '岗位', true), group: string(e.group, 80, '分组', true), color: color(e.color, '员工颜色'), minHoursPerMonth, minHoursPerWeek, maxHoursPerWeek, eligibleShiftIds, unavailableDates }
+    return { id: id(e.id, '员工 ID'), name: string(e.name, 80, '姓名'), role: string(e.role, 80, '岗位', true), group: string(e.group, 80, '分组', true), color: color(e.color, '员工颜色'), ...(e.avatar === undefined ? {} : { avatar: e.avatar as string | null }), minHoursPerMonth, minHoursPerWeek, maxHoursPerWeek, eligibleShiftIds, unavailableDates }
   })
   unique(employees.map(e => e.id), '员工 ID')
   const employeeIds = new Set(employees.map(e => e.id))
@@ -151,6 +153,28 @@ export function parseBackup(text: string): PlannerDocument {
     })
     unique(groups.map(group => group.id), '互斥组 ID')
     state.rules.separationGroups = groups
+  }
+  if (r.nonConsecutiveShifts !== undefined) {
+    const rules = list(r.nonConsecutiveShifts, 24, '班次不相连规则').map((entry, index) => {
+      const rule = object(entry, `班次不相连规则 ${index + 1}`)
+      const shiftId = id(rule.shiftId, '班次不相连的班次 ID')
+      if (!shiftIds.has(shiftId)) fail('班次不相连规则引用了不存在的班次')
+      return { id: id(rule.id, '班次不相连规则 ID'), shiftId }
+    })
+    unique(rules.map(rule => rule.id), '班次不相连规则 ID')
+    unique(rules.map(rule => rule.shiftId), '班次不相连的班次')
+    state.rules.nonConsecutiveShifts = rules
+  }
+  if (r.weeklyShiftLimits !== undefined) {
+    const rules = list(r.weeklyShiftLimits, 24, '周班次限制').map((entry, index) => {
+      const rule = object(entry, `周班次限制 ${index + 1}`)
+      const shiftId = id(rule.shiftId, '周班次限制的班次 ID')
+      if (!shiftIds.has(shiftId)) fail('周班次限制引用了不存在的班次')
+      return { id: id(rule.id, '周班次限制 ID'), shiftId, maxPerWeek: number(rule.maxPerWeek, 0, 7, '每周最多班次', true) }
+    })
+    unique(rules.map(rule => rule.id), '周班次限制 ID')
+    unique(rules.map(rule => rule.shiftId), '周班次限制的班次')
+    state.rules.weeklyShiftLimits = rules
   }
   if (root.payroll !== undefined) {
     const p = object(root.payroll, '工资设置')
@@ -207,7 +231,7 @@ export function backupJSON(state: PlannerDocument): string {
   // Validate exports too, so broken in-memory data never overwrites a usable backup.
   const safe = parseBackup(JSON.stringify(state))
   const formatted = JSON.stringify(safe, null, 2)
-  return new TextEncoder().encode(formatted).length <= MAX_BYTES ? formatted : JSON.stringify(safe)
+  return new TextEncoder().encode(formatted).length <= MAX_BACKUP_BYTES ? formatted : JSON.stringify(safe)
 }
 export function loadSaved(): PlannerDocument | null {
   const raw = localStorage.getItem(STORAGE_KEY)
@@ -273,6 +297,12 @@ export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Ce
   const payroll = documentPayroll(safe)
   const rows: Cell[][][] = [table(safe, payroll), [['班次', '简称', '开始时间', '结束时间', '人数模式', '每日人数', '单班工时', '固定班次津贴（元/人/班）'], ...safe.shifts.map(s => [s.name, s.shortName, s.start, s.end, s.staffingMode === 'fixed' ? '每日固定' : '每日最少', s.required, duration(s.start, s.end), s.normalAllowance ?? 0]), ['说明', '每日最少：每天该班次不得少于设定人数，可增加安排，设为 0 仍可排班。每日固定：每天该班次须恰好达到设定人数，设为 0 不得安排。班次格子归属开始日期；本月工时按实际时段拆月，上月跨夜进入本月的部分计入，月底跨出部分不计。']], options.payrollRows ?? makePayrollRows(payroll)]
   rows[1]!.push(['津贴口径', '每人每次排班领取该班次设置的固定津贴，全部计入排班开始日期，跨夜只计一次。津贴与工资、工时、倍率及节假日无关。'])
+  for (const rule of safe.rules.nonConsecutiveShifts ?? []) {
+    rows[1]!.push(['班次不相连', safe.shifts.find(shift => shift.id === rule.shiftId)!.name, '每位成员不能连续两天上此班次，包含相邻月份已有安排；按班次开始日期判断。'])
+  }
+  for (const rule of safe.rules.weeklyShiftLimits ?? []) {
+    rows[1]!.push(['周班次限制', safe.shifts.find(shift => shift.id === rule.shiftId)!.name, rule.maxPerWeek, '每人每个周一至周日最多次数；不足一周不折算，计入同周已知的跨月安排，跨夜按开始日期计一次。'])
+  }
   if (safe.rules.weekdayWeights) {
     const rule = safe.rules.weekdayWeights
     rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班的最少或固定人数要求，各组内每日差不超过 1 班。月首尾不足整周时，匹配完整周基准表示可满足比例的周总量，不表示月外已有这些排班。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', ...safe.shifts.map(s => s.name + '实际班次')])

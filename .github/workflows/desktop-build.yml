@@ -196,7 +196,7 @@ jobs:
           const directory = join('src-tauri/target/release/bundle', windows ? 'nsis' : 'dmg');
           const installers = readdirSync(directory).filter(name => name.endsWith(extension));
           assert.equal(installers.length, 1);
-          const file = `artifacts/shift-flow-${process.env.SHIFT_FLOW_PLATFORM_ID}${extension}`;
+          const file = `artifacts/shift-schedule-expert-${process.env.SHIFT_FLOW_PLATFORM_ID}${extension}`;
           copyFileSync(join(directory, installers[0]), file);
           assert.ok(statSync(file).size > 0);
           console.log(file);

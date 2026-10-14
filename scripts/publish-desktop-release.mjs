@@ -42,7 +42,7 @@ if (release) {
   assert.equal(release.isPrerelease, true, 'Refusing to change an existing stable release');
 } else {
   gh(['release', 'create', manifest.tag, '--repo', repository, '--target', manifest.commit,
-    '--verify-tag', '--draft', '--prerelease', '--title', `排班 plus ${manifest.version} · Windows / Intel Mac / M 芯片`,
+    '--verify-tag', '--draft', '--prerelease', '--title', `Shift Schedule Expert ${manifest.version} · Windows / Intel Mac / M 芯片`,
     '--notes-file', 'desktop-release-notes.md', ...manifest.files.map(file => join('artifacts', file.name))]);
 }
 release = view();

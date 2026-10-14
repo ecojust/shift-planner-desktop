@@ -16,7 +16,14 @@ const gh = args => execFileSync('gh', args, { encoding: 'utf8', timeout: 300_000
 const api = path => JSON.parse(gh(['api', `repos/${repository}/${path}`]));
 const current = api(`releases/tags/${tag}`);
 assert.equal(current.draft, false);
-const wanted = ['shift-flow-macos-arm64.dmg', 'shift-flow-macos-x64.dmg', 'shift-flow-windows-x64.exe', 'shift-planner-source.zip'];
+// Preserve each release's original installer names, including historical releases.
+const wanted = ['macos-arm64.dmg', 'macos-x64.dmg', 'windows-x64.exe'].map(platform => {
+  const candidates = [`shift-schedule-expert-${platform}`, `shift-flow-${platform}`];
+  const matches = current.assets.filter(asset => candidates.includes(asset.name));
+  assert.equal(matches.length, 1, `Expected exactly one installer for ${platform}; leave attachments untouched`);
+  return matches[0].name;
+});
+wanted.push('shift-planner-source.zip');
 const reports = current.assets.filter(asset => /^(?:macos-arm64|macos-x64|windows-x64)-(?:native-validation|month-schedule-validation|solver-manifest|macos-app-audit)\.json$/.test(asset.name));
 const allowed = new Set([...wanted, 'SHA256SUMS', ...reports.map(asset => asset.name)]);
 assert.ok(current.assets.every(asset => allowed.has(asset.name)), 'Unexpected attachment; leave it untouched');

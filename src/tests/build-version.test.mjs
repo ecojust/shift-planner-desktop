@@ -79,11 +79,19 @@ test('release preparation rejects a different build number on any platform', con
     // Minimal magic-byte fixtures exercise release metadata only, not native installation.
     const installer = Buffer.alloc(1024)
     installer.write(extension === 'exe' ? 'MZ' : 'koly', extension === 'exe' ? 0 : 512)
-    writeFileSync(join(artifacts, `shift-flow-${id}.${extension}`), installer)
+    writeFileSync(join(artifacts, `shift-schedule-expert-${id}.${extension}`), installer)
     reports.push({ id, native, month })
   }
   writeFileSync(join(artifacts, 'shift-planner-source.zip'), Buffer.from('504b0304', 'hex'))
-  assert.equal(prepareRelease(root, env).buildVersion, env.SHIFT_FLOW_BUILD_VERSION)
+  const release = prepareRelease(root, env)
+  assert.equal(release.buildVersion, env.SHIFT_FLOW_BUILD_VERSION)
+  assert.deepEqual(release.files.map(file => file.name).sort(), [
+    'SHA256SUMS', 'shift-planner-source.zip', 'shift-schedule-expert-macos-arm64.dmg',
+    'shift-schedule-expert-macos-x64.dmg', 'shift-schedule-expert-windows-x64.exe',
+  ])
+  const notes = readFileSync(join(root, 'desktop-release-notes.md'), 'utf8')
+  assert.ok(notes.startsWith('Shift Schedule Expert 1.1.1 ·'))
+  for (const file of release.files) assert.ok(notes.includes(file.name))
   for (const { id, native, month } of reports) {
     save(`${id}-native-validation.json`, { ...native, buildVersion: '2026.1012.2310' })
     assert.throws(() => prepareRelease(root, env), /different UI build number/)

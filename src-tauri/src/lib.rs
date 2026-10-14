@@ -18,7 +18,7 @@ pub fn run() {
             files::import_backup,
         ])
         .build(tauri::generate_context!())
-        .expect("无法启动排班 plus桌面应用");
+        .expect("无法启动 Shift Schedule Expert 桌面应用");
     application.run(|app, event| match event {
         RunEvent::ExitRequested { api, .. } => {
             let runtime = app.state::<SolverRuntime>().inner().clone();

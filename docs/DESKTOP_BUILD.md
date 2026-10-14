@@ -1,4 +1,4 @@
-# 排班 plus：Windows / macOS 桌面构建
+# Shift Schedule Expert：Windows / macOS 桌面构建
 
 桌面版由 Vue 界面、Tauri 2 本地宿主、Python OR-Tools CP-SAT 求解器组成。求解器通过标准输入输出交换 JSON，不监听 HTTP 端口，不需要在线算法服务。Python 和原生求解库一起打进安装包，**使用者不需要安装 Python、Rust 或 Node.js**。
 
@@ -86,7 +86,9 @@ npm run desktop:build
 | 构建系统 | 桌面产物 |
 | --- | --- |
 | Windows | NSIS `.exe` 和/或 `.msi`，以 Tauri 配置启用的目标为准 |
-| macOS | `.app` 和 `.dmg` |
+| macOS | `Shift Schedule Expert.app` 和 `.dmg` |
+
+应用显示名称为 **Shift Schedule Expert**；应用标识仍为 `com.shiftflow.planner`，已有排班沿用原存储位置。源码包名与内部可执行文件名保持稳定。历史已发布安装包保留原文件名，新构建使用下方的新下载名称。
 
 源码或静态网页 `dist/` **不是**桌面安装包。Windows 安装包必须在 Windows 上构建，macOS 安装包必须在 macOS 上构建；本项目不把 Linux 构建成功视为 Windows/macOS 安装验证。
 
@@ -143,9 +145,11 @@ macOS 自动合并 `src-tauri/tauri.macos.conf.json`，改用 `bundle.macOS.file
 
 | 平台 | 运行器 | Python 架构 | 输出安装包 |
 | --- | --- | --- | --- |
-| Windows x64 | `windows-2022` | x64 | `shift-flow-windows-x64.exe`（NSIS） |
-| Intel Mac | `macos-15-intel` | x64 | `shift-flow-macos-x64.dmg` |
-| M 芯片 Mac | `macos-15` | arm64 | `shift-flow-macos-arm64.dmg` |
+| Windows x64 | `windows-2022` | x64 | `shift-schedule-expert-windows-x64.exe`（NSIS） |
+| Intel Mac | `macos-15-intel` | x64 | `shift-schedule-expert-macos-x64.dmg` |
+| M 芯片 Mac | `macos-15` | arm64 | `shift-schedule-expert-macos-arm64.dmg` |
+
+下载包诊断工作流 **Diagnose published macOS download** 需要填写准确的发行标签，默认查找 `shift-schedule-expert-macos-arm64.dmg`。检查历史版本时，填写该版本实际的附件名（例如 `shift-flow-macos-arm64.dmg`）；直接运行 `scripts/diagnose-macos-download.mjs` 同样需传入 `--tag`，可用 `--asset` 指定旧附件名。
 
 三个平台各自校验 Node/Python/Rust 架构，执行前端、Python、Rust 及真实求解集成测试，再构建原生安装包。Windows 在临时目录静默安装 NSIS，检查安装后的 x64 可执行文件、完整求解资源和实际整月求解；Mac 检查最终 App 的对应架构、内部链接、最低系统版本与整月求解。Mac 两种架构均要求 macOS 14+；Windows 包面向 Windows 10/11 x64，CI 验证环境为 Server 2022，不表示已逐一人工测试桌面系统。
 

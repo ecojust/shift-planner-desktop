@@ -82,6 +82,10 @@ async function main() {
     if (await mobile.isVisible()) await mobile.click()
     await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: label }).click()
   }
+  async function openTeamRules() {
+    await navigate('排班规则')
+    await page.getByRole('tab', { name: '团队规则', exact: true }).click()
+  }
   async function importDocument(document) {
     await page.locator('input[type=file]').setInputFiles({ name: 'weights-fixture.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
@@ -139,7 +143,7 @@ async function main() {
     }
 
     await importDocument(fixture())
-    await navigate('排班规则')
+    await openTeamRules()
     const enabled = page.getByLabel('启用上班权重', { exact: true })
     const percent = page.getByLabel('所选星期合计占比', { exact: true })
     const names = ['一', '二', '三', '四', '五', '六', '日']
@@ -154,7 +158,7 @@ async function main() {
     async function saveRule(days, value) {
       await selectDays(days)
       await percent.fill(String(value))
-      await page.getByRole('button', { name: '保存规则', exact: true }).click()
+      await page.getByRole('button', { name: '保存团队规则', exact: true }).click()
       return persisted(s => JSON.stringify(s.rules.weekdayWeights?.days) === JSON.stringify(days) && s.rules.weekdayWeights.percent === value)
     }
     async function preview(monday, selected, other, total) {
@@ -203,18 +207,18 @@ async function main() {
     const savedRule = { days: [1, 6], percent: 40 }
     for (const invalid of ['', '-1', '101', '40.5']) {
       await percent.fill(invalid)
-      await page.getByRole('button', { name: '保存规则', exact: true }).click()
+      await page.getByRole('button', { name: '保存团队规则', exact: true }).click()
       assert.ok(!(await percent.evaluate(e => e.validity.valid)) || await page.locator('.sp-settings-error').isVisible(), `Invalid percentage ${invalid} needs feedback`)
       assert.deepEqual((await state()).rules.weekdayWeights, savedRule)
     }
     await percent.fill('40')
     await selectDays([])
-    await page.getByRole('button', { name: '保存规则', exact: true }).click()
+    await page.getByRole('button', { name: '保存团队规则', exact: true }).click()
     assert.match(await page.locator('.sp-settings-error').innerText(), /选择|星期/)
     assert.deepEqual((await state()).rules.weekdayWeights, savedRule)
     await selectDays([1, 2, 3, 4, 5, 6, 7])
     await percent.fill('99')
-    await page.getByRole('button', { name: '保存规则', exact: true }).click()
+    await page.getByRole('button', { name: '保存团队规则', exact: true }).click()
     assert.match(await page.locator('.sp-settings-error').innerText(), /100/)
     assert.deepEqual((await state()).rules.weekdayWeights, savedRule)
     await saveRule([1, 2, 3, 4, 5, 6, 7], 100)
@@ -231,7 +235,7 @@ async function main() {
     await page.getByLabel('全局排班月份').fill('2025-04')
     await page.getByLabel('全局排班月份').dispatchEvent('change')
     await persisted(s => s.month === '2025-04')
-    await navigate('排班规则')
+    await openTeamRules()
     await preview('2025-03-31', 7, 21, 28)
     assert.equal(Number.parseInt(await page.locator('.sp-settings-weight-month-total').innerText(), 10), 149)
     record('missing-monday-preview-retains-outside-month-share', { firstWeek: 28, selected: 7, other: 21, month: 149 })
@@ -240,7 +244,7 @@ async function main() {
     await page.getByLabel('全局排班月份').dispatchEvent('change')
     await persisted(s => s.month === '2025-10')
     await page.reload({ waitUntil: 'networkidle' })
-    await navigate('排班规则')
+    await openTeamRules()
     assert.equal(await enabled.isChecked(), true)
     assert.equal(await percent.inputValue(), '40')
     assert.deepEqual((await state()).rules.weekdayWeights, savedRule)
@@ -256,14 +260,14 @@ async function main() {
     const backup = JSON.parse(await fs.readFile(backupPath, 'utf8'))
     assert.deepEqual(backup.rules.weekdayWeights, savedRule)
     await setEnabled(false)
-    await page.getByRole('button', { name: '保存规则', exact: true }).click()
+    await page.getByRole('button', { name: '保存团队规则', exact: true }).click()
     await persisted(s => s.rules.weekdayWeights === undefined)
     await generate()
     const unweighted = await persisted(s => s.assignments.filter(a => a.date.startsWith('2025-10')).length >= 155)
     for (let day = 1; day <= 31; day++) assert.ok(unweighted.assignments.filter(a => a.date === `2025-10-${String(day).padStart(2, '0')}` && a.shiftId === 'day').length >= 5)
     record('disabling-weight-keeps-daily-minimum', { actual: unweighted.assignments.length, monthMinimum: 155, dailyMinimum: 5 })
     await importDocument(backup)
-    await navigate('排班规则')
+    await openTeamRules()
     assert.equal(await enabled.isChecked(), true)
     assert.equal(await percent.inputValue(), '40')
     await preview('2025-10-06', 14, 21, 35)

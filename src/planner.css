@@ -16,6 +16,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-brand { display: flex; align-items: center; gap: 10px; padding: 0 8px; font-size: 22px; font-weight: 650; letter-spacing: -.6px; white-space: nowrap; }
 .sp-brand img { flex-shrink: 0; width: 40px; height: 40px; }
 .sp-brand b { font-weight: 500; letter-spacing: -1px; }
+.sp-brand .sp-brand-name { display: flex; flex-direction: column; gap: 3px; min-width: 0; line-height: 1.2; letter-spacing: 0; }
+.sp-brand .sp-brand-name strong { font-size: 16px; font-weight: 650; letter-spacing: -.3px; }
+.sp-brand .sp-brand-name b { font-size: 13px; font-weight: 500; letter-spacing: 1.4px; color: #5a786b; }
 .sp-sidebar nav { display: grid; gap: 7px; margin-top: 30px; }
 .sp-sidebar nav button { width: 100%; display: flex; align-items: center; gap: 12px; min-height: 46px; border: none; background: none; border-radius: 8px; padding: 0 13px; text-align: left; color: #607367; font-size: 13px; }
 .sp-sidebar nav button:hover { background: #f4f7f5; }

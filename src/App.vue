@@ -2,9 +2,10 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import SettingsPanel from './SettingsPanel.vue'
+import EmployeeAvatar from './EmployeeAvatar.vue'
 import { makeDefaultState } from './defaults'
 import { datesOfMonth, shiftHours, validateSchedule } from './scheduler'
-import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX } from './storage'
+import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP_BYTES } from './storage'
 import { calculatePayroll, createPayrollConfig, dayInfo, payrollRows } from './payroll'
 import type { DayKind, PayrollConfig, PayrollResult } from './payroll'
 import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain'
@@ -299,13 +300,13 @@ async function openDiagnostic(issue: Issue) {
     if (issue.employeeId) { groupFilter.value = ''; employeeQuery.value = state.value.employees.find(e => e.id === issue.employeeId)?.name ?? '' }
   }
   await nextTick()
-  if (issue.target !== 'calendar') { await settingsPanel.value?.focusDiagnostic(issue.employeeId, issue.shiftId); return }
+  if (issue.target !== 'calendar') { await settingsPanel.value?.focusDiagnostic(issue.employeeId, issue.shiftId, issue.type); return }
   const element = document.querySelector<HTMLElement>('.sp-calendar-card')
   element?.scrollIntoView({ block: 'center', behavior: 'smooth' })
   element?.focus({ preventScroll: true })
 }
 async function exportBackup() {
-  try { if (await download(backupJSON(state.value), `排班 plus-${state.value.month}.json`, 'application/json')) { showBackup.value = false; flash('完整备份已导出') } }
+  try { if (await download(backupJSON(state.value), `Shift Schedule Expert-${state.value.month}.json`, 'application/json')) { showBackup.value = false; flash('完整备份已导出') } }
   catch (e) { flash(e instanceof Error ? e.message : String(e)) }
 }
 async function openImport() {
@@ -317,7 +318,7 @@ async function openImport() {
 }
 async function selectImport(event: Event) {
   const input = event.target as HTMLInputElement; const file = input.files?.[0]; if (!file) return
-  try { if (file.size > 2 * 1024 * 1024) throw new Error('备份文件不能超过 2 MB'); importCandidate.value = { ...createPayrollConfig(), ...parseBackup(await file.text()) } as Document }
+  try { if (file.size > MAX_BACKUP_BYTES) throw new Error('备份文件不能超过 8 MB'); importCandidate.value = { ...createPayrollConfig(), ...parseBackup(await file.text()) } as Document }
   catch (e) { flash(e instanceof Error ? e.message : '文件读取失败') }
   input.value = ''; showBackup.value = false
 }
@@ -330,9 +331,13 @@ watch(state, () => { revision++; if (solverFeedback.value && !solverFeedback.val
   try { saveLocal(state.value); savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); saveError.value = '' }
   catch { saveError.value = '自动保存失败，请导出 JSON 备份，避免刷新丢失。' }
 }, 350) }, { deep: true, flush: 'sync' })
-function settingsChanged() { history.value = []; flash('设置已保存，重新生成可按新规则安排班次') }
+function settingsChanged(options?: { silent?: boolean }) { history.value = []; if (!options?.silent) flash('设置已保存，重新生成可按新规则安排班次') }
 watch(() => state.value.month, () => { weekIndex.value = 0; history.value = [] }, { flush: 'sync' })
-function flushSave() { if (!saveError.value.startsWith('原有数据读取失败')) { try { saveLocal(state.value) } catch { /* The visible save warning covers storage errors. */ } } }
+function flushSave() {
+  // Flush valid card edits before persisting, independent of pagehide listener order.
+  settingsPanel.value?.flushAutosave()
+  if (!saveError.value.startsWith('原有数据读取失败')) { try { saveLocal(state.value) } catch { /* The visible save warning covers storage errors. */ } }
+}
 function escapeKey(event: KeyboardEvent) {
   if (event.key === 'Escape') { editing.value = null; calendarDate.value = ''; showGenerate.value = false; showBackup.value = false; showHelp.value = false; importCandidate.value = null; mobileNav.value = false }
   if (event.key === 'Tab') {
@@ -345,7 +350,7 @@ function escapeKey(event: KeyboardEvent) {
     }
   }
 }
-onMounted(() => { if (desktop) void checkEngine(); document.title = '排班 plus · 智能排班'; window.addEventListener('keydown', escapeKey); window.addEventListener('pagehide', flushSave) })
+onMounted(() => { if (desktop) void checkEngine(); document.title = 'Shift Schedule Expert'; window.addEventListener('keydown', escapeKey); window.addEventListener('pagehide', flushSave) })
 onUnmounted(() => { disposed = true; unlistenProgress?.(); unlistenProgress = null; if (activeRequestId) void cancelDesktop(activeRequestId).catch(() => {}); window.clearInterval(generationTimer); flushSave(); window.removeEventListener('keydown', escapeKey); window.removeEventListener('pagehide', flushSave); worker?.terminate(); window.clearTimeout(workerTimer); window.clearTimeout(saveTimer); window.clearTimeout(noticeTimer) })
 watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidate], async () => { await nextTick(); (document.querySelector('.sp-modal input, .sp-modal select, .sp-modal button') as HTMLElement | null)?.focus() })
 </script>
@@ -354,7 +359,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
   <div class="sp-app">
     <button v-if="mobileNav" class="sp-nav-scrim" aria-label="关闭导航" @click="mobileNav = false"></button>
     <aside class="sp-sidebar" :class="{ 'is-open': mobileNav }">
-      <a class="sp-brand" href="#" @click.prevent="chooseSection('calendar')"><img :src="brandMarkUrl" alt="" width="40" height="40" /><span>排班 <b>plus</b></span></a>
+      <a class="sp-brand" href="#" aria-label="Shift Schedule Expert" @click.prevent="chooseSection('calendar')"><img :src="brandMarkUrl" alt="" width="40" height="40" /><span class="sp-brand-name"><strong>Shift Schedule</strong><b>Expert</b></span></a>
       <nav aria-label="应用导航"><button v-for="item in navigation" :key="item.key" :class="{ active: section === item.key }" :aria-current="section === item.key ? 'page' : undefined" @click="chooseSection(item.key)"><Icon :name="item.icon" /><span>{{ item.label }}</span><span v-if="item.key === 'team'" class="sp-nav-count">{{ state.employees.length }}</span></button></nav>
       <div class="sp-sidebar-bottom"><button class="sp-help" @click="showBackup = true; mobileNav = false"><Icon name="file" :size="18" />备份与恢复</button><button class="sp-help" @click="showHelp = true; mobileNav = false"><Icon name="info" :size="18" />使用帮助</button></div>
     </aside>
@@ -375,7 +380,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span aria-hidden="true">·</span><button @click="showGenerate = true">{{ desktop ? '本地 CP-SAT' : '浏览器启发式排班' }}</button></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" title="导出当前成员、班次、规则和求解上下文为 JSON" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '检查算法…' : '自动排班' }}</button></div></div>
         <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
         <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消并停止本地任务…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成浏览器排班' }}</strong><p>总计 {{ elapsedSeconds }} 秒<span v-if="desktop"> · 当前阶段 {{ phaseSeconds }} 秒</span> · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `排班搜索时限 ${solveTimeLimit} 秒，结束后还需返回并校验结果。` : solvePhase === 'finishing' ? '搜索已结束，正在返回并校验结果。' : `正在准备本地算法，启动和加载不占 ${solveTimeLimit} 秒搜索时限。` }}</p><p v-else>浏览器搜索时限 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
-        <div v-if="solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status">
+        <div v-if="section === 'calendar' && solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status">
           <Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" />
           <div>
             <strong>{{ solverFeedback.message }}</strong>
@@ -420,7 +425,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
                 </tr></thead>
                 <tbody>
                   <tr v-for="employee in employees" :key="employee.id">
-                    <th class="sp-person-col"><div class="sp-person"><span class="sp-person-avatar" :style="{ background: employee.color }">{{ employee.name.slice(-2) }}</span><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
+                    <th class="sp-person-col"><div class="sp-person"><EmployeeAvatar class="sp-person-avatar" :avatar="employee.avatar" size="small" /><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
                     <td v-for="date in visibleDates" :key="date" :class="{ 'sp-current-day': date === today }">
                       <button class="sp-shift-cell" :class="{ 'is-off': !findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date), 'is-leave': leave(employee,date), 'has-allowance': (dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0 }" :style="findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date) ? { background: findShift(entry(employee.id,date)!.shiftId)!.color } : {}" :aria-label="`${employee.name} ${date} ${leave(employee,date) ? '请假' : findShift(entry(employee.id,date)?.shiftId || '')?.name || '休息'}，点击编辑`" :aria-description="allowanceDescription(employee.id,date)" :title="allowanceDescription(employee.id,date)" @click="openCell(employee,date)">
                         <template v-if="leave(employee,date)"><span>请假</span><small>全天休假</small></template>
@@ -487,7 +492,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         <div class="sp-modal-heading"><h2 id="sp-help-title">几步，安排好下个月</h2><button class="sp-icon-button" aria-label="关闭帮助" @click="showHelp = false"><Icon name="close" /></button></div>
         <ol class="sp-help-list">
           <li><strong>添加团队成员</strong><p>月参考工时默认按工作日 × 8 计算；设置每人的月最低工时、周最低/最高工时、班次资格和请假日期。</p></li>
-          <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数。</p></li>
+          <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数；也可逐条指定不连续的班次及每人每周次数上限。</p></li>
           <li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li>
           <li><strong>设置班次津贴</strong><p>在「班次设置」填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li>
           <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，“备份与恢复”中的 JSON 用于恢复全部设置。排班日历的“导出规则”保存当前求解配置，失败提示里的“导出本次规则”保留失败当次输入，便于复现排查。首次进入展示的是可编辑示例团队。</p></li>

@@ -178,14 +178,14 @@ jobs:
           test "${#dmgs[@]}" -eq 1
           # ditto preserves the app's links and metadata; upload the archive, not loose app files.
           ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" artifacts/shift-flow-macos-arm64.app.zip
-          cp "${dmgs[0]}" artifacts/shift-flow-macos-arm64.dmg
+          cp "${dmgs[0]}" artifacts/shift-schedule-expert-macos-arm64.dmg
           cp solver/build/aarch64-apple-darwin/manifest.json artifacts/solver-manifest.json
           git archive --format=zip --prefix=shift-planner/ --output=artifacts/shift-planner-source.zip "$GITHUB_SHA"
           shasum -a 256 artifacts/*.dmg artifacts/*.zip > artifacts/SHA256SUMS
           # Public checksums cover the installer and source only; diagnostics stay in Actions.
           (
             cd artifacts
-            shasum -a 256 shift-flow-macos-arm64.dmg shift-planner-source.zip
+            shasum -a 256 shift-schedule-expert-macos-arm64.dmg shift-planner-source.zip
           ) > artifacts/release-SHA256SUMS
           (
             cd artifacts
@@ -207,7 +207,7 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]
           tag="macos-arm64-v${version}-${GITHUB_RUN_ID}"
           cat > release-notes.md <<EOF
-          排班 plus ${version} · Apple Silicon 测试发行版
+          Shift Schedule Expert ${version} · Apple Silicon 测试发行版
 
           构建号：${SHIFT_FLOW_BUILD_VERSION}（北京时间）
 
@@ -215,7 +215,7 @@ jobs:
           本版本未进行 Apple Developer ID 签名或 Apple 公证。
           已进行 ad-hoc 签名并验证完整 App 的资源封印；首次运行仍可能需要在 macOS「隐私与安全性」中为此应用单独批准打开。
 
-          下载 shift-flow-macos-arm64.dmg 即可安装，内含 Python 和 OR-Tools，无需另装算法环境。
+          下载 shift-schedule-expert-macos-arm64.dmg 即可安装，内含 Python 和 OR-Tools，无需另装算法环境。
           shift-planner-source.zip 为本次构建提交的精确源码；无需重复下载 Actions 中的 App ZIP。
           release-SHA256SUMS 可用于校验安装包和源码 ZIP。原生资源、求解验证和构建清单等 JSON 报告保存在本次 Actions 的 shift-flow-macos-arm64 artifact 中（保留 14 天），不作为 Release 下载附件。
 
@@ -244,7 +244,7 @@ jobs:
           NODE
           else
             # Upload while still a draft so a failed upload cannot publish an incomplete release.
-            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "排班 plus ${version} · M 芯片 · macOS 14+（未公证）" --notes-file release-notes.md artifacts/shift-flow-macos-arm64.dmg artifacts/shift-planner-source.zip artifacts/release-SHA256SUMS
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease --title "Shift Schedule Expert ${version} · M 芯片 · macOS 14+（未公证）" --notes-file release-notes.md artifacts/shift-schedule-expert-macos-arm64.dmg artifacts/shift-planner-source.zip artifacts/release-SHA256SUMS
           fi
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease,targetCommitish,assets > release-ready.json
           node --input-type=module <<'NODE'
@@ -253,7 +253,7 @@ jobs:
           const release = JSON.parse(readFileSync('release-ready.json', 'utf8'));
           assert.equal(release.targetCommitish, process.env.GITHUB_SHA);
           assert.equal(release.isPrerelease, true);
-          const required = ['shift-flow-macos-arm64.dmg', 'shift-planner-source.zip', 'release-SHA256SUMS'];
+          const required = ['shift-schedule-expert-macos-arm64.dmg', 'shift-planner-source.zip', 'release-SHA256SUMS'];
           assert.equal(release.assets.length, required.length, 'Unexpected public attachments; diagnostics belong in Actions artifacts');
           for (const name of required) {
             const assets = release.assets.filter(asset => asset.name === name);

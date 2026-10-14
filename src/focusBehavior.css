@@ -1,0 +1,24 @@
+/* Pointer focus still places the caret / activates controls. Suppress only its
+   extra ring; keep normal borders, selected states, errors and card shadows. */
+html[data-focus-mode="pointer"] :focus,
+html[data-focus-mode="pointer"] .sp-settings-switch input:focus + span,
+html[data-focus-mode="pointer"] .sp-employee-avatar-upload:focus-within {
+  outline: none !important;
+}
+
+html[data-focus-mode="pointer"] .sp-settings-field input:focus,
+html[data-focus-mode="pointer"] .sp-settings-input-unit:focus-within,
+html[data-focus-mode="pointer"] .sp-settings-search:focus-within {
+  box-shadow: none !important;
+}
+
+html[data-focus-mode="pointer"] :where(button, a, label, input, select, textarea, summary, [tabindex]) {
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* A separate keyboard rule also restores a visible ring on controls whose
+   component styles hide the inner outline in favour of a wrapping field. */
+html[data-focus-mode="keyboard"] :where(button, a, input, select, textarea, summary, [tabindex]):focus {
+  outline: 3px solid #86ccbf !important;
+  outline-offset: 3px;
+}

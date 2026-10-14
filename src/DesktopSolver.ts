@@ -103,6 +103,10 @@ export function checkDesktopResult(request: SolverRequest, result: SolverResult)
   const fixed = request.state.assignments.filter(a => a.locked || !a.date.startsWith(`${request.state.month}-`))
   for (const a of fixed) if (!result.assignments.some(b => a.employeeId === b.employeeId && a.date === b.date && a.shiftId === b.shiftId && a.locked === b.locked)) return reject('求解结果改变了锁定安排或其他月份，已拒绝覆盖原表。')
   const sameAssignment = (a: Assignment, b: Assignment) => a.employeeId === b.employeeId && a.date === b.date && a.shiftId === b.shiftId && a.locked === b.locked
+  // A solver may preserve locks but cannot create them. In particular, marking
+  // a new month-end night as locked would turn its outgoing hours into false
+  // "known outside" credit when independently checking weekly minimums.
+  if (result.assignments.some(a => a.locked && !fixed.some(b => sameAssignment(a, b)))) return reject('求解结果新增了未经确认的锁定安排，已拒绝覆盖原表。')
   const originalOtherMonths = request.state.assignments.filter(a => !a.date.startsWith(`${request.state.month}-`))
   const resultOtherMonths = result.assignments.filter(a => !a.date.startsWith(`${request.state.month}-`))
   if (originalOtherMonths.length !== resultOtherMonths.length || resultOtherMonths.some(a => !originalOtherMonths.some(b => sameAssignment(a, b)))) return reject('求解结果改变了其他月份，已拒绝覆盖原表。')

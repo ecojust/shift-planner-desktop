@@ -4,6 +4,8 @@ export interface Employee {
   role: string
   group: string
   color: string
+  /** Optional local JPEG thumbnail; absent or null means no avatar. */
+  avatar?: string | null
   /** null follows this month's team reference; missing is a legacy zero minimum. */
   minHoursPerMonth?: number | null
   minHoursPerWeek?: number
@@ -27,6 +29,18 @@ export interface Shift {
   normalAllowance?: number
 }
 
+export interface NonConsecutiveShiftRule {
+  id: string
+  shiftId: string
+}
+
+export interface WeeklyShiftLimit {
+  id: string
+  shiftId: string
+  /** Starts per employee per Monday–Sunday week, including known month boundaries. */
+  maxPerWeek: number
+}
+
 export interface Rules {
   minRestHours: number
   maxConsecutiveDays: number
@@ -36,6 +50,10 @@ export interface Rules {
   weekdayWeights?: { days: number[]; percent: number }
   /** Each group permits at most one member per date / shift. Empty shiftIds means all shifts. */
   separationGroups?: { id: string; name: string; employeeIds: string[]; shiftIds: string[] }[]
+  /** Applies to adjacent start dates with at least one date in the selected month. */
+  nonConsecutiveShifts?: NonConsecutiveShiftRule[]
+  /** Applies to natural weeks touching the selected month; missing means unrestricted. */
+  weeklyShiftLimits?: WeeklyShiftLimit[]
 }
 
 export interface Assignment {

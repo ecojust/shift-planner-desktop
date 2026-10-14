@@ -1,4 +1,4 @@
-# 部署排班 plus
+# 部署 Shift Schedule Expert
 
 这是独立 Vue 3 + TypeScript + Vite 项目，和 GameLink 游戏工程没有依赖关系。可部署静态网页，也可通过 Tauri 打包 Windows/macOS 桌面程序；两种产物的部署方式与排班引擎不同。
 

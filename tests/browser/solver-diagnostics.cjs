@@ -173,11 +173,15 @@ async function fillState(page,desktop=false,state=fixture) {
     await check('member action clears existing search to reveal its target',async()=>{
       await actionPage.getByPlaceholder('搜索姓名、岗位或分组').fill('林晚晴');
       assert.equal(await actionPage.locator('#member-employee-1').count(),0);
+      assert.equal(await actionPage.locator('.sp-solve-result').count(),0,'solve feedback stays in the calendar');
+      await actionPage.getByRole('button',{name:'排班日历',exact:true}).click();
       await actionPage.getByRole('button',{name:'查看成员设置 →',exact:true}).click();
       assert.equal(await actionPage.evaluate(()=>document.activeElement.id),'member-employee-1');
       assert.equal(await actionPage.getByPlaceholder('搜索姓名、岗位或分组').inputValue(),'');
     });
     await check('date action selects the target week and member',async()=>{
+      assert.equal(await actionPage.locator('.sp-solve-result').count(),0,'member settings do not show the calendar result');
+      await actionPage.getByRole('button',{name:'排班日历',exact:true}).click();
       await actionPage.getByRole('button',{name:'查看对应日期 →',exact:true}).click();
       assert.equal(await actionPage.locator('h1').innerText(),'排班日历');
       assert.equal(await actionPage.getByRole('textbox',{name:'搜索成员',exact:true}).inputValue(),'陈晨');

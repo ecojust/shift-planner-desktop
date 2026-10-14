@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Inspect a macOS .app without running any executable inside the bundle.
 
-Usage: python3 scripts/audit-macos-app.py "/path/to/排班 plus.app" [--arch arm64|x86_64] > audit.json
+Usage: python3 scripts/audit-macos-app.py "/path/to/Shift Schedule Expert.app" [--arch arm64|x86_64] > audit.json
 Exit 1 means a structural, architecture, or symlink validation failed. A bundle
 declaring an older macOS version than a dependency's minos is reported, but does
 not fail this audit. This report is static evidence, not an installation test.

@@ -11,8 +11,8 @@ import { runtimeInventory } from './runtime-files.mjs';
 // quarantine metadata or bytes. Signing/Gatekeeper failures are diagnostic data.
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const defaults = {
-  repo: 'ecojust/shift-planner-desktop', tag: 'desktop-v1.1.0-38277333420',
-  asset: 'shift-flow-macos-arm64.dmg', output: 'artifacts/macos-download-diagnostics', launch: 'true',
+  repo: 'ecojust/shift-planner-desktop', tag: '',
+  asset: 'shift-schedule-expert-macos-arm64.dmg', output: 'artifacts/macos-download-diagnostics', launch: 'true',
 };
 const sleep = milliseconds => new Promise(resolvePromise => setTimeout(resolvePromise, milliseconds));
 const sha256 = file => createHash('sha256').update(readFileSync(file)).digest('hex');
@@ -26,6 +26,7 @@ function optionsFrom(args) {
     options[key] = args[index + 1];
   }
   assert.match(options.repo, /^[\w.-]+\/[\w.-]+$/);
+  assert.ok(options.tag.trim(), 'Pass --tag with the exact published release tag');
   assert.equal(basename(options.asset), options.asset);
   assert.ok(options.asset.endsWith('.dmg'));
   assert.ok(['true', 'false'].includes(options.launch));

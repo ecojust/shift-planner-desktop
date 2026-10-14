@@ -1,6 +1,7 @@
 /* Start Vite on 5197, then run:
  * PLAYWRIGHT_MODULE_PATH=/path/to/playwright PLAYWRIGHT_EXECUTABLE_PATH=/path/to/chromium node tests/browser/member-interactions.cjs
- * Exercises actual member cards and the leave dialog, including keyboard and mobile interaction.
+ * Exercises auto-saving member cards, the profile modal and leave calendar,
+ * including independent edits, keyboard focus and mobile interaction.
  */
 const fs = require('node:fs/promises')
 const path = require('node:path')
@@ -56,11 +57,10 @@ async function main() {
   const monthHours = name => page.getByLabel(`${name}每月最低工时`, { exact: true })
   const minWeek = name => page.getByLabel(`${name}每周最低工时`, { exact: true })
   const maxWeek = name => page.getByLabel(`${name}每周最高工时`, { exact: true })
-  const saveHours = name => page.getByRole('button', { name: `保存${name}设置`, exact: true })
-  const cancelHours = name => page.getByRole('button', { name: `取消${name}设置修改`, exact: true })
   const chip = (name, shift) => page.getByRole('button', { name: `${name}可上${shift}`, exact: true })
   const leaveButton = name => page.getByRole('button', { name: `设置${name}请假`, exact: true })
   const dialog = () => page.getByRole('dialog', { name: '陈小满 · 请假日历', exact: true })
+  const profile = () => page.getByRole('dialog').filter({ has: page.getByLabel('岗位', { exact: true }) })
   const leaveDay = date => dialog().locator(`button[data-leave-date="${date}"]`)
   async function leaveMonth(month) { await dialog().getByLabel('请假月份', { exact: true }).fill(month); await dialog().getByLabel('请假月份', { exact: true }).dispatchEvent('change') }
   async function widthCheck(name) {
@@ -81,35 +81,33 @@ async function main() {
       assert.equal(await minWeek(name).inputValue(), '0')
       assert.equal(await maxWeek(name).inputValue(), '40')
     }
-    assert.equal(await page.locator('.sp-settings-editor').count(), 0)
+    assert.equal(await profile().count(), 0)
     record('hours-are-visible-on-member-cards-without-opening-editor')
     await minWeek('陈小满').fill('24')
     await minWeek('李青').fill('20')
-    assert.equal((await state()).employees[0].minHoursPerWeek, 0)
-    assert.equal((await state()).employees[1].minHoursPerWeek, 0)
-    await cancelHours('陈小满').click()
-    assert.equal(await minWeek('陈小满').inputValue(), '0')
-    assert.equal(await minWeek('李青').inputValue(), '20')
-    await minWeek('陈小满').fill('24')
-    await saveHours('李青').click()
-    await persisted(s => s.employees[0].minHoursPerWeek === 0 && s.employees[1].minHoursPerWeek === 20)
+    await persisted(s => s.employees[0].minHoursPerWeek === 24 && s.employees[1].minHoursPerWeek === 20)
     assert.equal(await minWeek('陈小满').inputValue(), '24')
-    await cancelHours('陈小满').click()
-    assert.equal(await minWeek('陈小满').inputValue(), '0')
-    record('member-drafts-save-and-cancel-independently')
+    assert.equal(await minWeek('李青').inputValue(), '20')
+    // A bad weekly pair must not roll back another member's valid edit.
+    await minWeek('陈小满').fill('40')
+    await minWeek('李青').fill('22')
+    await persisted(s => s.employees[0].minHoursPerWeek === 24 && s.employees[1].minHoursPerWeek === 22)
+    assert.equal(await minWeek('陈小满').inputValue(), '40')
+    assert.match(await card('陈小满').getByRole('alert').innerText(), /至少相差 8 小时/)
+    await minWeek('陈小满').fill('24')
+    await persisted(s => s.employees[0].minHoursPerWeek === 24 && s.employees[1].minHoursPerWeek === 22)
+    assert.equal(await page.getByRole('button', { name: /保存.+设置|取消.+设置修改/ }).count(), 0)
+    record('valid-member-edits-autosave-independently-and-invalid-weekly-pairs-do-not-write')
     await follow('陈小满').uncheck()
     await monthHours('陈小满').fill('120')
     await minWeek('陈小满').fill('24')
     await maxWeek('陈小满').fill('48')
-    await saveHours('陈小满').click()
     await persisted(s => s.employees[0].minHoursPerMonth === 120 && s.employees[0].maxHoursPerWeek === 48)
     await page.getByLabel('手动月参考工时', { exact: true }).fill('160')
-    await page.getByRole('button', { name: '保存本月', exact: true }).click()
     await persisted(s => s.monthlyReferenceHours?.['2026-10'] === 160)
     assert.equal(await monthHours('陈小满').inputValue(), '120')
     assert.equal(await monthHours('李青').inputValue(), '160')
     await follow('陈小满').check()
-    await saveHours('陈小满').click()
     await persisted(s => s.employees[0].minHoursPerMonth === null)
     assert.equal(await monthHours('陈小满').inputValue(), '160')
     record('inline-month-follow-and-custom-minimum-track-reference-correctly')
@@ -120,18 +118,13 @@ async function main() {
     await chip('陈小满', '日班').click()
     assert.equal(await chip('陈小满', '日班').getAttribute('aria-pressed'), 'false')
     assert.equal(await chip('陈小满', '夜班').getAttribute('aria-pressed'), 'true')
-    assert.deepEqual((await state()).employees[0].eligibleShiftIds, ['day', 'night'])
-    await cancelHours('陈小满').click()
-    assert.equal(await chip('陈小满', '日班').getAttribute('aria-pressed'), 'true')
-    await chip('陈小满', '日班').click()
+    await persisted(s => JSON.stringify(s.employees[0].eligibleShiftIds) === JSON.stringify(['night']))
     await chip('陈小满', '夜班').click()
-    await saveHours('陈小满').click()
     await persisted(s => s.employees[0].eligibleShiftIds.length === 0)
     assert.deepEqual((await state()).assignments, original.assignments)
     await chip('陈小满', '日班').click()
-    await saveHours('陈小满').click()
     await persisted(s => JSON.stringify(s.employees[0].eligibleShiftIds) === JSON.stringify(['day']))
-    record('shift-chips-support-multiselect-cancel-and-empty-eligibility-without-deleting-roster')
+    record('shift-chips-autosave-multiselect-and-empty-eligibility-without-deleting-roster')
 
     // The leave editor owns a separate draft: changes across multiple months
     // cannot leak into storage until its Save button is used.
@@ -203,26 +196,37 @@ async function main() {
     await dialog().getByRole('button', { name: '取消', exact: true }).click()
     record('leave-calendar-supports-leap-month-without-changing-roster-month')
 
-    // Keep an older basic-information form open while newer card and leave
-    // edits are saved. Saving the basic form must merge these newer fields.
-    await page.getByRole('button', { name: '编辑陈小满', exact: true }).click()
-    await minWeek('陈小满').fill('30')
-    await chip('陈小满', '夜班').click()
-    await saveHours('陈小满').click()
-    await persisted(s => s.employees[0].minHoursPerWeek === 30 && s.employees[0].eligibleShiftIds.length === 2)
+    // The profile modal blocks interaction with the background. Begin a card
+    // edit immediately before opening it, then let autosave finish while it is
+    // open; profile changes must retain the latest hours, eligibility and leave.
     await leaveButton('陈小满').click()
     await leaveDay('2026-10-18').click()
     await dialog().getByRole('button', { name: '保存请假', exact: true }).click()
     await persisted(s => s.employees[0].unavailableDates.includes('2026-10-18'))
-    await page.getByLabel('岗位', { exact: true }).fill('资深值班员')
-    await page.getByRole('button', { name: '保存人员', exact: true }).click()
+    await chip('陈小满', '夜班').click()
+    await minWeek('陈小满').fill('30')
+    await page.getByRole('button', { name: '编辑陈小满', exact: true }).click()
+    await persisted(s => s.employees[0].minHoursPerWeek === 30 && s.employees[0].eligibleShiftIds.length === 2)
+    assert.equal(await profile().getAttribute('aria-modal'), 'true')
+    assert.equal(await profile().evaluate(e => e.contains(document.activeElement)), true)
+    await profile().getByLabel('岗位', { exact: true }).fill('未保存岗位')
+    for (let i = 0; i < 16; i++) { await page.keyboard.press('Tab'); assert.equal(await profile().evaluate(e => e.contains(document.activeElement)), true) }
+    await page.keyboard.press('Escape')
+    assert.equal(await profile().count(), 0)
+    assert.equal((await state()).employees[0].role, '值班员')
+    assert.equal((await state()).employees[0].minHoursPerWeek, 30)
+    assert.equal(await page.getByRole('button', { name: '编辑陈小满', exact: true }).evaluate(e => e === document.activeElement), true)
+    record('profile-modal-traps-focus-and-cancels-profile-only-without-rolling-back-autosave')
+    await page.getByRole('button', { name: '编辑陈小满', exact: true }).click()
+    await profile().getByLabel('岗位', { exact: true }).fill('资深值班员')
+    await profile().getByRole('button', { name: '保存人员', exact: true }).click()
     await persisted(s => s.employees[0].role === '资深值班员')
     const merged = (await state()).employees[0]
     assert.equal(merged.minHoursPerWeek, 30)
     assert.deepEqual(merged.eligibleShiftIds, ['day', 'night'])
     assert.deepEqual(merged.unavailableDates, ['2026-09-30', '2026-10-18', '2026-11-01', '2028-02-29'])
     assert.deepEqual((await state()).assignments, original.assignments)
-    record('stale-basic-editor-preserves-latest-hours-shift-eligibility-and-leave')
+    record('profile-modal-save-preserves-latest-hours-shift-eligibility-and-leave')
 
     for (const width of [390, 320]) {
       await page.setViewportSize({ width, height: 844 })
@@ -250,7 +254,7 @@ async function main() {
     await importDocument(capped)
     await navigate('成员管理')
     assert.equal(await minWeek('陈小满').inputValue(), '0')
-    assert.equal(await saveHours('陈小满').count(), 0)
+    assert.equal(await page.getByRole('button', { name: /保存陈小满设置|取消陈小满设置修改/ }).count(), 0)
     record('import-replaces-stale-card-drafts-even-for-matching-member-ids')
     await leaveButton('陈小满').click()
     await leaveDay('2026-10-12').click()

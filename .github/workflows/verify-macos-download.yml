@@ -7,11 +7,11 @@ on:
       release_tag:
         description: Published release containing the ARM64 DMG
         type: string
-        default: desktop-v1.1.0-38277333420
+        required: true
       asset_name:
         description: Exact published ARM64 disk image asset name
         type: string
-        default: shift-flow-macos-arm64.dmg
+        default: shift-schedule-expert-macos-arm64.dmg
       attempt_launch:
         description: Observe direct app startup for eight seconds if no quarantine is present
         type: boolean

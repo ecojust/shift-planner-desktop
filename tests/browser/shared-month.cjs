@@ -54,7 +54,7 @@ async function main() {
   }
   const reference = () => page.getByLabel('手动月参考工时', { exact: true })
   const personalMonth = () => page.getByLabel('月份测试甲每月最低工时', { exact: true })
-  async function saveReference(value) { await reference().fill(String(value)); await page.getByRole('button', { name: '保存本月', exact: true }).click(); await persisted(document => document.monthlyReferenceHours[document.month] === value) }
+  async function saveReference(value) { await reference().fill(String(value)); await reference().blur(); await persisted(document => document.monthlyReferenceHours[document.month] === value) }
   try {
     await page.goto(url, { waitUntil: 'networkidle' })
     const original = fixture()
@@ -80,33 +80,58 @@ async function main() {
     assert.equal(await personalMonth().inputValue(), '168')
     record('calendar-month-updates-member-reference-and-following-month-hours')
 
-    await reference().fill('123')
     await page.getByLabel('月份测试甲每周最低工时', { exact: true }).fill('12')
+    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).blur()
+    await persisted(document => document.employees[0].minHoursPerWeek === 12)
+    assert.equal(await page.getByRole('button', { name: '保存月份测试甲设置', exact: true }).count(), 0)
+    // Immediately move months while a valid reference edit is being saved.
+    // It belongs to the month in which it was entered, never the next month.
+    await reference().fill('123')
     await setMonth('2026-12')
-    // October and December now have the same saved value. Watching only the
-    // reference number would leave the unsaved October draft behind.
+    await persisted(document => document.monthlyReferenceHours['2026-10'] === 123)
     assert.equal(await reference().inputValue(), '168')
     assert.equal(await personalMonth().inputValue(), '168')
-    assert.equal((await state()).monthlyReferenceHours['2026-10'], 168)
+    assert.equal((await state()).monthlyReferenceHours['2026-10'], 123)
     assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
     assert.equal(await page.getByLabel('月份测试甲每周最低工时', { exact: true }).inputValue(), '12')
     await navigate('排班规则')
     await navigate('成员管理')
     assert.equal(await page.getByLabel('月份测试甲每周最低工时', { exact: true }).inputValue(), '12')
-    assert.equal((await state()).employees[0].minHoursPerWeek, 0, 'Navigating through rules must preserve the unsaved draft without saving it')
-    record('member-hour-draft-survives-navigation-through-rules')
-    await page.getByRole('button', { name: '取消月份测试甲设置修改', exact: true }).click()
+    assert.equal((await state()).employees[0].minHoursPerWeek, 12, 'Valid member hours automatically persist before navigation')
+    record('member-hours-auto-save-and-reference-edit-remains-in-its-original-month')
+
+    // A one-hour weekly range and blank reference are invalid drafts. Neither
+    // may replace the last valid settings, including when changing months.
+    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).fill('39')
+    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).blur()
+    await reference().fill('')
+    await reference().blur()
+    await page.waitForTimeout(750)
+    assert.equal((await state()).employees[0].minHoursPerWeek, 12)
+    assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
+    await setMonth('2026-10')
+    assert.equal(await reference().inputValue(), '123')
+    assert.equal(await personalMonth().inputValue(), '123')
+    assert.equal((await state()).employees[0].minHoursPerWeek, 12)
+    assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
+    await saveReference(168)
+    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).fill('12')
+    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).blur()
+    await setMonth('2026-12')
     await saveReference(160)
     await setMonth('2026-10')
     assert.equal(await reference().inputValue(), '168')
     assert.equal((await state()).monthlyReferenceHours['2026-12'], 160)
-    record('changing-month-discards-reference-draft-without-losing-member-draft-or-other-month-overrides')
+    record('invalid-auto-save-drafts-do-not-overwrite-member-hours-or-other-month-references')
 
     await navigate('排班规则')
+    await page.getByRole('tab', { name: '团队规则', exact: true }).click()
     await page.locator('.sp-settings-calculation-details > summary').click()
     await setMonth('2026-09')
+    assert.equal(await page.getByRole('tab', { name: '团队规则', exact: true }).getAttribute('aria-selected'), 'true')
     assert.equal(await page.locator('.sp-settings-weight-preview article').first().getAttribute('data-week'), '2026-08-31')
     await setMonth('2026-10')
+    assert.equal(await page.getByRole('tab', { name: '团队规则', exact: true }).getAttribute('aria-selected'), 'true')
     assert.equal(await page.locator('.sp-settings-weight-preview article').first().getAttribute('data-week'), '2026-09-28')
     record('weekday-example-regroups-weeks-from-shared-month')
 

@@ -23,7 +23,10 @@ function stringify(value: unknown, space?: number): string {
 /** Take a detached snapshot before resolving defaults. Vue reactive state is
  * deliberately copied through JSON; structuredClone cannot clone its proxies. */
 export function createSolverRequest(state: PlannerState, options: SolverRequest['options'], requestId: string): SolverRequest {
-  const snapshot = JSON.parse(stringify({ state, options })) as { state: PlannerState; options: SolverRequest['options'] }
+  // Profile images have no scheduling meaning. Keep them out of worker/IPC and
+  // debug requests; they remain intact in the live document and full backups.
+  const employees = state.employees.map(({ avatar: _avatar, ...employee }) => employee)
+  const snapshot = JSON.parse(stringify({ state: { ...state, employees }, options })) as { state: PlannerState; options: SolverRequest['options'] }
   return { protocolVersion: 1, requestId, state: resolveHoursState(snapshot.state), options: snapshot.options }
 }
 
