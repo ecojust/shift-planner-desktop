@@ -1,3 +1,4 @@
+const { selectGlobalMonth } = require('./helpers/month-picker.cjs')
 /* Run against an existing Vite server:
  * HOURS_TEST_URL=http://127.0.0.1:5197 PLAYWRIGHT_MODULE_PATH=/path/to/playwright node tests/browser/hours-settings.cjs
  * Browser-only verification: this does not exercise the packaged Tauri solver.
@@ -36,7 +37,7 @@ async function main() {
     await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: label }).click()
     if (compact) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
-  async function month(value) { const input = page.getByLabel('全局排班月份', { exact: true }); await input.fill(value); await input.dispatchEvent('change'); await persisted(s => s.month === value) }
+  async function month(value) { await selectGlobalMonth(page, value); await persisted(s => s.month === value) }
   async function reference(value) { await page.getByLabel('手动月参考工时', { exact: true }).fill(String(value)); await page.getByLabel('手动月参考工时', { exact: true }).blur(); await persisted(s => s.monthlyReferenceHours?.[s.month] === value) }
   const employee = name => page.locator('.sp-settings-employee-card').filter({ has: page.getByRole('heading', { name, exact: true }) })
   const follow = name => page.getByLabel(`${name}月最低工时跟随月参考值`, { exact: true })
@@ -214,7 +215,7 @@ async function main() {
     await page.getByRole('button', { name: '开始生成', exact: true }).click()
     await page.locator('.sp-solve-result.is-warning').waitFor({ timeout: 30000 })
     const unsuccessfulSearch = await page.locator('.sp-solve-result').innerText()
-    assert.match(unsuccessfulSearch, /浏览器搜索.*未找到.*原排班未改变/s)
+    assert.match(unsuccessfulSearch, /暂未找到符合规则的排班方案.*原排班未改变/s)
     assert.match(unsuccessfulSearch, /不代表无解/)
     assert.match(unsuccessfulSearch, /工时测试员.*744/s)
     assert.deepEqual((await state()).assignments, originalAssignments)

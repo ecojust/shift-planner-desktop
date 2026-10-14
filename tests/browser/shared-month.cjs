@@ -3,11 +3,12 @@
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const assert = require('node:assert/strict')
+const { selectGlobalMonth, readGlobalMonth } = require('./helpers/month-picker.cjs')
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
 const url = process.env.STAFFING_TEST_URL || 'http://127.0.0.1:5197'
 const output = path.resolve(process.env.SHARED_MONTH_TEST_OUTPUT || 'test-results/shared-month-ui')
 const checks = [], errors = []
-const report = { url, startedAt: new Date().toISOString(), scope: 'Real Chromium shared-month controls, draft isolation, calendar allowance totals, rules and independent leave calendar', checks, errors, ok: false }
+const report = { url, startedAt: new Date().toISOString(), scope: 'Real Chromium selection-only month picker, keyboard and year boundaries, shared-month controls, draft isolation, calendar allowance totals, rules and independent leave calendar', checks, errors, ok: false }
 const record = (name, detail) => { checks.push({ name, ok: true, detail }); console.log(`PASS ${name}`) }
 
 function fixture() {
@@ -39,8 +40,15 @@ async function main() {
     for (let attempts = 0; attempts < 160; attempts++) { const value = await state(); if (value && predicate(value)) return value; await page.waitForTimeout(50) }
     assert.fail('Expected shared month or settings did not persist')
   }
-  const month = () => page.getByLabel('全局排班月份', { exact: true })
-  async function setMonth(value) { await month().fill(value); await month().dispatchEvent('change'); await persisted(document => document.month === value) }
+  const month = () => page.getByRole('button', { name: '全局排班月份', exact: true })
+  const picker = () => page.getByRole('dialog', { name: '选择排班月份', exact: true })
+  async function setMonth(value) { await selectGlobalMonth(page, value); await persisted(document => document.month === value) }
+  async function importState(document, name = 'shared-month.json') {
+    await page.locator('input[type=file]').setInputFiles({ name, mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.getByRole('button', { name: '确认导入', exact: true }).click()
+    await persisted(value => value.month === document.month && value.teamName === document.teamName)
+  }
+  async function focused(locator) { assert.equal(await locator.evaluate(element => element === document.activeElement), true) }
   async function navigate(label) {
     const toggle = page.getByRole('button', { name: '打开导航', exact: true }), mobile = await toggle.isVisible()
     if (mobile) await toggle.click()
@@ -48,8 +56,9 @@ async function main() {
     if (mobile) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
   async function uniqueMonth(value) {
-    assert.equal(await page.locator('input[type=month]').count(), 1, 'Only the header can set the roster month')
-    assert.equal(await month().inputValue(), value)
+    assert.equal(await page.locator('.sp-topbar input').count(), 0, 'The header month must not accept free text')
+    assert.equal(await month().count(), 1, 'Only one control selects the global roster month')
+    assert.equal(await readGlobalMonth(page), value)
     assert.equal(await month().isVisible(), true)
   }
   const reference = () => page.getByLabel('手动月参考工时', { exact: true })
@@ -58,9 +67,7 @@ async function main() {
   try {
     await page.goto(url, { waitUntil: 'networkidle' })
     const original = fixture()
-    await page.locator('input[type=file]').setInputFiles({ name: 'shared-month.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(original)) })
-    await page.getByRole('button', { name: '确认导入', exact: true }).click()
-    await persisted(document => document.teamName === original.teamName)
+    await importState(original)
     for (const section of ['排班日历', '成员管理', '班次设置', '排班规则']) {
       await navigate(section)
       await uniqueMonth('2026-10')
@@ -68,6 +75,80 @@ async function main() {
     record('all-four-pages-share-one-visible-month-control')
 
     await navigate('排班日历')
+    await month().focus()
+    await page.keyboard.type('0000-99invalid')
+    await page.keyboard.press('Backspace')
+    await page.keyboard.press('Delete')
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write'])
+    await page.evaluate(() => navigator.clipboard.writeText('2026-13'))
+    await page.keyboard.press('Control+V')
+    await uniqueMonth('2026-10')
+    assert.equal((await state()).month, '2026-10')
+    assert.equal(await month().getAttribute('aria-haspopup'), 'dialog')
+    await month().press('Enter')
+    await picker().waitFor()
+    assert.equal(await picker().locator('input, textarea, [contenteditable=true]').count(), 0)
+    await focused(picker().getByRole('button', { name: '2026 年 10 月', exact: true }))
+    await page.keyboard.type('99999-00')
+    await page.keyboard.press('Backspace')
+    await page.keyboard.press('Delete')
+    await page.keyboard.press('Control+V')
+    assert.equal((await state()).month, '2026-10')
+    assert.equal(await month().getAttribute('aria-expanded'), 'true')
+    await page.keyboard.press('Escape')
+    await picker().waitFor({ state: 'detached' })
+    await focused(month())
+    record('typing-pasting-and-deleting-cannot-create-an-invalid-month')
+
+    await month().click()
+    await picker().getByRole('button', { name: '下一年', exact: true }).click()
+    assert.equal((await state()).month, '2026-10', 'Browsing years must not change the saved month')
+    await picker().getByRole('button', { name: '选择年份', exact: true }).click()
+    await picker().getByRole('button', { name: '2028 年', exact: true }).click()
+    await picker().getByRole('button', { name: '2028 年 5 月', exact: true }).click()
+    await persisted(document => document.month === '2028-05')
+    await uniqueMonth('2028-05')
+    await focused(month())
+    await month().click()
+    await picker().getByRole('button', { name: '下一年', exact: true }).click()
+    await page.locator('.sp-breadcrumb > strong').click()
+    await picker().waitFor({ state: 'detached' })
+    await uniqueMonth('2028-05')
+    assert.equal((await state()).month, '2028-05')
+    await month().click()
+    assert.equal(await picker().getByRole('button', { name: '2028 年 5 月', exact: true }).getAttribute('aria-pressed'), 'true')
+    await page.keyboard.press('Escape')
+    record('year-and-month-buttons-commit-selection-while-outside-close-discards-browsing')
+
+    await setMonth('2026-12')
+    await month().press('Enter')
+    await picker().waitFor()
+    await page.keyboard.press('ArrowRight')
+    await focused(picker().getByRole('button', { name: '2027 年 1 月', exact: true }))
+    assert.equal((await state()).month, '2026-12')
+    await page.keyboard.press('Enter')
+    await persisted(document => document.month === '2027-01')
+    await focused(month())
+    await month().press('Space')
+    await picker().waitFor()
+    await page.keyboard.press('PageDown')
+    await focused(picker().getByRole('button', { name: '2028 年 1 月', exact: true }))
+    await page.keyboard.press('End')
+    await focused(picker().getByRole('button', { name: '2028 年 12 月', exact: true }))
+    await page.keyboard.press('Home')
+    await focused(picker().getByRole('button', { name: '2028 年 1 月', exact: true }))
+    const focusable = picker().locator('button:not([disabled])')
+    await focusable.last().focus()
+    await page.keyboard.press('Tab')
+    await focused(focusable.first())
+    await page.keyboard.press('Shift+Tab')
+    await focused(focusable.last())
+    await page.keyboard.press('Escape')
+    await focused(month())
+    await uniqueMonth('2027-01')
+    await setMonth('2026-10')
+    record('keyboard-selection-crosses-years-and-escape-restores-focus-without-committing')
+
     await setMonth('2026-11')
     assert.match(await page.locator('.sp-month-label').innerText(), /2026\s*年\s*11\s*月/)
     await navigate('成员管理')
@@ -151,7 +232,7 @@ async function main() {
     await leave.getByLabel('请假月份', { exact: true }).dispatchEvent('change')
     await leave.locator('[data-leave-date="2027-01-02"]').click()
     assert.equal((await state()).month, '2026-11')
-    assert.equal(await month().inputValue(), '2026-11')
+    assert.equal(await readGlobalMonth(page), '2026-11')
     await leave.getByRole('button', { name: '保存请假', exact: true }).click()
     await persisted(document => document.employees[0].unavailableDates.includes('2027-01-02'))
     await uniqueMonth('2026-11')
@@ -166,6 +247,40 @@ async function main() {
     record('reload-retains-shared-month-overrides-and-cross-month-assignments')
     await page.screenshot({ path: path.join(output, '01-shared-month-desktop.png') })
 
+    const saved = await state()
+    for (const boundary of ['0001-01', '9999-12']) {
+      await importState({ ...saved, month: boundary }, `month-boundary-${boundary}.json`)
+      await uniqueMonth(boundary)
+      const lower = boundary === '0001-01'
+      const blocked = lower ? '上个月' : '下个月'
+      const allowed = lower ? '下个月' : '上个月'
+      assert.equal(await page.locator('.sp-global-month').getByRole('button', { name: blocked, exact: true }).isDisabled(), true)
+      await month().click()
+      assert.equal(await picker().getByRole('button', { name: lower ? '上一年' : '下一年', exact: true }).isDisabled(), true)
+      await page.keyboard.press(lower ? 'ArrowLeft' : 'ArrowRight')
+      await page.keyboard.press(lower ? 'PageUp' : 'PageDown')
+      await focused(picker().getByRole('button', { name: lower ? '1 年 1 月' : '9999 年 12 月', exact: true }))
+      await picker().getByRole('button', { name: '选择年份', exact: true }).click()
+      assert.equal(await picker().getByRole('button', { name: lower ? '上一组年份' : '下一组年份', exact: true }).isDisabled(), true)
+      assert.equal(await picker().getByRole('button', { name: lower ? '0 年' : '10000 年', exact: true }).count(), 0)
+      await page.keyboard.press('Escape')
+      await page.locator('.sp-global-month').getByRole('button', { name: allowed, exact: true }).click()
+      await persisted(document => document.month === (lower ? '0001-02' : '9999-11'))
+      await page.locator('.sp-global-month').getByRole('button', { name: blocked, exact: true }).click()
+      await persisted(document => document.month === boundary)
+      await uniqueMonth(boundary)
+    }
+    const currentMonth = await page.evaluate(() => {
+      const now = new Date()
+      return `${String(now.getFullYear()).padStart(4, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    })
+    await page.locator('.sp-global-month').getByRole('button', { name: '本月', exact: true }).click()
+    await persisted(document => document.month === currentMonth)
+    await uniqueMonth(currentMonth)
+    await importState(saved, 'shared-month-restored.json')
+    await navigate('成员管理')
+    record('year-boundaries-stay-within-0001-and-9999-and-current-month-shortcut-still-works')
+
     for (const width of [1440, 1024, 768, 390, 320]) {
       await page.setViewportSize({ width, height: width > 390 ? 650 : 844 })
       if (await page.getByRole('button', { name: '打开导航', exact: true }).isVisible()) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
@@ -176,8 +291,8 @@ async function main() {
       assert.ok(box && box.x >= 0 && box.x + box.width <= width && box.y >= 0, JSON.stringify(box))
       const geometry = await page.locator('.sp-topbar').evaluate(header => {
         const bounds = header.getBoundingClientRect()
-        const selectors = ['.sp-breadcrumb > button', '.sp-breadcrumb > strong', '.sp-global-month > button', '.sp-global-month label > span', '.sp-global-month input', '.sp-save-indicator', '.sp-build-version']
-        const items = selectors.flatMap(selector => [...header.querySelectorAll(selector)]).map(element => {
+        const selectors = ['.sp-breadcrumb > button', '.sp-breadcrumb > strong', '.sp-global-month > button', '[aria-label="全局排班月份"]', '.sp-save-indicator', '.sp-build-version']
+        const items = [...header.querySelectorAll(selectors.join(', '))].map(element => {
           const rect = element.getBoundingClientRect()
           return { label: element.getAttribute('aria-label') || element.textContent.trim(), left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height }
         }).filter(rect => rect.width > 0 && rect.height > 0)
@@ -198,8 +313,16 @@ async function main() {
       assert.ok(sticky && Math.abs(sticky.y) <= .5, `${width}: header must remain pinned after real scroll`)
       assert.equal(await month().isVisible(), true)
       await uniqueMonth('2026-11')
+      await month().click()
+      await picker().waitFor()
+      const panel = await picker().boundingBox()
+      assert.ok(panel && panel.x >= 0 && panel.x + panel.width <= width && panel.y >= 0 && panel.y + panel.height <= (width > 390 ? 650 : 844), `${width}: picker must fit viewport: ${JSON.stringify(panel)}`)
+      assert.equal(await picker().getByRole('button', { name: '2026 年 11 月', exact: true }).isVisible(), true)
+      await page.screenshot({ path: path.join(output, `03-month-picker-${width}.png`) })
+      await page.keyboard.press('Escape')
+      await focused(month())
       await page.screenshot({ path: path.join(output, `02-shared-month-${width}.png`) })
-      record(`width-${width}-header-controls-do-not-overlap-and-stay-pinned-after-scroll`, { ...size, geometry, sticky })
+      record(`width-${width}-header-controls-and-picker-fit-without-overlap-after-scroll`, { ...size, geometry, sticky, panel })
     }
     await setMonth('2026-10')
     assert.equal(await personalMonth().inputValue(), '168')

@@ -30,8 +30,6 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .sp-main { margin-left: 218px; min-width: 0; }
 .sp-topbar { position: sticky; top: 0; z-index: 20; min-height: 68px; display: grid; grid-template-columns: minmax(80px, 1fr) auto minmax(0, 1fr); align-items: center; gap: 14px; padding: 6px 28px; border-bottom: 1px solid #e3e9e4; background: #fff; }
 .sp-global-month { display: flex; align-items: center; gap: 3px; min-width: 0; }
-.sp-global-month label { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px; color: #65786e; white-space: nowrap; }
-.sp-global-month input { min-width: 0; width: 145px; min-height: 40px; padding: 7px 8px; border: 1px solid #d9e2da; border-radius: 6px; background: #f8faf8; color: #245b4e; font-weight: 600; font-size: 13px; }
 .sp-global-month .sp-icon-button { width: 40px; height: 40px; flex-shrink: 0; }
 .sp-current-month { flex-shrink: 0; min-height: 40px; border: 0; border-radius: 6px; padding: 0 9px; background: transparent; font-size: 12px; }
 .sp-current-month:hover { background: #edf4f0; }
@@ -283,8 +281,6 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
   .sp-main { margin-left: 0; }.sp-nav-scrim { display: block; position: fixed; inset: 0; z-index: 55; border: 0; background: #16312766; backdrop-filter: blur(2px); }
   .sp-topbar .sp-mobile-toggle { display: inline-flex; width: 44px; height: 44px; }.sp-topbar { min-height: 104px; padding: 4px 12px 8px; gap: 2px 8px; grid-template-columns: minmax(0, 1fr) auto; }
   .sp-global-month { grid-column: 1 / -1; grid-row: 2; justify-content: center; }
-  .sp-global-month label { gap: 6px; }.sp-global-month label > span { font-size: 10px; }
-  .sp-global-month input { width: 155px; min-height: 44px; }
   .sp-global-month .sp-icon-button { width: 44px; height: 44px; }
   .sp-current-month { min-height: 44px; padding: 0 7px; }
   .sp-top-actions { grid-column: 2; grid-row: 1; }
@@ -301,7 +297,6 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
   .sp-toast { left: 50%; bottom: 15px; width: max-content; max-width: 92vw; }.sp-modal { padding: 22px 19px; border-radius: 14px; max-height: calc(100dvh - 30px); }.sp-overlay { padding: 15px 12px; }
   .sp-subheading { padding: 18px 14px; flex-wrap: wrap; }.sp-subheading p { font-size: 11px; }.sp-issues small { display: none; }.sp-issues > button { align-items: flex-start; }
 }
-@media (max-width: 400px) { .sp-global-month label > span { display: none; } }
 @media print { .sp-main { margin: 0; }.sp-content { padding: 0; }.sp-check-status { display: none; } }
 
 /* Amounts stay readable over every shift colour; the gold glow is static. */

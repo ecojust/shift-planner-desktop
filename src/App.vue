@@ -4,6 +4,7 @@ import Icon from './Icon.vue'
 import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
+import MonthPicker from './MonthPicker.vue'
 import { makeDefaultState } from './defaults'
 import { datesOfMonth, shiftHours, validateSchedule } from './scheduler'
 import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP_BYTES } from './storage'
@@ -142,11 +143,6 @@ function remember() { history.value.push({ assignments: clone(state.value.assign
 function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; flash('已撤销上一次排班调整') } }
 function chooseSection(value: Section) { section.value = value; mobileNav.value = false }
 function changeMonth(value: string) { if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(value) || Number(value.slice(0, 4)) < 1) return; state.value.month = value; weekIndex.value = 0; history.value = [] }
-function selectMonth(event: Event) {
-  const input = event.target as HTMLInputElement
-  changeMonth(input.value)
-  input.value = state.value.month
-}
 function navigateMonth(direction: number) {
   const index = Number(state.value.month.slice(0, 4)) * 12 + Number(state.value.month.slice(5)) - 1 + direction
   if (index < 12 || index >= 120000) return
@@ -419,7 +415,7 @@ watch([generating, cancelling], async () => {
         <div class="sp-breadcrumb"><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" @click="mobileNav = true"><Icon name="menu" /></button><strong>{{ sectionLabel }}</strong></div>
         <div class="sp-global-month" role="group" aria-label="所有面板共用排班月份">
           <button class="sp-icon-button" aria-label="上个月" :disabled="state.month === '0001-01'" @click="navigateMonth(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button>
-          <label><span>排班月份</span><input :value="state.month" type="month" min="0001-01" max="9999-12" aria-label="全局排班月份" @change="selectMonth" /></label>
+          <MonthPicker :model-value="state.month" @update:model-value="changeMonth" />
           <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
           <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
         </div>

@@ -1,3 +1,4 @@
+const { selectGlobalMonth } = require('./helpers/month-picker.cjs')
 /* Real browser integration checks. Start Vite first, then run:
  * ALLOWANCES_TEST_URL=http://127.0.0.1:5197 PLAYWRIGHT_MODULE_PATH=/path/to/playwright node tests/browser/allowances.cjs
  * Optional: PLAYWRIGHT_EXECUTABLE_PATH=/path/to/chromium
@@ -77,8 +78,7 @@ async function main() {
   }
   async function closeNotice() { const close = page.getByRole('button', { name: '关闭提示', exact: true }); if (await close.isVisible()) await close.click() }
   async function month(value) {
-    await page.getByLabel('全局排班月份', { exact: true }).fill(value)
-    await page.getByLabel('全局排班月份', { exact: true }).dispatchEvent('change')
+    await selectGlobalMonth(page, value);
     await persisted(s => s.month === value)
   }
   async function amount(employeeId, expected) {

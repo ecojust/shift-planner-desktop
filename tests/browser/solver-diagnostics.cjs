@@ -1,3 +1,4 @@
+const { selectGlobalMonth } = require('./helpers/month-picker.cjs')
 /* Start Vite first, then run from the project root:
  * SHIFT_FLOW_PYTHON=/path/to/python PLAYWRIGHT_MODULE_PATH=/path/to/playwright node tests/browser/solver-diagnostics.cjs
  * Optional: SOLVER_DIAGNOSTICS_TEST_URL, SOLVER_DIAGNOSTICS_TEST_OUTPUT,
@@ -131,8 +132,7 @@ async function fillState(page,desktop=false,state=fixture) {
       assert.equal(await desktop.locator('h1').innerText(),expected);
     });
     await desktop.getByRole('button',{name:'排班日历',exact:true}).click();
-    await desktop.getByLabel('全局排班月份',{exact:true}).fill('2026-11');
-    await desktop.getByLabel('全局排班月份',{exact:true}).dispatchEvent('change');
+    await selectGlobalMonth(desktop, '2026-11');
     await check('editing settings marks diagnostics stale and keeps failed snapshot separate',async()=>{
       await desktop.locator('.sp-diagnostic-stale').waitFor();
       const {data:past}=await saveSnapshot(desktop,'导出本次规则',saved);assert.equal(past.state.month,'2026-10');assert.deepEqual(past.options,lastRequest.options);

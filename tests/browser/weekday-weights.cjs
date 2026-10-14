@@ -1,3 +1,4 @@
+const { selectGlobalMonth } = require('./helpers/month-picker.cjs')
 /* Real browser integration checks. Start Vite first, then run:
  * HOURS_TEST_URL=http://127.0.0.1:5197 PLAYWRIGHT_MODULE_PATH=/path/to/playwright node tests/browser/weekday-weights.cjs
  * Optional: PLAYWRIGHT_EXECUTABLE_PATH=/path/to/chromium
@@ -232,16 +233,14 @@ async function main() {
     await saveRule([1, 6], 40)
 
     await navigate('成员管理')
-    await page.getByLabel('全局排班月份').fill('2025-04')
-    await page.getByLabel('全局排班月份').dispatchEvent('change')
+    await selectGlobalMonth(page, '2025-04');
     await persisted(s => s.month === '2025-04')
     await openTeamRules()
     await preview('2025-03-31', 7, 21, 28)
     assert.equal(Number.parseInt(await page.locator('.sp-settings-weight-month-total').innerText(), 10), 149)
     record('missing-monday-preview-retains-outside-month-share', { firstWeek: 28, selected: 7, other: 21, month: 149 })
     await navigate('成员管理')
-    await page.getByLabel('全局排班月份').fill('2025-10')
-    await page.getByLabel('全局排班月份').dispatchEvent('change')
+    await selectGlobalMonth(page, '2025-10');
     await persisted(s => s.month === '2025-10')
     await page.reload({ waitUntil: 'networkidle' })
     await openTeamRules()

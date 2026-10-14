@@ -1,3 +1,4 @@
+const { selectGlobalMonth, openMonthPicker } = require('./helpers/month-picker.cjs')
 /* Run against a freshly built production preview (or an existing Vite server):
  * MEMBER_AUTOSAVE_TEST_URL=http://127.0.0.1:5194 \
  * PLAYWRIGHT_MODULE_PATH=/path/to/playwright PLAYWRIGHT_EXECUTABLE_PATH=/path/to/chromium \
@@ -101,15 +102,17 @@ async function main() {
   // Dispatching both events in one browser task guarantees the tested transition
   // occurs before a debounce timer, independent of browser/CI speed.
   async function inputThen(label, value, action) {
+    if (action.month) await openMonthPicker(page, action.month)
     await page.evaluate(({ label, value, action }) => {
       const input = document.querySelector(`input[aria-label="${label}"]`)
       if (!input) throw new Error(`Missing input ${label}`)
       input.value = value
       input.dispatchEvent(new Event('input', { bubbles: true }))
       if (action.month) {
-        const month = document.querySelector('input[aria-label="全局排班月份"]')
-        month.value = action.month
-        month.dispatchEvent(new Event('change', { bubbles: true }))
+        const [year, month] = action.month.split('-').map(Number)
+        const choice = document.querySelector(`[role="dialog"][aria-label="选择排班月份"] button[aria-label="${year} 年 ${month} 月"]`)
+        if (!choice) throw new Error(`Missing month choice ${action.month}`)
+        choice.click()
       } else {
         const selector = action.navigation ? 'nav[aria-label="应用导航"] button' : 'button'
         const button = [...document.querySelectorAll(selector)].find(button => button.textContent.trim() === action.button)
@@ -302,11 +305,9 @@ async function main() {
     assert.equal(await monthHours('李青').inputValue(), '160')
     assert.equal(await monthHours().inputValue(), '151')
     await monthHours().fill('152')
-    await page.getByLabel('全局排班月份', { exact: true }).fill('2026-11')
-    await page.getByLabel('全局排班月份', { exact: true }).dispatchEvent('change')
+    await selectGlobalMonth(page, '2026-11');
     await persisted(value => value.month === '2026-11' && value.employees[0].minHoursPerMonth === 152)
-    await page.getByLabel('全局排班月份', { exact: true }).fill('2026-10')
-    await page.getByLabel('全局排班月份', { exact: true }).dispatchEvent('change')
+    await selectGlobalMonth(page, '2026-10');
     await persisted(value => value.month === '2026-10')
     await monthHours().fill('151')
     await persistedMember(employee => employee.minHoursPerMonth === 151)

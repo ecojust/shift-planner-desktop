@@ -1,3 +1,4 @@
+const { selectGlobalMonth } = require('./helpers/month-picker.cjs')
 /* Real browser acceptance checks for per-member shift sequence/frequency rules.
  * Start Vite first, then run from the project root:
  * SHIFT_FLOW_PYTHON=/path/to/python PLAYWRIGHT_MODULE_PATH=/path/to/playwright node tests/browser/shift-rules.cjs
@@ -222,13 +223,11 @@ async function main() {
     record('saving one rule group preserves the other group’s unsaved draft');
 
     await add('nonConsecutiveShifts').click(); await add('weeklyShiftLimits').click();
-    await page.getByLabel('全局排班月份',{exact:true}).fill('2026-11');
-    await page.getByLabel('全局排班月份',{exact:true}).dispatchEvent('change');
+    await selectGlobalMonth(page, '2026-11');
     await persisted(page,state => state.month === '2026-11');
     assert.equal(await card('nonConsecutiveShifts').locator('.sp-shift-rule-row').count(),2);
     assert.equal(await card('weeklyShiftLimits').locator('.sp-shift-rule-row').count(),2);
-    await page.getByLabel('全局排班月份',{exact:true}).fill('2026-10');
-    await page.getByLabel('全局排班月份',{exact:true}).dispatchEvent('change');
+    await selectGlobalMonth(page, '2026-10');
     await persisted(page,state => state.month === '2026-10');
     record('month changes discard uncommitted rule drafts without altering saved rules');
 
