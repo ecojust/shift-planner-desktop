@@ -1,4 +1,4 @@
-"""One bounded JSON request on stdin, exactly one JSON response on stdout."""
+"""One bounded JSON request from stdin or --input, one JSON response on stdout."""
 import json
 import sys
 import time
@@ -56,6 +56,28 @@ def load_engine():
             faulthandler.cancel_dump_traceback_later()
 
 
+def read_request():
+    """File replay must not wait for stdin EOF, including under an IDE debugger."""
+    arguments = sys.argv[1:]
+    if '--input' in arguments:
+        if arguments.count('--input') != 1:
+            raise ValueError('--input 只能指定一个规则 JSON 文件。')
+        index = arguments.index('--input')
+        if index + 1 == len(arguments) or arguments[index + 1].startswith('--'):
+            raise ValueError('--input 后需要指定规则 JSON 文件路径。')
+        try:
+            with open(arguments[index + 1], 'rb') as source:
+                raw = source.read(MAX_INPUT_BYTES + 1)
+        except OSError:
+            # Do not copy private local paths from an exception into the result.
+            raise ValueError('无法读取规则 JSON 文件，请检查文件是否存在及读取权限。') from None
+    else:
+        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
+    if len(raw) > MAX_INPUT_BYTES:
+        raise ValueError('请求超过 8 MiB 上限。')
+    return json.loads(raw, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f'不支持非有限数字 {value}')))
+
+
 def main():
     stage('loading')
     # Import the real native engine after announcing the stage. This lets the
@@ -83,10 +105,7 @@ def main():
         return
     try:
         stage('reading')
-        raw = sys.stdin.buffer.read(MAX_INPUT_BYTES + 1)
-        if len(raw) > MAX_INPUT_BYTES:
-            raise ValueError('请求超过 8 MiB 上限。')
-        request = json.loads(raw, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(f'不支持非有限数字 {value}')))
+        request = read_request()
         stage('solving')
         result = solve(request)
     except (ValueError, UnicodeDecodeError, RecursionError) as exc:

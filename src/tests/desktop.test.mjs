@@ -30,6 +30,31 @@ test('infeasible and error statuses never supply replacement assignments', () =>
     assert.equal(decision.assignments, undefined)
   }
 })
+test('infeasibility retains specific native evidence and adjustment route without stacking generic lists', () => {
+  const request = fixture()
+  const evidence = { id: 'coverage-day', type: 'coverage-capacity', severity: 'error', date: '2026-10-02', shiftId: 'day', message: '2026-10-02 早班需要 1 人，可用 0 人。', suggestion: '小林当天请假，请补充可上早班的成员。', target: 'team' }
+  const decision = checkDesktopResult(request, result(request, { status: 'INFEASIBLE', issues: [evidence], message: '已证明无解。原排班未修改。' }))
+  assert.deepEqual(decision.issues, [evidence])
+  assert.equal(decision.assignments, undefined)
+  assert.equal(decision.message.match(/原排班/g)?.length, 1)
+  assert.doesNotMatch(decision.message, /月\/周最低工时|周最高工时、锁定安排/)
+})
+test('legacy blanket infeasibility is reported as unlocalized and offers replay, never as exact diagnosis', () => {
+  const request = fixture()
+  const decision = checkDesktopResult(request, result(request, { status: 'INFEASIBLE', issues: [{ id: 'infeasible', type: 'infeasible', severity: 'error', message: '现有人员、班次人数设置与硬规则存在冲突。' }], message: '请检查所有硬性规则。原排班未改变。' }))
+  assert.match(decision.message, /尚未定位具体冲突/)
+  assert.match(decision.message, /导出本次规则/)
+  assert.deepEqual(decision.issues, [])
+})
+test('an exhausted diagnosis budget keeps infeasibility proof without claiming a located conflict', () => {
+  const request = fixture()
+  const issue = { id: 'diagnosis-incomplete', type: 'diagnosis-incomplete', severity: 'error', message: '求解器已证明无解，但限时冲突分析尚未完成。', suggestion: '导出本次规则进一步复现。', target: 'rules' }
+  const decision = checkDesktopResult(request, result(request, { status: 'INFEASIBLE', issues: [issue] }))
+  assert.match(decision.message, /已确认.*无可行解.*尚未定位具体冲突/)
+  assert.doesNotMatch(decision.message, /逐项调整/)
+  assert.deepEqual(decision.issues, [issue])
+  assert.equal(decision.assignments, undefined)
+})
 test('response request identity and engine must match', () => {
   const request = fixture()
   for (const change of [{ requestId: 'stale' }, { protocolVersion: 2 }, { engine: 'browser' }]) assert.equal(checkDesktopResult(request, result(request, change)).success, false)

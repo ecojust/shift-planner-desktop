@@ -11,7 +11,9 @@ import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain'
 import { desktop, solveDesktop, cancelDesktop, desktopSolverInfo, importDesktopBackup, exportDesktopFile, checkDesktopResult, listenSolverProgress, matchingSolverPhase, solverPhaseLabels, formatSolverError } from './DesktopSolver'
 import type { SolverRequest, SolverPhase } from './DesktopSolver'
 import { BUILD_VERSION } from './buildInfo'
-import { minimumMonthHours, monthlyHoursByEmployee, resolveHoursState } from './hours.ts'
+import { minimumMonthHours, monthlyHoursByEmployee } from './hours.ts'
+import { createSolverRequest, solverDebugJSON, solverDebugFileName } from './solverDebug'
+import { withSolverGuidance, diagnosticActionLabel } from './solverGuidance'
 import './planner.css'
 
 const brandMarkUrl = `${import.meta.env.BASE_URL}brand-mark.png`
@@ -47,7 +49,10 @@ const engineState = ref<'checking' | 'ready' | 'error'>(desktop ? 'checking' : '
 const engineDiagnostic = ref(false)
 const solvePhase = ref<SolverPhase>('starting')
 const phaseSeconds = ref(0)
-const solverFeedback = ref<{ success: boolean; message: string; details: string[]; diagnostic: boolean } | null>(null)
+type Attempt = { request: SolverRequest; originalState: PlannerState; revision: number }
+let activeAttempt: Attempt | null = null
+const solverFeedback = ref<{ success: boolean; message: string; details: string[]; issues: Issue[]; diagnostic: boolean; attempt: Attempt | null; stale: boolean } | null>(null)
+const expandedFeedback = ref(false)
 let phaseStartedAt = 0
 let engineCheckPending = false
 let unlistenProgress: (() => void) | null = null
@@ -58,6 +63,7 @@ let activeRequestId: string | null = null
 let generationTimer = 0
 let disposed = false
 const importer = ref<HTMLInputElement | null>(null)
+const settingsPanel = ref<InstanceType<typeof SettingsPanel> | null>(null)
 const importCandidate = ref<Document | null>(null)
 const editing = ref<{ employee: Employee; date: string; shiftId: string; locked: boolean } | null>(null)
 const calendarDate = ref('')
@@ -126,6 +132,8 @@ function allowanceDescription(employeeId: string, date: string) {
 }
 function money(amount: number) { return amount.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) }
+// Request correlation does not require a secure-context-only randomUUID API.
+function solverRequestId() { return `${Array.from(crypto.getRandomValues(new Uint8Array(12)), value => value.toString(16).padStart(2, '0')).join('')}-${Date.now()}` }
 function flash(message: string) { notice.value = message; window.clearTimeout(noticeTimer); noticeTimer = window.setTimeout(() => notice.value = '', 5500) }
 function remember() { history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])) }); if (history.value.length > 10) history.value.shift() }
 function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; flash('已撤销上一次排班调整') } }
@@ -167,8 +175,9 @@ function finishGeneration() {
   window.clearTimeout(workerTimer); window.clearInterval(generationTimer)
   generating.value = false; cancelling.value = false; activeRequestId = null
 }
-function feedback(success: boolean, message: string, details: string[] = [], diagnostic = false) {
-  solverFeedback.value = { success, message, details: [...new Set(details)].filter(detail => !message.includes(detail)), diagnostic }
+function feedback(success: boolean, message: string, details: string[] = [], diagnostic = false, issues: Issue[] = []) {
+  solverFeedback.value = { success, message, details: [...new Set(details)].filter(detail => !message.includes(detail)), diagnostic, issues: withSolverGuidance(issues), attempt: activeAttempt, stale: !!activeAttempt && activeAttempt.revision !== revision }
+  expandedFeedback.value = false
   // The persistent result card is the sole announcement of solver outcomes.
   notice.value = ''; window.clearTimeout(noticeTimer)
 }
@@ -204,10 +213,12 @@ async function generate() {
   solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solvePhase.value = 'starting'
   const started = Date.now(); phaseStartedAt = started
   generationTimer = window.setInterval(() => { elapsedSeconds.value = Math.floor((Date.now() - started) / 1000); phaseSeconds.value = Math.floor((Date.now() - phaseStartedAt) / 1000) }, 250)
-  const input = resolveHoursState(clone(state.value)), inputRevision = revision
   const seed = Math.floor(Math.random() * 2147483647)
+  const originalState = clone(state.value), inputRevision = revision
+  const request = createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: allowPartial.value, seed }, solverRequestId())
+  const input = request.state
+  activeAttempt = { request, originalState, revision: inputRevision }
   if (desktop) {
-    const request: SolverRequest = { protocolVersion: 1, requestId: crypto.randomUUID(), state: input, options: { timeLimitSeconds: solveTimeLimit.value, allowPartial: allowPartial.value, seed } }
     activeRequestId = request.requestId
     try {
       const result = await solveDesktop(request)
@@ -220,7 +231,7 @@ async function generate() {
           remember(); state.value.assignments = checked.assignments; showIssues.value = checked.issues.length > 0
           scheduleSource.value = result.status === 'OPTIMAL' ? '本地 CP-SAT · 最优方案' : '本地 CP-SAT · 可行方案'
         }
-        feedback(checked.success, checked.message, checked.success ? [] : checked.issues.map(i => i.message))
+        feedback(checked.success, checked.message, [], false, checked.success ? [] : checked.issues)
       }
     } catch (error) {
       if (!disposed) {
@@ -240,8 +251,8 @@ async function generate() {
     if (inputRevision !== revision) feedback(false, '排班期间设置发生变化，已保留你的修改。请按最新设置重新生成。')
     else if (error) feedback(false, error)
     else {
-      const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || (!allowPartial.value && issue.type === 'coverage'))
-      if (result.success === false || blockingIssues.length) feedback(false, '浏览器搜索未找到满足全部硬性规则的方案，原排班未改变。可调整工时或使用桌面约束求解器重试。', ['以下为未采用方案的问题：', ...blockingIssues.map((issue: Issue) => issue.message)])
+      const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || (!request.options.allowPartial && issue.type === 'coverage'))
+      if (result.success === false || blockingIssues.length) feedback(false, '浏览器搜索尚未找到可行方案，这不代表无解。原排班未改变。', ['下方是未采用方案中的问题，可参考调整，或用桌面约束求解器重试。'], false, blockingIssues)
       else { remember(); state.value.assignments = result.assignments; showIssues.value = result.issues.length > 0; scheduleSource.value = '浏览器排班 · 启发式方案'; feedback(true, result.issues.length ? `浏览器排班已生成，有 ${result.issues.length} 项需要检查` : '浏览器排班已生成，所有岗位已覆盖，规则检查通过') }
     }
     finishGeneration()
@@ -271,6 +282,28 @@ async function exportExcel() {
   const rows = payrollRows(payroll.value)
   try { if (await download(scheduleXLSX(state.value, { payrollRows: rows }), `${state.value.teamName}-${state.value.month}-排班与津贴.xlsx`, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')) flash('Excel 已导出，包含排班、班次和津贴明细') } catch (e) { flash(e instanceof Error ? e.message : String(e)) }
 }
+async function exportRules(attempt: Attempt | null = null) {
+  try {
+    const source = attempt ? 'attempt' : 'current'
+    const originalState = attempt?.originalState ?? clone(state.value)
+    const request = attempt?.request ?? createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: allowPartial.value, seed: Math.floor(Math.random() * 2147483647) }, solverRequestId())
+    const data = solverDebugJSON(request, { buildVersion: BUILD_VERSION, source, runtime: desktop ? 'desktop' : 'browser', originalState })
+    if (await download(data, solverDebugFileName(request, source), 'application/json')) flash(attempt ? '已导出失败当次的原始规则与求解参数，可直接复现' : '已导出当前成员、班次、规则及求解所需的完整上下文')
+  } catch (e) { flash(e instanceof Error ? e.message : String(e)) }
+}
+async function openDiagnostic(issue: Issue) {
+  if (!issue.target) return
+  chooseSection(issue.target)
+  if (issue.target === 'calendar') {
+    if (issue.date) jumpToIssue(issue.date)
+    if (issue.employeeId) { groupFilter.value = ''; employeeQuery.value = state.value.employees.find(e => e.id === issue.employeeId)?.name ?? '' }
+  }
+  await nextTick()
+  if (issue.target !== 'calendar') { await settingsPanel.value?.focusDiagnostic(issue.employeeId, issue.shiftId); return }
+  const element = document.querySelector<HTMLElement>('.sp-calendar-card')
+  element?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  element?.focus({ preventScroll: true })
+}
 async function exportBackup() {
   try { if (await download(backupJSON(state.value), `排班 plus-${state.value.month}.json`, 'application/json')) { showBackup.value = false; flash('完整备份已导出') } }
   catch (e) { flash(e instanceof Error ? e.message : String(e)) }
@@ -292,7 +325,7 @@ function confirmImport() { if (!importCandidate.value) return; state.value = imp
 function jumpToIssue(date?: string) { if (!date) return; if (!date.startsWith(state.value.month)) changeMonth(date.slice(0, 7)); weekIndex.value = weekOf(date); view.value = 'week' }
 let noticeTimer = 0
 let saveTimer = 0
-watch(state, () => { revision++; window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
+watch(state, () => { revision++; if (solverFeedback.value && !solverFeedback.value.success) solverFeedback.value.stale = true; window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
   if (saveError.value.startsWith('原有数据读取失败')) return
   try { saveLocal(state.value); savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); saveError.value = '' }
   catch { saveError.value = '自动保存失败，请导出 JSON 备份，避免刷新丢失。' }
@@ -339,10 +372,31 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
-        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span aria-hidden="true">·</span><button @click="showGenerate = true">{{ desktop ? '本地 CP-SAT' : '浏览器启发式排班' }}</button></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '检查算法…' : '自动排班' }}</button></div></div>
+        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span aria-hidden="true">·</span><button @click="showGenerate = true">{{ desktop ? '本地 CP-SAT' : '浏览器启发式排班' }}</button></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" title="导出当前成员、班次、规则和求解上下文为 JSON" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '检查算法…' : '自动排班' }}</button></div></div>
         <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
         <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消并停止本地任务…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成浏览器排班' }}</strong><p>总计 {{ elapsedSeconds }} 秒<span v-if="desktop"> · 当前阶段 {{ phaseSeconds }} 秒</span> · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `排班搜索时限 ${solveTimeLimit} 秒，结束后还需返回并校验结果。` : solvePhase === 'finishing' ? '搜索已结束，正在返回并校验结果。' : `正在准备本地算法，启动和加载不占 ${solveTimeLimit} 秒搜索时限。` }}</p><p v-else>浏览器搜索时限 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
-        <div v-if="solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status"><Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" /><div><strong>{{ solverFeedback.message }}</strong><ul v-if="solverFeedback.details.length"><li v-for="(detail,index) in solverFeedback.details.slice(0,8)" :key="index">{{ detail }}</li></ul><p v-if="solverFeedback.details.length > 8">还有 {{ solverFeedback.details.length - 8 }} 项，请检查规则与锁定安排。</p><details v-if="solverFeedback.diagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>若重新检测后仍无法启动，开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查打包的算法组件与本机运行环境。</p></details></div><button class="sp-icon-button" aria-label="关闭求解结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button></div>
+        <div v-if="solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status">
+          <Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" />
+          <div>
+            <strong>{{ solverFeedback.message }}</strong>
+            <p v-if="!solverFeedback.success && solverFeedback.stale" class="sp-diagnostic-stale">设置已更改，下方诊断仍对应上一次求解；请重新排班验证修改。</p>
+            <p v-for="(detail,index) in solverFeedback.details" :key="index">{{ detail }}</p>
+            <ol v-if="solverFeedback.issues.length" class="sp-conflict-list">
+              <li v-for="(issue,index) in (expandedFeedback ? solverFeedback.issues : solverFeedback.issues.slice(0,5))" :key="`${issue.id}-${index}`">
+                <span>{{ issue.message }}</span>
+                <p v-if="issue.suggestion" class="sp-conflict-suggestion">建议：{{ issue.suggestion }}</p>
+                <button v-if="diagnosticActionLabel(issue)" class="sp-link" @click="openDiagnostic(issue)">{{ diagnosticActionLabel(issue) }} →</button>
+              </li>
+            </ol>
+            <button v-if="solverFeedback.issues.length > 5" class="sp-link" @click="expandedFeedback = !expandedFeedback">{{ expandedFeedback ? '收起部分问题' : `查看其余 ${solverFeedback.issues.length - 5} 项问题` }}</button>
+            <div v-if="!solverFeedback.success && solverFeedback.attempt" class="sp-diagnostic-actions">
+              <button class="sp-button" @click="exportRules(solverFeedback.attempt)"><Icon name="download" :size="15" />导出本次规则</button>
+              <span>保留 {{ solverFeedback.attempt.request.state.month }} 当次的设置、锁定安排和求解参数。</span>
+            </div>
+            <details v-if="solverFeedback.diagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>若重新检测后仍无法启动，开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查打包的算法组件与本机运行环境。</p></details>
+          </div>
+          <button class="sp-icon-button" aria-label="关闭求解结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button>
+        </div>
         <dl v-if="section === 'calendar'" class="sp-overview" aria-label="本月排班概览">
           <div><dt>需求覆盖</dt><dd>{{ coverage.percentage }}<small>%</small></dd><span :class="coverage.percentage === 100 && !coverage.excess ? 'sp-text-green' : 'sp-text-amber'">{{ coverage.excess ? `固定班次超出 ${coverage.excess} 人次，请调整` : coverage.percentage === 100 ? `${coverage.filled} 个需求班位已满足` : `缺 ${coverage.total - coverage.filled} 个班位` }}</span></div>
           <div><dt>参与成员</dt><dd>{{ state.employees.length }}<small>人</small></dd><span>{{ state.shifts.length }} 种班次</span></div>
@@ -350,7 +404,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         </dl>
         <p v-if="payrollError && section === 'calendar'" class="sp-calculation-error" role="alert">津贴无法计算：{{ payrollError }}。调整配置前不会导出金额。</p>
         <template v-if="section === 'calendar'">
-          <section class="sp-calendar-card" aria-label="人员排班表">
+          <section class="sp-calendar-card" aria-label="人员排班表" tabindex="-1">
             <div class="sp-calendar-toolbar">
               <div class="sp-date-controls"><span class="sp-month-label"><Icon name="calendar" :size="19" /><span>{{ monthTitle }}</span></span><div v-if="view === 'week'" class="sp-arrows"><button class="sp-icon-button" aria-label="上一时段" title="本月上一周" :disabled="weekIndex === 0" @click="navigatePeriod(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button><button class="sp-icon-button" aria-label="下一时段" title="本月下一周" :disabled="weekIndex >= weekCount - 1" @click="navigatePeriod(1)"><Icon name="arrow" :size="16" /></button></div><span class="sp-period">{{ period }}</span></div>
               <div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div>
@@ -393,7 +447,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
           <div v-if="showIssues" class="sp-issues"><template v-if="issues.length"><button v-for="issue in issues.slice(0, 100)" :key="issue.id" @click="jumpToIssue(issue.date)"><span :class="issue.severity">{{ issue.severity === 'error' ? '冲突' : '提醒' }}</span><span>{{ issue.message }}</span><small v-if="issue.date">{{ issue.date }} ↗</small></button><p v-if="issues.length > 100">还有 {{ issues.length - 100 }} 项，请先处理当前提醒。</p></template><p v-else>休假、班次资格、月最低与周工时上下限、连续工作和休息间隔均通过检查。<button class="sp-link" @click="chooseSection('rules')">自定义规则 →</button></p></div>
         </template>
 
-        <SettingsPanel v-if="section !== 'calendar'" :state="state" :section="section" :payroll="state.payroll" @change="settingsChanged" />
+        <SettingsPanel v-if="section !== 'calendar'" ref="settingsPanel" :state="state" :section="section" :payroll="state.payroll" @change="settingsChanged" />
       </main>
     </div>
 
@@ -436,7 +490,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
           <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数。</p></li>
           <li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li>
           <li><strong>设置班次津贴</strong><p>在「班次设置」填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li>
-          <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，JSON 用于恢复全部设置。首次进入展示的是可编辑示例团队。</p></li>
+          <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，“备份与恢复”中的 JSON 用于恢复全部设置。排班日历的“导出规则”保存当前求解配置，失败提示里的“导出本次规则”保留失败当次输入，便于复现排查。首次进入展示的是可编辑示例团队。</p></li>
         </ol>
         <figure class="sp-help-qrcode">
           <img :src="helpQrCodeUrl" alt="公众号二维码" width="258" height="258" />

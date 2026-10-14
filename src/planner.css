@@ -55,7 +55,7 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-page-heading p { font-size: 12px; color: #748477; margin-top: 5px; }
 .sp-context { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
 .sp-context button { background: none; padding: 0; border: 0; font-size: inherit; color: #597867; text-decoration: underline; text-decoration-color: #bacabc; text-underline-offset: 3px; }
-.sp-heading-actions { display: flex; align-items: center; gap: 10px; }
+.sp-heading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
 .sp-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 16px; border: 1px solid #d9e2da; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 550; white-space: nowrap; transition: background .15s, box-shadow .15s; }
 .sp-button:hover { background: #f4f8f5; }
 .sp-primary { background: var(--sp-teal); color: #fff !important; border-color: var(--sp-teal); box-shadow: 0 3px 5px #0c887a13; }
@@ -203,6 +203,18 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-solve-result > svg { flex-shrink: 0; margin-top: 2px; }
 .sp-solve-result ul { margin: 8px 0 0; padding-left: 18px; }
 .sp-solve-result.is-warning { background: #fff8e9; color: #8b6b3d; border-color: #eee1c3; }
+.sp-conflict-list { margin: 12px 0; padding-left: 20px; max-height: 340px; overflow: auto; }
+.sp-conflict-list > li { padding: 9px 4px; border-bottom: 1px solid #e9dcbc; }
+.sp-conflict-list > li:last-child { border: 0; }
+.sp-conflict-list > li > span { font-weight: 550; }
+.sp-conflict-list .sp-conflict-suggestion { color: #70644e; margin: 5px 0; }
+.sp-conflict-list .sp-link { min-height: 30px; }
+.sp-diagnostic-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; margin-top: 13px; }
+.sp-diagnostic-actions .sp-button { font-size: 11px; min-height: 36px; }
+.sp-diagnostic-actions > span { font-size: 11px; color: #80715b; }
+.sp-solve-result .sp-diagnostic-stale { font-weight: 550; }
+.sp-settings:focus, .sp-calendar-card:focus { outline: 2px solid #82a797; outline-offset: 3px; }
+.sp-settings-employee-card:focus, .sp-settings-shift-card:focus { outline: 2px solid #82a797; outline-offset: 3px; }
 .sp-solve-spinner { width: 18px; height: 18px; margin-top: 3px; flex-shrink: 0; border: 2px solid #cfe0d1; border-top-color: #557d61; border-radius: 50%; animation: sp-solve-turn 1s linear infinite; }
 @keyframes sp-solve-turn { to { transform: rotate(360deg); } }
 .sp-solver-options { border: 1px solid #dfe9e1; border-radius: 10px; padding: 15px; margin-top: 16px; background: #fafcf9; }

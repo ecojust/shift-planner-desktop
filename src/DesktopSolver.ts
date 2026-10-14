@@ -77,8 +77,17 @@ export function checkDesktopResult(request: SolverRequest, result: SolverResult)
   if (!result || result.protocolVersion !== 1 || result.requestId !== request.requestId || result.engine !== 'ortools-cp-sat') return reject('本地求解器返回的结果协议不匹配，原排班未改变。')
   const responseIssues = Array.isArray(result.issues) ? result.issues : []
   if (result.status !== 'OPTIMAL' && result.status !== 'FEASIBLE') {
+    if (result.status === 'INFEASIBLE') {
+      // Old solvers only returned a list of every possible rule. Do not repeat it
+      // or present that list as a diagnosis of this particular request.
+      const concrete = responseIssues.filter(issue => issue.type !== 'infeasible')
+      const localized = concrete.some(issue => !['diagnosis-incomplete', 'diagnosis-background'].includes(issue.type))
+      const message = localized
+        ? '本次配置无法排班，请按下方冲突逐项调整。原排班未改变。'
+        : '已确认本次规则无可行解，但尚未定位具体冲突。请导出本次规则进一步排查；原排班未改变。'
+      return reject(message, concrete)
+    }
     const messages: Record<string, string> = {
-      INFEASIBLE: '当前硬性规则无法同时满足，请检查月/周最低工时、周最高工时、锁定安排、人员资格、上班权重与班次需求。原排班未改变。',
       UNKNOWN: '在限定时间内尚未找到可行方案，这不代表无解。可以增加求解时间或调整规则；原排班未改变。',
       MODEL_INVALID: '排班配置或约束模型无效，原排班未改变。',
       ERROR: '本地求解失败，原排班未改变。',

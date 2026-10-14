@@ -66,4 +66,8 @@ export interface Issue {
   message: string
   date?: string
   employeeId?: string
+  shiftId?: string
+  /** A suggested adjustment, never applied automatically. */
+  suggestion?: string
+  target?: 'team' | 'shifts' | 'rules' | 'calendar'
 }

@@ -11,6 +11,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
 
 from ortools.sat.python import cp_model
+from diagnostics import ConstraintDiagnostics, daily_capacity_issues, weekday_capacity_issues, problem
 
 ENGINE = 'ortools-cp-sat'
 DAY = 1440
@@ -257,6 +258,7 @@ def solve(request: Any) -> dict:
             week_days[week] += 1
             week_dates[week].append(day)
         weights = state['rules'].get('weekdayWeights')
+        allow_partial = options.get('allowPartial', False)
         weighted_weeks = {week: weekday_targets(weights, days, 0)[:2] for week, days in week_dates.items()} if weights else {}
         # A partial boundary week has its own minimum for the days in this
         # month. Out-of-month work counts only towards the full-week maximum.
@@ -274,16 +276,17 @@ def solve(request: Any) -> dict:
             eid, sid, day = a['employeeId'], a['shiftId'], _date(a['date'])
             cell = (eid, day)
             if cell in fixed_cells:
-                conflicts.append(issue('duplicate', f'{a["date"]} 同一员工有多条固定排班（含锁定休息）。', date=a['date'], employeeId=eid))
+                conflicts.append(problem('duplicate', f'{a["date"]} {emap[eid].get("name", eid)}有多条固定排班（含锁定休息）。', '在排班日历保留该员工当天的一条安排，解除或删除重复固定记录。', 'calendar', date=a['date'], employeeId=eid))
             fixed_cells[cell] = a
             if sid == 'off':
                 continue
             start_clock, duration = shift_times[sid]
             start, end = day * DAY + start_clock, day * DAY + start_clock + duration
             if sid not in emap[eid]['eligibleShiftIds']:
-                conflicts.append(issue('qualification', '固定排班违反员工班次资格，请先调整锁定排班或月外历史。', date=a['date'], employeeId=eid))
-            if any(x in leave[eid] for x in range(start // DAY, (end - 1) // DAY + 1)):
-                conflicts.append(issue('unavailable', '固定排班与整日请假重叠（包含跨夜部分）。', date=a['date'], employeeId=eid))
+                conflicts.append(problem('qualification', f'{a["date"]} {emap[eid].get("name", eid)}已固定上{smap[sid].get("name", sid)}，但该成员未勾选此班次资格。', '确认成员可上班次，或在排班日历解除/更换此固定安排；月外历史也会参与校验。', 'team', date=a['date'], employeeId=eid, shiftId=sid))
+            overlapping_leave = [dt.date.fromordinal(x).isoformat() for x in range(start // DAY, (end - 1) // DAY + 1) if x in leave[eid]]
+            if overlapping_leave:
+                conflicts.append(problem('unavailable', f'{a["date"]} {emap[eid].get("name", eid)}的固定{smap[sid].get("name", sid)}与 {"、".join(overlapping_leave)} 的整日请假重叠（包含跨夜部分）。', '核实请假日期，或解除/调整与请假重叠的固定班次。', 'team', date=a['date'], employeeId=eid, shiftId=sid))
             fixed_work[eid].append((start, end, a))
             fixed_days[eid].add(day)
             fixed_coverage[(day, sid)].add(eid)
@@ -296,23 +299,30 @@ def solve(request: Any) -> dict:
             work = sorted(fixed_work[eid], key=lambda item: (item[0], item[1]))
             for previous, current in zip(work, work[1:]):
                 if current[0] < previous[1] + rest:
-                    conflicts.append(issue('rest', '固定排班间休息不足或时间重叠，请先调整锁定排班或月外历史。', employeeId=eid, date=current[2]['date']))
-            if any(value > caps[eid] for value in fixed_weeks[eid].values()):
-                conflicts.append(issue('weekly-hours', '固定排班已超过周一至周日自然周工时上限。', employeeId=eid))
+                    interval = current[0] - previous[1]
+                    gap = f'间隔仅 {_hours_text(interval)} 小时' if interval >= 0 else f'时间重叠 {_hours_text(-interval)} 小时'
+                    conflicts.append(problem('rest', f'{emap[eid].get("name", eid)}的固定安排 {previous[2]["date"]} {smap[previous[2]["shiftId"]].get("name", previous[2]["shiftId"])} → {current[2]["date"]} {smap[current[2]["shiftId"]].get("name", current[2]["shiftId"])}，{gap}，要求至少休息 {_hours_text(rest)} 小时。', '调整这两次安排中的至少一次；先核对时间与锁定记录，确实允许更短休息时再修改休息规则。', 'calendar', employeeId=eid, date=current[2]['date']))
+            for week, value in fixed_weeks[eid].items():
+                if value > caps[eid]:
+                    conflicts.append(problem('weekly-hours', f'{emap[eid].get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，固定安排已有 {_hours_text(value)} 小时，超过周上限 {_hours_text(caps[eid])} 小时（含跨月实际工时）。', f'至少减少该周 {_hours_text(value - caps[eid])} 小时的固定工作，或确认并调整成员周最高工时。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
             run, last = 0, -10000
             for day in sorted(fixed_days[eid]):
                 run = run + 1 if day == last + 1 else 1
                 if run == consecutive + 1:
-                    conflicts.append(issue('consecutive-days', '固定排班超过连续工作日上限。', employeeId=eid))
+                    conflicts.append(problem('consecutive-days', f'{emap[eid].get("name", eid)}在 {dt.date.fromordinal(day - consecutive).isoformat()} 至 {dt.date.fromordinal(day).isoformat()} 已连续固定上班 {run} 天，上限为 {consecutive} 天。', '在这段连续安排中解除至少一天固定工作并安排休息，或核实连续工作日上限。', 'calendar', employeeId=eid, date=dt.date.fromordinal(day).isoformat()))
                 last = day
         for group in state['rules'].get('separationGroups', []):
             members = set(group['employeeIds'])
             selected = set(group['shiftIds']) or set(smap)
-            if any(len(staff & members) > 1 for (_, sid), staff in fixed_coverage.items() if sid in selected):
-                conflicts.append(issue('separation', f'固定排班违反同班互斥分组“{group.get("name", group["id"])}”。'))
+            for (day, sid), staff in fixed_coverage.items():
+                overlap = staff & members
+                if sid in selected and len(overlap) > 1:
+                    names = '、'.join(str(emap[eid].get('name', eid))[:80] for eid in sorted(overlap)[:5]) + (f'等 {len(overlap)} 人' if len(overlap) > 5 else '')
+                    group_name = str(group.get('name', group['id']))[:120]
+                    conflicts.append(problem('separation', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}已固定安排 {names}，互斥组“{group_name}”要求他们同班最多 1 人。', '解除这些成员的同班锁定，或核对互斥分组的成员及适用班次。', 'rules', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
         for (day, sid), staff in fixed_coverage.items():
             if day in active and smap[sid].get('staffingMode', 'minimum') == 'fixed' and len(staff) > smap[sid]['required']:
-                conflicts.append(issue('overstaffed', f'{smap[sid].get("name", sid)}锁定排班有 {len(staff)} 人，超过每日固定人数 {smap[sid]["required"]}；允许缺员也不能突破固定人数上限。', date=dt.date.fromordinal(day).isoformat()))
+                conflicts.append(problem('overstaffed', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}锁定排班有 {len(staff)} 人，超过每日固定人数 {smap[sid]["required"]}；允许缺员也不能突破固定人数上限。', f'解除至少 {len(staff) - smap[sid]["required"]} 人的该班锁定，或修改此班固定人数/人数模式。', 'calendar', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
@@ -331,11 +341,12 @@ def solve(request: Any) -> dict:
             )
             minimum = sum(monthly_minimums.values())
             if minimum > capacity:
-                return response('INFEASIBLE', '全部班次的固定人数上限无法提供所需月工时，原排班未修改。', [issue(
-                    'monthly-min-hours', f'月最低工时合计 {_hours_text(minimum)} 小时，固定人数上限在本月最多提供 {_hours_text(capacity)} 小时；请调整固定人数、最低工时或将适合的班次改为每日最少人数。'
+                return response('INFEASIBLE', '全部班次的固定人数上限无法提供所需月工时，原排班未修改。', [problem(
+                    'monthly-min-hours', f'月最低工时合计 {_hours_text(minimum)} 小时，固定人数上限在本月最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时。', '在班次设置增加固定人数或将适合的班次改为每日最少人数，或核实成员月最低工时。', 'shifts'
                 )])
         check_time()
         model = cp_model.CpModel()
+        diagnostics = ConstraintDiagnostics()
         x = {}
         cells = defaultdict(list)
         coverage = defaultdict(list)
@@ -397,57 +408,101 @@ def solve(request: Any) -> dict:
             if intervals:
                 model.add_no_overlap(intervals)
             for week, terms in weekly[eid].items():
-                model.add(sum(terms) + fixed_weeks[eid][week] <= caps[eid])
+                diagnostics.track(model.add(sum(terms) + fixed_weeks[eid][week] <= caps[eid]), f'weekly-cap-{eid}-{week}', problem(
+                    'weekly-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周最多 {_hours_text(caps[eid])} 小时，其中已有固定安排 {_hours_text(fixed_weeks[eid][week])} 小时（含跨月）。',
+                    '核对该成员周最高工时及这周固定安排，或增加可分担班次的人员。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
+            # Weekly limits also bound monthly work, even if isolated candidate
+            # shifts would each fit. This remains an upper bound (not a promise
+            # that rest/consecutive constraints allow all of these minutes).
+            possible_weeks = {week: min(possible_weeks.get(week, 0), max(0, caps[eid] - fixed_weeks[eid][week] + fixed_month_weeks[eid][week])) for week in week_days}
+            possible_month = min(possible_month, sum(possible_weeks.values()))
             if possible_month < monthly_minimums[eid]:
-                conflicts.append(issue('monthly-min-hours', f'{e.get("name", eid)}本月最低 {_hours_text(monthly_minimums[eid])} 小时，但现有班次资格、请假和固定安排下最多可安排 {_hours_text(possible_month)} 小时。', employeeId=eid))
-            model.add(sum(total_minutes[eid]) + fixed_current_minutes[eid] >= monthly_minimums[eid])
+                conflicts.append(problem('monthly-min-hours', f'{e.get("name", eid)}本月最低 {_hours_text(monthly_minimums[eid])} 小时，但现有班次资格、请假、固定安排和周上限 {_hours_text(caps[eid])} 小时的条件下，最多不超过 {_hours_text(possible_month)} 小时，至少相差 {_hours_text(monthly_minimums[eid] - possible_month)} 小时。', '在成员管理核对该成员最低工时、周上限、可上班次及请假日期；达到此上界也仍须满足休息等规则。', 'team', employeeId=eid))
+            diagnostics.track(model.add(sum(total_minutes[eid]) + fixed_current_minutes[eid] >= monthly_minimums[eid]), f'monthly-min-{eid}', problem(
+                'monthly-min-hours', f'{e.get("name", eid)}在 {state["month"]} 的月最低工时为 {_hours_text(monthly_minimums[eid])} 小时。',
+                '核对该成员月最低工时与可用班次；固定人数班次不能为了补工时超额排人。此条与同列要求组合冲突。', 'team', employeeId=eid))
             for week, target in weekly_targets[eid].items():
                 if possible_weeks.get(week, 0) < target:
-                    conflicts.append(issue('weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，本月 {week_days[week]} 天折算最低 {_hours_text(target)} 小时，但现有条件下最多可安排 {_hours_text(possible_weeks.get(week, 0))} 小时。', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
-                model.add(sum(month_weekly[eid][week]) + fixed_month_weeks[eid][week] >= target)
+                    conflicts.append(problem('weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，本月 {week_days[week]} 天折算最低 {_hours_text(target)} 小时，但现有班次、请假、固定安排和周上限下最多不超过 {_hours_text(possible_weeks.get(week, 0))} 小时。', '核对该成员这一周的可上班次、请假、锁定安排及最低/最高工时；跨月已排工时占用周上限。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
+                diagnostics.track(model.add(sum(month_weekly[eid][week]) + fixed_month_weeks[eid][week] >= target), f'weekly-min-{eid}-{week}', problem(
+                    'weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周要求本月工时至少 {_hours_text(target)} 小时（周最低 {_hours_text(weekly_minimums[eid])} 小时 × 本月 {week_days[week]} 天 / 7，按分钟向上取整）。',
+                    '核对该成员周最低工时和当周可用班次；完整班次不能拆成零散小时，每人达到最低值所需的完整班次数也会占用名额。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
             for first_day in range(dates[0] - consecutive, dates[-1] + 1):
                 last_day = first_day + consecutive
                 terms = [var for day in dates if first_day <= day <= last_day for var in cells[(eid, day)]]
                 prior = sum(first_day <= day <= last_day for day in fixed_days[eid])
                 if terms:
-                    model.add(sum(terms) + prior <= consecutive)
+                    diagnostics.track(model.add(sum(terms) + prior <= consecutive), f'consecutive-{eid}', problem(
+                        'consecutive-days', f'{e.get("name", eid)}最多连续上班 {consecutive} 天；本月及相邻月份的固定工作日一并计入。',
+                        '为该成员留出休息日、让其他成员分担连续日期的需求，或核实连续工作天数上限。此条与同列要求组合冲突。', 'rules', employeeId=eid))
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
             return response('INFEASIBLE', '员工最低工时无法达到，原排班未修改；允许缺员也不会放宽最低工时。', conflicts)
         check_time()
+        conflicts = daily_capacity_issues(employees, shifts, dates, x, fixed_coverage, fixed_cells, leave, shift_times, fixed_work, fixed_weeks, caps, rest, state['rules'].get('separationGroups', []), allow_partial, check_time)
+        if not conflicts:
+            conflicts = weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_coverage, allow_partial, weekday_targets, check_time)
+        if conflicts:
+            for index, item in enumerate(conflicts):
+                item['id'] = f'{item["type"]}-{index}'
+            return response('INFEASIBLE', '已定位无法满足的人员或星期人数要求，原排班未修改。', conflicts)
+        # Aggregate weekly lower bounds versus fixed coverage upper bounds.
+        # Include prior Sunday's overnight minutes and actual month carry-in.
+        if all(s.get('staffingMode', 'minimum') == 'fixed' for s in shifts):
+            for week in week_days:
+                check_time()
+                lower = max(month_start, week * DAY)
+                upper = min(month_end, (week + 7) * DAY)
+                capacity = sum(overlap_minutes(day * DAY + clock, day * DAY + clock + duration, lower, upper) * smap[sid]['required'] for day in dates for sid, (clock, duration) in shift_times.items()) + sum(overlap_minutes(start, end, lower, upper) for work in fixed_work.values() for start, end, a in work if _date(a['date']) not in active)
+                minimum = sum(weekly_targets[eid][week] for eid in emap)
+                if minimum > capacity:
+                    return response('INFEASIBLE', '这一周的固定班次容量不足以满足成员最低工时，原排班未修改。', [problem(
+                        'weekly-fixed-capacity', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，本月 {week_days[week]} 天内全员最低工时合计 {_hours_text(minimum)} 小时，固定班次人数最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时（按实际跨夜分钟计入）。',
+                        '增加对应班次固定人数、将适合的班次改为每日最少人数，或核实成员的周最低工时。', 'shifts', date=dt.date.fromordinal(max(week, dates[0])).isoformat())])
         for group in state['rules'].get('separationGroups', []):
+            check_time()
+            member_names = [str(emap[eid].get('name', eid))[:80] for eid in group['employeeIds'][:5]]
+            member_label = '、'.join(member_names) + (f'等 {len(group["employeeIds"])} 人' if len(group['employeeIds']) > 5 else '')
+            group_label = f'互斥组“{str(group.get("name", group["id"]))[:120]}”（{member_label}）'
             for day in dates:
+                check_time()
                 for sid in group['shiftIds'] or smap:
                     terms = [x[(eid, day, sid)] for eid in group['employeeIds'] if (eid, day, sid) in x]
                     prior = len(fixed_coverage[(day, sid)] & set(group['employeeIds']))
                     if terms:
-                        model.add(sum(terms) + prior <= 1)
+                        diagnostics.track(model.add(sum(terms) + prior <= 1), f'separation-{group["id"]}-{day}-{sid}', problem(
+                            'separation', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}，{group_label}最多 1 人。',
+                            '核对该互斥分组的成员与适用班次，或增加组外合格人员。此条与同列要求组合冲突。', 'rules', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
         shortages = []
-        allow_partial = options.get('allowPartial', False)
         for day in dates:
             for s in shifts:
                 target = max(0, int(s['required']) - len(fixed_coverage[(day, s['id'])]))
                 terms = coverage[(day, s['id'])]
                 fixed_staffing = s.get('staffingMode', 'minimum') == 'fixed'
+                detail = problem('coverage', f'{dt.date.fromordinal(day).isoformat()} {s.get("name", s["id"])}每日{"固定" if fixed_staffing else "最少"} {s["required"]} 人，其中已固定安排 {len(fixed_coverage[(day, s["id"])])} 人。' + (' 已允许缺员，但固定人数上限仍有效。' if allow_partial and fixed_staffing else ''),
+                    '核对该班每日人数和人数模式，或增加当日符合资格、休息及工时要求的人员。此条与同列要求组合冲突。', 'shifts', date=dt.date.fromordinal(day).isoformat(), shiftId=s['id'])
                 if allow_partial:
                     shortage = model.new_int_var(0, target, f'shortage_{day}_{s["id"]}')
                     shortages.append(shortage)
                     if fixed_staffing:
                         # A nonnegative exact shortfall keeps the fixed ceiling
                         # hard and provides a tighter linear model than max().
-                        model.add(sum(terms) + shortage == target)
+                        diagnostics.track(model.add(sum(terms) + shortage == target), f'coverage-{day}-{s["id"]}', detail)
                     else:
                         model.add_max_equality(shortage, [target - sum(terms), 0])
                 elif fixed_staffing:
-                    model.add(sum(terms) == target)
+                    diagnostics.track(model.add(sum(terms) == target), f'coverage-{day}-{s["id"]}', detail)
                 else:
-                    model.add(sum(terms) >= target)
+                    diagnostics.track(model.add(sum(terms) >= target), f'coverage-{day}-{s["id"]}', detail)
         if weights:
             staff = len(employees)
             selected_count = len(weights['days'])
             other_count = 7 - selected_count
             for week, (selected, others) in weighted_weeks.items():
+                weight_detail = problem('weekday-weight', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，星期 {"、".join(str(day) for day in weights["days"])} 合计占 {weights["percent"]}%（向上取整），其余星期平摊，组内每日人数相差不超过 1；月边界按存在的星期折算。',
+                    '核对该周的星期比例与每日人数要求、可用人员；调整比例或有关日期的人员/班次容量。此条与同列要求组合冲突。', 'rules', date=dt.date.fromordinal(max(week, dates[0])).isoformat())
+                weight_key = f'weekday-weight-{week}'
                 counts = {}
                 for day in week_dates[week]:
                     count = model.new_int_var(0, len(employees), f'weekday_total_{day}')
@@ -468,17 +523,17 @@ def solve(request: Any) -> dict:
                     model.add_division_equality(other_target, full_other * len(others) + other_count - 1, other_count)
                 else:
                     model.add(other_target == 0)
-                model.add(sum(counts[day] for day in selected) == selected_target)
-                model.add(sum(counts[day] for day in others) == other_target)
+                diagnostics.track(model.add(sum(counts[day] for day in selected) == selected_target), weight_key, weight_detail)
+                diagnostics.track(model.add(sum(counts[day] for day in others) == other_target), weight_key, weight_detail)
                 if len(week_dates[week]) == 7:
-                    model.add(full_total == sum(counts.values()))
+                    diagnostics.track(model.add(full_total == sum(counts.values())), weight_key, weight_detail)
                 for label, group in (('selected', selected), ('remaining', others)):
                     if len(group) > 1:
                         low = model.new_int_var(0, len(employees), f'weekday_{week}_{label}_min')
                         high = model.new_int_var(0, len(employees), f'weekday_{week}_{label}_max')
                         model.add_min_equality(low, [counts[day] for day in group])
                         model.add_max_equality(high, [counts[day] for day in group])
-                        model.add(high - low <= 1)
+                        diagnostics.track(model.add(high - low <= 1), weight_key, weight_detail)
         # Fairness is secondary: normalized workload and shift rotation.
         fairness_terms = []
         load_vars = []
@@ -559,7 +614,13 @@ def solve(request: Any) -> dict:
         if saved_assignments is not None and status in (cp_model.UNKNOWN, cp_model.OPTIMAL):
             return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, None, None, '已保留满足全部硬约束的可行方案，后续班次数或公平轮班优化达到时限。')
         if status == cp_model.INFEASIBLE:
-            return response('INFEASIBLE', '已证明当前硬约束无法同时满足，原排班未修改。请检查每日最少或固定人数、请假、工时、班间休息、同班互斥及星期权重；允许缺员也不会放宽固定人数上限、星期配额和工时规则。', [issue('infeasible', '现有人员、班次人数设置与硬规则存在冲突。')])
+            try:
+                details = diagnostics.explain(model, deadline, int(options.get('seed', 1010)), _hours_text(rest))
+            except Exception:
+                # A failure to explain a completed proof must never erase it or
+                # turn into UNKNOWN / ERROR; no replacement roster is returned.
+                details = [problem('diagnosis-incomplete', '求解器已证明无解，但进一步定位冲突时未能完成诊断。', '请导出本次规则用于复现排查；当前结果尚不能归因于某一项设置。', 'rules')]
+            return response('INFEASIBLE', '已确认当前配置无法排班，具体冲突与调整方向见下方；原排班未修改。', details)
         if status == cp_model.MODEL_INVALID:
             return response('MODEL_INVALID', '求解器拒绝了无效模型，原排班未修改。', [issue('model-invalid', solver.solution_info()[:1000])])
         return response('UNKNOWN', '求解达到时限，尚未找到可行方案；这不代表无解。原排班未修改。', [issue('timeout', '可增加求解时限后重试。')])
