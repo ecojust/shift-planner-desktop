@@ -29,7 +29,7 @@ export const solverPhaseLabels: Record<SolverPhase, string> = {
   starting: '正在准备排班',
   loading: '正在准备排班',
   reading: '正在检查设置',
-  solving: '正在生成排班',
+  solving: '正在计算方案与轮班公平性',
   finishing: '正在整理结果',
 }
 export function matchingSolverPhase(progress: unknown, requestId: string | null): SolverPhase | null {

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
+import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import { makeDefaultState } from './defaults'
@@ -44,6 +45,10 @@ const generating = ref(false)
 const cancelling = ref(false)
 const solveTimeLimit = ref(15)
 const elapsedSeconds = ref(0)
+const phaseSeconds = ref(0)
+const cancellationError = ref('')
+let phaseStartedAt = 0
+let discardActiveResult = false
 const engineInfo = ref('正在准备自动排班…')
 const engineState = ref<'checking' | 'ready' | 'error'>(desktop ? 'checking' : 'ready')
 const engineDiagnostic = ref(false)
@@ -172,6 +177,10 @@ function finishGeneration() {
   worker?.terminate(); worker = null
   window.clearTimeout(workerTimer); window.clearInterval(generationTimer)
   generating.value = false; cancelling.value = false; activeRequestId = null
+  showGenerate.value = false
+  void nextTick(() => {
+    if (!disposed && !showGenerate.value && !generating.value) document.querySelector<HTMLButtonElement>('.sp-heading-actions .sp-primary')?.focus({ preventScroll: true })
+  })
 }
 function feedback(success: boolean, message: string, details: string[] = [], diagnostic = false, issues: Issue[] = []) {
   const visibleMessage = formatUserMessage(message)
@@ -185,7 +194,7 @@ async function ensureProgressListener() {
   if (!progressListenerPending) progressListenerPending = listenSolverProgress(progress => {
     const phase = matchingSolverPhase(progress, activeRequestId)
     if (!disposed && generating.value && phase && phase !== solvePhase.value) {
-      solvePhase.value = phase
+      solvePhase.value = phase; phaseStartedAt = performance.now(); phaseSeconds.value = 0
     }
   }).then(unlisten => { if (disposed) unlisten(); else unlistenProgress = unlisten }).finally(() => { progressListenerPending = null })
   await progressListenerPending
@@ -208,21 +217,33 @@ async function checkEngine() {
 }
 async function generate() {
   if (generating.value || (desktop && engineState.value !== 'ready')) return
-  showGenerate.value = false; generating.value = true; cancelling.value = false
-  solverFeedback.value = null; elapsedSeconds.value = 0; solvePhase.value = 'starting'
-  const started = Date.now()
-  generationTimer = window.setInterval(() => { elapsedSeconds.value = Math.floor((Date.now() - started) / 1000) }, 250)
-  const seed = Math.floor(Math.random() * 2147483647)
-  const originalState = clone(state.value), inputRevision = revision
-  const request = createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: false, seed }, solverRequestId())
-  const input = request.state
-  activeAttempt = { request, originalState, revision: inputRevision }
-  if (desktop) {
+  showGenerate.value = true; generating.value = true; cancelling.value = false
+  cancellationError.value = ''; discardActiveResult = false; activeAttempt = null
+  solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solvePhase.value = desktop ? 'starting' : 'solving'
+  const started = performance.now(); phaseStartedAt = started
+  generationTimer = window.setInterval(() => {
+    const now = performance.now()
+    elapsedSeconds.value = Math.max(0, Math.floor((now - started) / 1000))
+    phaseSeconds.value = Math.max(0, Math.floor((now - phaseStartedAt) / 1000))
+  }, 250)
+  let request: SolverRequest
+  const inputRevision = revision
+  try {
+    const originalState = clone(state.value)
+    request = createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: false, seed: Math.floor(Math.random() * 2147483647) }, solverRequestId())
+    activeAttempt = { request, originalState, revision: inputRevision }
     activeRequestId = request.requestId
+  } catch {
+    feedback(false, '排班设置未能读取，请检查成员、班次和规则后重试。原排班未改变。')
+    finishGeneration()
+    return
+  }
+  const isCurrent = () => !disposed && activeRequestId === request.requestId
+  if (desktop) {
     try {
       const result = await solveDesktop(request)
-      if (disposed || activeRequestId !== request.requestId) return
-      if (cancelling.value) feedback(false, '本次排班已取消，原排班未改变。')
+      if (!isCurrent()) return
+      if (discardActiveResult) feedback(false, '本次排班已取消，原排班未改变。')
       else if (inputRevision !== revision) feedback(false, '排班期间设置或排班发生变化，已保留你的修改。请按最新设置重新生成。')
       else {
         const checked = checkDesktopResult(request, result)
@@ -233,41 +254,63 @@ async function generate() {
         feedback(checked.success, checked.message, [], false, checked.success ? [] : checked.issues)
       }
     } catch (error) {
-      if (!disposed) {
-        if (cancelling.value) feedback(false, '本次排班已取消，原排班未改变。')
+      if (isCurrent()) {
+        if (discardActiveResult) feedback(false, '本次排班已取消，原排班未改变。')
         else {
           const failure = formatSolverError(error)
           feedback(false, failure.message, [], failure.diagnostic)
           if (failure.diagnostic) { engineState.value = 'error'; engineInfo.value = '自动排班暂不可用，请重试。'; engineDiagnostic.value = true }
         }
       }
-    } finally { if (!disposed && activeRequestId === request.requestId) finishGeneration() }
+    } finally { if (isCurrent()) finishGeneration() }
     return
   }
-  worker = new Worker(new URL('./scheduler.worker.ts', import.meta.url), { type: 'module' })
-  worker.onmessage = event => {
-    const { result, error } = event.data
-    if (inputRevision !== revision) feedback(false, '排班期间设置发生变化，已保留你的修改。请按最新设置重新生成。')
-    else if (error) feedback(false, '排班暂时未完成，请重试；原排班未改变。')
-    else {
-      const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || (!request.options.allowPartial && issue.type === 'coverage'))
-      if (result.success === false || blockingIssues.length) feedback(false, '暂未找到符合规则的排班方案，这不代表无解。原排班未改变。', ['下方是此次尝试中发现的问题，可参考调整后重试。'], false, blockingIssues)
-      else { remember(); state.value.assignments = result.assignments; showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过') }
+  try {
+    worker = new Worker(new URL('./scheduler.worker.ts', import.meta.url), { type: 'module' })
+    worker.onmessage = event => {
+      if (!isCurrent()) return
+      try {
+        const { result, error } = event.data
+        if (inputRevision !== revision) feedback(false, '排班期间设置发生变化，已保留你的修改。请按最新设置重新生成。')
+        else if (error || !Array.isArray(result?.issues) || !Array.isArray(result?.assignments)) feedback(false, '排班暂时未完成，请重试；原排班未改变。')
+        else {
+          const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || issue.type === 'coverage')
+          if (result.success === false || blockingIssues.length) feedback(false, '暂未找到符合规则的排班方案，这不代表无解。原排班未改变。', ['下方是此次尝试中发现的问题，可参考调整后重试。'], false, blockingIssues)
+          else { remember(); state.value.assignments = result.assignments; showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过') }
+        }
+      } catch { feedback(false, '排班结果未能读取，请重试；原排班未改变。') }
+      finally { if (isCurrent()) finishGeneration() }
     }
-    finishGeneration()
+    worker.onerror = () => {
+      if (!isCurrent()) return
+      feedback(false, '排班未完成，请重试；原排班未改变。'); finishGeneration()
+    }
+    workerTimer = window.setTimeout(() => {
+      if (!isCurrent()) return
+      feedback(false, '排班等待超时，尚未找到方案，已保留原表。'); finishGeneration()
+    }, 30000)
+    worker.postMessage({ state: request.state, seed: request.options.seed })
+  } catch {
+    if (isCurrent()) { feedback(false, '排班暂时无法开始，请重试；原排班未改变。'); finishGeneration() }
   }
-  worker.onerror = () => { feedback(false, '排班未完成，请重试；原排班未改变。'); finishGeneration() }
-  workerTimer = window.setTimeout(() => { feedback(false, '排班等待超时，尚未找到方案，已保留原表。'); finishGeneration() }, 30000)
-  worker.postMessage({ state: input, seed })
 }
 async function cancelGeneration() {
   if (!generating.value || cancelling.value) return
-  cancelling.value = true
-  if (!desktop) { finishGeneration(); feedback(false, '本次排班已取消，原排班未改变。'); return }
+  discardActiveResult = true; cancelling.value = true; cancellationError.value = ''
+  if (!desktop) { feedback(false, '本次排班已取消，原排班未改变。'); finishGeneration(); return }
   const requestId = activeRequestId
   if (requestId) {
-    try { await cancelDesktop(requestId) }
-    catch (error) { if (generating.value) { const failure = formatSolverError(error, 'cancel'); feedback(false, failure.message, [], failure.diagnostic) } }
+    try {
+      const stopped = await cancelDesktop(requestId)
+      if (!disposed && generating.value && activeRequestId === requestId) {
+        if (stopped) { feedback(false, '本次排班已取消，原排班未改变。'); finishGeneration() }
+        else { cancelling.value = false; cancellationError.value = '取消尚未确认，可以重试取消；本次结果不会写入排班表。' }
+      }
+    } catch (error) {
+      if (!disposed && generating.value && activeRequestId === requestId) {
+        cancelling.value = false; cancellationError.value = formatSolverError(error, 'cancel').message
+      }
+    }
   }
 }
 async function download(data: string | Uint8Array, name: string, type: string): Promise<boolean> {
@@ -340,6 +383,7 @@ function flushSave() {
   if (!saveError.value.startsWith('原有数据读取失败')) { try { saveLocal(state.value) } catch { /* The visible save warning covers storage errors. */ } }
 }
 function escapeKey(event: KeyboardEvent) {
+  if (event.key === 'Escape' && showGenerate.value && generating.value) { event.preventDefault(); return }
   if (event.key === 'Escape') { editing.value = null; calendarDate.value = ''; showGenerate.value = false; showBackup.value = false; showHelp.value = false; importCandidate.value = null; mobileNav.value = false }
   if (event.key === 'Tab') {
     const modal = document.querySelector('.sp-modal')
@@ -348,12 +392,18 @@ function escapeKey(event: KeyboardEvent) {
       const first = controls[0]!, last = controls[controls.length - 1]!
       if (event.shiftKey && (document.activeElement === first || !modal?.contains(document.activeElement))) { event.preventDefault(); last.focus() }
       else if (!event.shiftKey && (document.activeElement === last || !modal?.contains(document.activeElement))) { event.preventDefault(); first.focus() }
-    }
+    } else if (modal instanceof HTMLElement && generating.value) { event.preventDefault(); modal.focus({ preventScroll: true }) }
   }
 }
 onMounted(() => { if (desktop) void checkEngine(); document.title = 'Shift Schedule Expert'; window.addEventListener('keydown', escapeKey); window.addEventListener('pagehide', flushSave) })
 onUnmounted(() => { disposed = true; unlistenProgress?.(); unlistenProgress = null; if (activeRequestId) void cancelDesktop(activeRequestId).catch(() => {}); window.clearInterval(generationTimer); flushSave(); window.removeEventListener('keydown', escapeKey); window.removeEventListener('pagehide', flushSave); worker?.terminate(); window.clearTimeout(workerTimer); window.clearTimeout(saveTimer); window.clearTimeout(noticeTimer) })
 watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidate], async () => { await nextTick(); (document.querySelector('.sp-modal input, .sp-modal select, .sp-modal button') as HTMLElement | null)?.focus() })
+watch([generating, cancelling], async () => {
+  await nextTick()
+  if (!showGenerate.value || !generating.value) return
+  const modal = document.querySelector<HTMLElement>('.sp-generate-modal')
+  ;(modal?.querySelector<HTMLButtonElement>('button:not(:disabled)') ?? modal)?.focus({ preventScroll: true })
+})
 </script>
 
 <template>
@@ -380,7 +430,6 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
         <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
         <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
-        <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消排班…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成排班' }}</strong><p>已用 {{ elapsedSeconds }} 秒 · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `正在尝试满足全部规则，最长等待 ${solveTimeLimit} 秒。` : solvePhase === 'finishing' ? '正在检查排班是否符合要求，请稍候。' : '准备完成后会开始生成排班，请稍候。' }}</p><p v-else>正在尝试满足全部规则，最长等待 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
         <div v-if="section === 'calendar' && solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status">
           <Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" />
           <div>
@@ -426,7 +475,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
                 </tr></thead>
                 <tbody>
                   <tr v-for="employee in employees" :key="employee.id">
-                    <th class="sp-person-col"><div class="sp-person"><EmployeeAvatar class="sp-person-avatar" :avatar="employee.avatar" size="small" /><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
+                    <th class="sp-person-col"><div class="sp-person"><EmployeeAvatar class="sp-person-avatar" :name="employee.name" :color="employee.color" :avatar="employee.avatar" size="small" /><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
                     <td v-for="date in visibleDates" :key="date" :class="{ 'sp-current-day': date === today }">
                       <button class="sp-shift-cell" :class="{ 'is-off': !findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date), 'is-leave': leave(employee,date), 'has-allowance': (dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0 }" :style="findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date) ? { background: findShift(entry(employee.id,date)!.shiftId)!.color } : {}" :aria-label="`${employee.name} ${date} ${leave(employee,date) ? '请假' : findShift(entry(employee.id,date)?.shiftId || '')?.name || '休息'}，点击编辑`" :aria-description="allowanceDescription(employee.id,date)" :title="allowanceDescription(employee.id,date)" @click="openCell(employee,date)">
                         <template v-if="leave(employee,date)"><span>请假</span><small>全天休假</small></template>
@@ -442,7 +491,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
                   <tr v-if="!employees.length"><td :colspan="visibleDates.length+3" class="sp-empty">没有找到成员，请修改筛选条件或添加成员。</td></tr>
                 </tbody>
                 <tfoot>
-                  <tr><th class="sp-person-col">每日覆盖 <small>已安排 / 需求人数</small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
+                  <tr><th class="sp-person-col">每日覆盖<small class="sp-coverage-caption"><span>已安排 / 需求人数</span><InfoTip label="需求人数计算说明"><strong>需求人数怎么计算？</strong><p>将班次设置中所有班次的人数相加，当前为 {{ requiredPerDay }} 人／天。</p><p>每日最少：达到设置人数后可以增派。每日固定：必须恰好满足。各班次分别检查，不能相互抵消缺口。</p><p>已安排统计当天全团队，不随成员筛选变化。需求人数不由成员的月／周最低工时换算。</p></InfoTip></small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
                   <tr class="sp-allowance-footer"><th class="sp-person-col">津贴合计<small>当前筛选成员</small></th><td v-for="date in visibleDates" :key="date">¥{{ payrollError ? '—' : money(dailyAllowanceTotal(date)) }}</td><td class="sp-hours-col">当月汇总 →</td><td class="sp-allowance-col" :data-allowance-total="payrollError ? null : filteredAllowanceTotal"><strong>¥{{ payrollError ? '—' : money(filteredAllowanceTotal) }}</strong></td></tr>
                 </tfoot>
               </table>
@@ -464,9 +513,22 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
 
     <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" @click="saveCalendar(true)">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
 
-    <div v-if="showGenerate" class="sp-overlay" @click.self="showGenerate = false">
-      <section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title">
-        <div class="sp-modal-heading"><h2 id="sp-generate-title">为 {{ monthTitle }} 生成排班</h2><button class="sp-icon-button" aria-label="关闭自动排班" @click="showGenerate = false"><Icon name="close" /></button></div>
+    <div v-if="showGenerate" class="sp-overlay" @click.self="!generating && (showGenerate = false)">
+      <section class="sp-modal sp-generate-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title" tabindex="-1">
+        <div class="sp-modal-heading"><h2 id="sp-generate-title">为 {{ monthTitle }} 生成排班</h2><button v-if="!generating" class="sp-icon-button" aria-label="关闭自动排班" @click="showGenerate = false"><Icon name="close" /></button></div>
+        <template v-if="generating">
+          <div class="sp-solve-progress sp-generation-progress">
+            <span class="sp-solve-spinner" aria-hidden="true"></span>
+            <div>
+              <strong role="status" aria-live="polite">{{ cancelling ? '正在取消排班…' : cancellationError ? '取消尚未完成' : solverPhaseLabels[solvePhase] }}</strong>
+              <p class="sp-generation-timing" aria-live="off"><span>总计 <span data-elapsed-seconds>{{ elapsedSeconds }}</span> 秒</span><span>· 当前阶段 <span data-phase-seconds>{{ phaseSeconds }}</span> 秒</span><span>· 完成前保留原表</span></p>
+              <p>排班搜索时限 {{ desktop ? solveTimeLimit : 30 }} 秒，结束后还需返回并校验结果。</p>
+            </div>
+          </div>
+          <p v-if="cancellationError" class="sp-generation-cancel-error" role="alert">{{ cancellationError }}</p>
+          <div class="sp-modal-actions"><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">{{ cancelling ? '正在取消…' : cancellationError ? '重试取消' : '取消排班' }}</button></div>
+        </template>
+        <template v-else>
         <div class="sp-generation-summary"><Icon name="spark" :size="35" /><div><strong>{{ state.employees.length }} 位成员 · {{ state.shifts.length }} 个班次</strong><p>需求 {{ coverage.total }} 个班位 · 保留 {{ lockedCount }} 项锁定安排</p></div></div>
         <p class="sp-modal-copy">按成员工时、请假和已设置规则重新安排本月未锁定班次。每日最少人数可增派；每日固定人数须恰好满足。</p>
         <template v-if="desktop">
@@ -478,6 +540,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         </template>
         <p class="sp-modal-note">人数和其他规则都满足后才会替换本月排班。未完成时保留原表，生成后可以撤销。</p>
         <div class="sp-modal-actions"><button class="sp-button" @click="showGenerate = false">取消</button><button class="sp-button sp-primary" :disabled="desktop && engineState !== 'ready'" @click="generate"><Icon name="spark" :size="17" />{{ desktop && engineState === 'checking' ? '正在准备…' : '开始生成' }}</button></div>
+        </template>
       </section>
     </div>
 
