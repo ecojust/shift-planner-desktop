@@ -82,6 +82,12 @@ async function main() {
     await page.keyboard.press('Enter')
     assert.equal(await advanced.evaluate(element => element.open), true)
     await page.keyboard.press('Tab')
+    await assertFocused(dialog.getByRole('button', { name: '最长等待时间说明', exact: true }))
+    await page.getByRole('tooltip').waitFor()
+    await page.keyboard.press('Escape')
+    await page.getByRole('tooltip').waitFor({ state: 'detached' })
+    assert.equal(await dialog.isVisible(), true, 'Dismissing help must keep generation options open')
+    await page.keyboard.press('Tab')
     await assertFocused(time)
     record('keyboard-tab-reaches-summary-and-enter-opens-options')
 

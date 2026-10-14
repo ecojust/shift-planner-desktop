@@ -229,7 +229,8 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-solver-engine { display: flex; align-items: center; gap: 10px; padding-bottom: 15px; margin-bottom: 14px; border-bottom: 1px solid #e6ede6; color: #548268; }
 .sp-solver-engine strong { display: block; font-size: 12px; }
 .sp-solver-engine small { display: block; margin-top: 5px; font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; color: #85998b; }
-.sp-solver-options > label { display: flex; justify-content: space-between; gap: 12px; align-items: center; font-size: 12px; color: #607d68; }
+.sp-solver-options > label, .sp-solver-time { display: flex; justify-content: space-between; gap: 12px; align-items: center; font-size: 12px; color: #607d68; }
+.sp-solver-time-caption { display: flex; align-items: center; gap: 2px; }
 .sp-solver-options select { border: 1px solid #d6e4d8; border-radius: 7px; background: white; min-height: 34px; padding: 4px 12px; color: #4f765e; }
 .sp-solver-options .sp-partial-option { justify-content: flex-start; align-items: flex-start; margin-top: 16px; line-height: 1.8; }
 .sp-partial-option input { accent-color: var(--sp-teal); margin-top: 5px; flex-shrink: 0; }

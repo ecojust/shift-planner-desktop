@@ -487,7 +487,7 @@ watch([generating, cancelling], async () => {
                   <tr v-if="!employees.length"><td :colspan="visibleDates.length+3" class="sp-empty">没有找到成员，请修改筛选条件或添加成员。</td></tr>
                 </tbody>
                 <tfoot>
-                  <tr><th class="sp-person-col">每日覆盖<small class="sp-coverage-caption"><span>已安排 / 需求人数</span><InfoTip label="需求人数计算说明"><strong>需求人数怎么计算？</strong><p>将班次设置中所有班次的人数相加，当前为 {{ requiredPerDay }} 人／天。</p><p>每日最少：达到设置人数后可以增派。每日固定：必须恰好满足。各班次分别检查，不能相互抵消缺口。</p><p>已安排统计当天全团队，不随成员筛选变化。需求人数不由成员的月／周最低工时换算。</p></InfoTip></small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
+                  <tr><th class="sp-person-col">每日覆盖<small class="sp-coverage-caption"><span>已安排 / 最低人数</span><InfoTip label="最低安排人数说明"><strong>规则要求的每日最低安排人数</strong><p>将各班次的“每日最少”或“每日固定”人数相加，当前每天至少安排 {{ requiredPerDay }} 人。</p><p>实际增派只增加左侧“已安排”，不会抬高右侧最低人数。固定班次仍须恰好满足，各班次不能相互抵消缺口。</p><p>均按当天全团队统计，不随成员筛选变化。个人月／周最低工时另行检查。</p></InfoTip></small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
                   <tr class="sp-allowance-footer"><th class="sp-person-col">津贴合计<small>当前筛选成员</small></th><td v-for="date in visibleDates" :key="date">¥{{ payrollError ? '—' : money(dailyAllowanceTotal(date)) }}</td><td class="sp-hours-col">当月汇总 →</td><td class="sp-allowance-col" :data-allowance-total="payrollError ? null : filteredAllowanceTotal"><strong>¥{{ payrollError ? '—' : money(filteredAllowanceTotal) }}</strong></td></tr>
                 </tfoot>
               </table>
@@ -531,7 +531,18 @@ watch([generating, cancelling], async () => {
           <div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>{{ engineState === 'ready' ? '已准备就绪' : engineState === 'error' ? '暂时无法排班' : '正在准备' }}</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div>
           <p v-if="engineDiagnostic" class="sp-solver-diagnostic">请先重试；仍然无法使用时，可重新打开应用或更新到最新版本。</p>
           <details class="sp-generation-advanced"><summary>高级选项<span>最长等待 {{ solveTimeLimit }} 秒</span></summary>
-            <div class="sp-solver-options"><label>最长等待时间<select v-model.number="solveTimeLimit" aria-label="最长等待时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select></label></div>
+            <div class="sp-solver-options">
+              <div class="sp-solver-time">
+                <div class="sp-solver-time-caption"><label for="sp-solve-time-limit">最长等待时间</label><InfoTip label="最长等待时间说明">
+                  <strong>给排班搜索多少时间？</strong>
+                  <p>这是搜索和优化排班的时间上限，提前完成会提前返回。启动和结果校验还需额外时间。</p>
+                  <p>延长时间可能找到更均衡的工时和班次分配，但不保证结果更好，15 秒与 60 秒也可能得到相同结果。</p>
+                  <p>休息间隔、连续工作天数等规则始终必须满足；延长时间不会放宽规则，也无法解决规则本身的冲突。</p>
+                  <p>建议先用 15 秒；提示暂未找到方案时，再试 60 秒。</p>
+                </InfoTip></div>
+                <select id="sp-solve-time-limit" v-model.number="solveTimeLimit" aria-label="最长等待时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select>
+              </div>
+            </div>
           </details>
         </template>
         <p class="sp-modal-note">人数和其他规则都满足后才会替换本月排班。未完成时保留原表，生成后可以撤销。</p>

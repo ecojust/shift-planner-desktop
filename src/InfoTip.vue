@@ -34,7 +34,13 @@ function toggle() { if (pinned) close(); else { pinned = true; void open() } }
 function outside(event: PointerEvent) {
   if (visible.value && !trigger.value?.contains(event.target as Node) && !tip.value?.contains(event.target as Node)) close()
 }
-function keydown(event: KeyboardEvent) { if (visible.value && event.key === 'Escape') close() }
+function keydown(event: KeyboardEvent) {
+  if (visible.value && event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    close()
+  }
+}
 function scrolled(event: Event) { if (visible.value && !tip.value?.contains(event.target as Node)) close() }
 onMounted(() => {
   document.addEventListener('pointerdown', outside)
