@@ -103,7 +103,7 @@ async function main() {
     await page.locator('.sp-solve-result').waitFor({ timeout: 35000 })
     const result = await page.locator('.sp-solve-result').innerText()
     assert.equal(await page.locator('.sp-solve-result').evaluate(e => e.classList.contains('is-warning')), !expectSuccess, result)
-    await page.getByRole('button', { name: '关闭求解结果', exact: true }).click()
+    await page.getByRole('button', { name: '关闭排班结果', exact: true }).click()
     return result
   }
   try {

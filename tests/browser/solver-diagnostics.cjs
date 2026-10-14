@@ -59,6 +59,9 @@ async function saveSnapshot(page, buttonName, saved) {
 }
 async function shot(page,name) {const file=path.join(out,name+'.png');await page.screenshot({path:file,fullPage:false});report.screenshots.push(file);}
 async function overflow(page,label) {const x=await page.evaluate(()=>({width:innerWidth,scroll:document.documentElement.scrollWidth,body:document.body.scrollWidth}));assert.equal(x.scroll,x.width,label+JSON.stringify(x));assert.equal(x.body,x.width,label+JSON.stringify(x));}
+async function plainInterface(page) {
+  assert.doesNotMatch(await page.locator('body').innerText(), /CP-SAT|OR-Tools|启发式|命令行|原生协议|求解器|引擎|组件|Vue|TypeScript|npm run|browser-test-bridge/i);
+}
 async function fillState(page,desktop=false,state=fixture) {
   await page.addInitScript(({fixture,desktop})=>{
     localStorage.setItem('shift-planner:v1',JSON.stringify(fixture));
@@ -79,6 +82,7 @@ async function fillState(page,desktop=false,state=fixture) {
     const web=await browser.newPage({viewport:{width:1440,height:900},acceptDownloads:true});
     await fillState(web);
     await check('browser toolbar export is downloadable and complete',async()=>{
+      await plainInterface(web);
       const pending=web.waitForEvent('download');await web.getByRole('button',{name:'导出规则',exact:true}).click();const d=await pending;
       await d.saveAs(path.join(out,'browser-current.json'));
       const data=JSON.parse(await fs.readFile(path.join(out,'browser-current.json'),'utf8'));
@@ -109,6 +113,8 @@ async function fillState(page,desktop=false,state=fixture) {
     await desktop.locator('.sp-solve-result').waitFor({timeout:45000});
     await check('real CP-SAT failure shows concrete evidence and actions',async()=>{
       const text=await desktop.locator('.sp-solve-result').innerText();report.failureText=text;
+      await plainInterface(desktop);
+      assert.equal(lastRequest.options.allowPartial,false,'actual generation must require complete staffing');
       assert.equal(lastResult.status,'INFEASIBLE');assert.match(text,/1728/);assert.match(text,/原排班未改变/);assert.ok(await desktop.locator('.sp-conflict-list button').count()>0);
       assert.doesNotMatch(text,/请检查月\/周最低工时、周最高工时、锁定安排/);assert.ok(text.includes('建议：'));
     });

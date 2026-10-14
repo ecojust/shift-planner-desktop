@@ -6,7 +6,7 @@ export interface CalendarYearInfo { verified: boolean; reason: string; source: s
 
 export const HOLIDAY_SOURCE = 'https://github.com/6tail/lunar-typescript'
 export const STATUTORY_SOURCE = 'https://www.gov.cn/zhengce/content/202411/content_6986380.htm'
-const source = `lunar-typescript / HolidayUtil：${HOLIDAY_SOURCE}；法定日依据：${STATUTORY_SOURCE}`
+const source = `依据国家节假日及调休安排；法定节假日规定：${STATUTORY_SOURCE}`
 const labels: Record<DayKind, string> = { workday: '工作日', restday: '休息日', statutory: '法定节假日' }
 const requiredFestivals = ['元旦', '春节', '清明', '劳动', '端午', '中秋', '国庆']
 const years = new Map<number, { info: CalendarYearInfo; statutory: Map<string, string> }>()
@@ -50,13 +50,13 @@ function yearCalendar(year: number) {
     const holidays = HolidayUtil.getHolidays(year)
     const names = holidays.filter(holiday => holiday.getTarget().startsWith(`${year}-`)).map(holiday => holiday.getName())
     if (!requiredFestivals.every(name => names.some(candidate => candidate.includes(name)))) {
-      reason = '当前 lunar-typescript 数据未覆盖该年完整放假与补班安排。'
+      reason = '当前日历尚未收录该年完整的放假与补班安排。'
     } else {
       const dates = statutoryDates(year)
       if (dates.size !== 13) {
         reason = '该年法定节日发生重合，补假及计薪日期需另行核对。'
       } else if ([...dates.keys()].some(date => !HolidayUtil.getHoliday(date) || HolidayUtil.getHoliday(date)!.isWork())) {
-        reason = '法定日期与库内放假安排未完整对应，请核对该年日历。'
+        reason = '法定日期与已收录的放假安排未完整对应，请核对该年日历。'
       } else {
         for (const [date, name] of dates) statutory.set(date, name)
       }

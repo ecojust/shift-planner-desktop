@@ -82,7 +82,7 @@ async function main() {
       assert.match(message, /原排班未改变/)
       assert.deepEqual((await state()).assignments, before.assignments)
     }
-    await page.getByRole('button', { name: '关闭求解结果', exact: true }).click()
+    await page.getByRole('button', { name: '关闭排班结果', exact: true }).click()
     if (success) {
       assert.match(await page.locator('.sp-check-status').innerText(), /排班检查通过/)
       // The previous minimum roster may still be in debounced localStorage

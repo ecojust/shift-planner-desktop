@@ -101,7 +101,7 @@ export function weightedDayRange(week: WeightedWeek, date: string): [number, num
  * separation groups still require the scheduler to solve the actual assignments.
  */
 export function weekdayWeightCapacity(state: PlannerState): { maxPercent: number | null; explanation: string } {
-  const explanation = '按严格覆盖估算：最低人数班可增排，固定人数班不能超额；结合每人每天最多一班、请假、可上班次及锁定安排计算人数上限。具体班次资格匹配、休息间隔、工时上下限和互斥规则仍须通过求解，不代表一定可排；允许缺员时该参考上限不适用。'
+  const explanation = '按全部班次满足人数要求估算：最低人数班可增排，固定人数班不能超额；结合每人每天最多一班、请假、可上班次及锁定安排计算人数上限。班次资格、休息间隔、工时上下限和互斥规则仍须在生成排班时同时满足，该估算不代表一定可排。'
   const rule = state.rules.weekdayWeights
   if (!rule || weekdayWeightRuleError(rule)) return { maxPercent: null, explanation }
   const weeks = weightedWeeks(state)

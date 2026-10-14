@@ -15,7 +15,7 @@ test('all 365 dates agree with the 2026 statutory, holiday and compensatory-work
     const expected = statutory2026.has(date) ? 'statutory' : work2026.has(date) ? 'workday' : off || [0, 6].includes(weekday) ? 'restday' : 'workday'
     assert.equal(dayInfo(date).kind, expected, date)
     assert.equal(dayInfo(date).verified, true, date)
-    assert.match(dayInfo(date).source, /lunar-typescript/)
+    assert.match(dayInfo(date).source, /国家节假日及调休安排/)
   }
 })
 
@@ -42,7 +42,7 @@ test('folk festivals and continuous holiday breaks are never all statutory', () 
 test('missing future arrangements and historical legal regimes require verification', () => {
   for (const year of [2001, 2020, 2024, 2027, 2028]) assert.equal(calendarYearInfo(year).verified, false, String(year))
   assert.match(calendarYearInfo(2024).reason, /历史年份/)
-  assert.match(calendarYearInfo(2027).reason, /未覆盖/)
+  assert.match(calendarYearInfo(2027).reason, /尚未收录/)
   for (const date of ['2024-02-09', '2027-01-01', '2028-01-01']) {
     assert.equal(dayInfo(date).verified, false, date)
     assert.match(dayInfo(date).label, /待核对/)

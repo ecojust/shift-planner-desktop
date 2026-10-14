@@ -9,7 +9,7 @@ import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP
 import { calculatePayroll, createPayrollConfig, dayInfo, payrollRows } from './payroll'
 import type { DayKind, PayrollConfig, PayrollResult } from './payroll'
 import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain'
-import { desktop, solveDesktop, cancelDesktop, desktopSolverInfo, importDesktopBackup, exportDesktopFile, checkDesktopResult, listenSolverProgress, matchingSolverPhase, solverPhaseLabels, formatSolverError } from './DesktopSolver'
+import { desktop, solveDesktop, cancelDesktop, desktopSolverInfo, importDesktopBackup, exportDesktopFile, checkDesktopResult, listenSolverProgress, matchingSolverPhase, solverPhaseLabels, formatSolverError, formatUserMessage, formatUserIssue } from './DesktopSolver'
 import type { SolverRequest, SolverPhase } from './DesktopSolver'
 import { BUILD_VERSION } from './buildInfo'
 import { minimumMonthHours, monthlyHoursByEmployee } from './hours.ts'
@@ -43,18 +43,15 @@ const showHelp = ref(false)
 const generating = ref(false)
 const cancelling = ref(false)
 const solveTimeLimit = ref(15)
-const allowPartial = ref(false)
 const elapsedSeconds = ref(0)
-const engineInfo = ref('正在检查本地求解器…')
+const engineInfo = ref('正在准备自动排班…')
 const engineState = ref<'checking' | 'ready' | 'error'>(desktop ? 'checking' : 'ready')
 const engineDiagnostic = ref(false)
 const solvePhase = ref<SolverPhase>('starting')
-const phaseSeconds = ref(0)
 type Attempt = { request: SolverRequest; originalState: PlannerState; revision: number }
 let activeAttempt: Attempt | null = null
 const solverFeedback = ref<{ success: boolean; message: string; details: string[]; issues: Issue[]; diagnostic: boolean; attempt: Attempt | null; stale: boolean } | null>(null)
 const expandedFeedback = ref(false)
-let phaseStartedAt = 0
 let engineCheckPending = false
 let unlistenProgress: (() => void) | null = null
 let progressListenerPending: Promise<void> | null = null
@@ -84,7 +81,7 @@ const groups = computed(() => [...new Set(state.value.employees.map(e => e.group
 const employees = computed(() => state.value.employees.filter(e => (!groupFilter.value || e.group === groupFilter.value) && `${e.name}${e.role}`.includes(employeeQuery.value.trim())))
 const assignments = computed(() => new Map(state.value.assignments.map(a => [`${a.employeeId}:${a.date}`, a])))
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
-const issues = computed(() => validateSchedule(state.value))
+const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
 const payrollCalculation = computed<{ result: PayrollResult; error: string }>(() => {
   try { return { result: calculatePayroll(state.value, { payroll: state.value.payroll, calendar: state.value.calendar }), error: '' } }
   catch (error) {
@@ -135,7 +132,7 @@ function money(amount: number) { return amount.toLocaleString('zh-CN', { minimum
 function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) }
 // Request correlation does not require a secure-context-only randomUUID API.
 function solverRequestId() { return `${Array.from(crypto.getRandomValues(new Uint8Array(12)), value => value.toString(16).padStart(2, '0')).join('')}-${Date.now()}` }
-function flash(message: string) { notice.value = message; window.clearTimeout(noticeTimer); noticeTimer = window.setTimeout(() => notice.value = '', 5500) }
+function flash(message: string) { notice.value = formatUserMessage(message); window.clearTimeout(noticeTimer); noticeTimer = window.setTimeout(() => notice.value = '', 5500) }
 function remember() { history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])) }); if (history.value.length > 10) history.value.shift() }
 function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; flash('已撤销上一次排班调整') } }
 function chooseSection(value: Section) { section.value = value; mobileNav.value = false }
@@ -177,7 +174,8 @@ function finishGeneration() {
   generating.value = false; cancelling.value = false; activeRequestId = null
 }
 function feedback(success: boolean, message: string, details: string[] = [], diagnostic = false, issues: Issue[] = []) {
-  solverFeedback.value = { success, message, details: [...new Set(details)].filter(detail => !message.includes(detail)), diagnostic, issues: withSolverGuidance(issues), attempt: activeAttempt, stale: !!activeAttempt && activeAttempt.revision !== revision }
+  const visibleMessage = formatUserMessage(message)
+  solverFeedback.value = { success, message: visibleMessage, details: [...new Set(details.map(formatUserMessage))].filter(detail => !visibleMessage.includes(detail)), diagnostic, issues: withSolverGuidance(issues).map(formatUserIssue), attempt: activeAttempt, stale: !!activeAttempt && activeAttempt.revision !== revision }
   expandedFeedback.value = false
   // The persistent result card is the sole announcement of solver outcomes.
   notice.value = ''; window.clearTimeout(noticeTimer)
@@ -187,7 +185,7 @@ async function ensureProgressListener() {
   if (!progressListenerPending) progressListenerPending = listenSolverProgress(progress => {
     const phase = matchingSolverPhase(progress, activeRequestId)
     if (!disposed && generating.value && phase && phase !== solvePhase.value) {
-      solvePhase.value = phase; phaseStartedAt = Date.now(); phaseSeconds.value = 0
+      solvePhase.value = phase
     }
   }).then(unlisten => { if (disposed) unlisten(); else unlistenProgress = unlisten }).finally(() => { progressListenerPending = null })
   await progressListenerPending
@@ -195,14 +193,14 @@ async function ensureProgressListener() {
 async function checkEngine() {
   if (!desktop || disposed || engineCheckPending || generating.value) return
   engineCheckPending = true; engineState.value = 'checking'; engineDiagnostic.value = false
-  engineInfo.value = '正在启动并检查本地求解器，首次加载可能需要一些时间…'
+  engineInfo.value = '正在准备自动排班，首次使用请稍候…'
   try {
     await ensureProgressListener()
     if (disposed) return
     const info = await desktopSolverInfo()
     if (disposed) return
-    if (info.engine !== 'ortools-cp-sat' || info.protocolVersion !== 1 || !info.version) throw new Error('求解器版本信息不兼容，请重新安装桌面版')
-    engineInfo.value = `OR-Tools CP-SAT ${info.version} · 已通过本地启动检测`
+    if (info.engine !== 'ortools-cp-sat' || info.protocolVersion !== 1 || !info.version) throw new Error('自动排班暂不可用，请更新应用后重试')
+    engineInfo.value = '可以开始生成排班'
     engineState.value = 'ready'
   } catch (error) {
     if (!disposed) { const failure = formatSolverError(error, 'startup'); engineInfo.value = failure.message; engineState.value = 'error'; engineDiagnostic.value = failure.diagnostic }
@@ -211,12 +209,12 @@ async function checkEngine() {
 async function generate() {
   if (generating.value || (desktop && engineState.value !== 'ready')) return
   showGenerate.value = false; generating.value = true; cancelling.value = false
-  solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solvePhase.value = 'starting'
-  const started = Date.now(); phaseStartedAt = started
-  generationTimer = window.setInterval(() => { elapsedSeconds.value = Math.floor((Date.now() - started) / 1000); phaseSeconds.value = Math.floor((Date.now() - phaseStartedAt) / 1000) }, 250)
+  solverFeedback.value = null; elapsedSeconds.value = 0; solvePhase.value = 'starting'
+  const started = Date.now()
+  generationTimer = window.setInterval(() => { elapsedSeconds.value = Math.floor((Date.now() - started) / 1000) }, 250)
   const seed = Math.floor(Math.random() * 2147483647)
   const originalState = clone(state.value), inputRevision = revision
-  const request = createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: allowPartial.value, seed }, solverRequestId())
+  const request = createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: false, seed }, solverRequestId())
   const input = request.state
   activeAttempt = { request, originalState, revision: inputRevision }
   if (desktop) {
@@ -224,23 +222,23 @@ async function generate() {
     try {
       const result = await solveDesktop(request)
       if (disposed || activeRequestId !== request.requestId) return
-      if (cancelling.value) feedback(false, '本次求解已取消，原排班未改变。')
-      else if (inputRevision !== revision) feedback(false, '求解期间设置或排班发生变化，已保留你的修改。请按最新设置重新生成。')
+      if (cancelling.value) feedback(false, '本次排班已取消，原排班未改变。')
+      else if (inputRevision !== revision) feedback(false, '排班期间设置或排班发生变化，已保留你的修改。请按最新设置重新生成。')
       else {
         const checked = checkDesktopResult(request, result)
         if (checked.success && checked.assignments) {
           remember(); state.value.assignments = checked.assignments; showIssues.value = checked.issues.length > 0
-          scheduleSource.value = result.status === 'OPTIMAL' ? '本地 CP-SAT · 最优方案' : '本地 CP-SAT · 可行方案'
+          scheduleSource.value = '已自动生成排班'
         }
         feedback(checked.success, checked.message, [], false, checked.success ? [] : checked.issues)
       }
     } catch (error) {
       if (!disposed) {
-        if (cancelling.value) feedback(false, '本次求解已取消，原排班未改变。')
+        if (cancelling.value) feedback(false, '本次排班已取消，原排班未改变。')
         else {
           const failure = formatSolverError(error)
           feedback(false, failure.message, [], failure.diagnostic)
-          if (failure.diagnostic) { engineState.value = 'error'; engineInfo.value = `本地算法运行检查未通过${failure.code ? `（${failure.code}）` : ''}，需要重新检测。`; engineDiagnostic.value = true }
+          if (failure.diagnostic) { engineState.value = 'error'; engineInfo.value = '自动排班暂不可用，请重试。'; engineDiagnostic.value = true }
         }
       }
     } finally { if (!disposed && activeRequestId === request.requestId) finishGeneration() }
@@ -250,16 +248,16 @@ async function generate() {
   worker.onmessage = event => {
     const { result, error } = event.data
     if (inputRevision !== revision) feedback(false, '排班期间设置发生变化，已保留你的修改。请按最新设置重新生成。')
-    else if (error) feedback(false, error)
+    else if (error) feedback(false, '排班暂时未完成，请重试；原排班未改变。')
     else {
       const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || (!request.options.allowPartial && issue.type === 'coverage'))
-      if (result.success === false || blockingIssues.length) feedback(false, '浏览器搜索尚未找到可行方案，这不代表无解。原排班未改变。', ['下方是未采用方案中的问题，可参考调整，或用桌面约束求解器重试。'], false, blockingIssues)
-      else { remember(); state.value.assignments = result.assignments; showIssues.value = result.issues.length > 0; scheduleSource.value = '浏览器排班 · 启发式方案'; feedback(true, result.issues.length ? `浏览器排班已生成，有 ${result.issues.length} 项需要检查` : '浏览器排班已生成，所有岗位已覆盖，规则检查通过') }
+      if (result.success === false || blockingIssues.length) feedback(false, '暂未找到符合规则的排班方案，这不代表无解。原排班未改变。', ['下方是此次尝试中发现的问题，可参考调整后重试。'], false, blockingIssues)
+      else { remember(); state.value.assignments = result.assignments; showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过') }
     }
     finishGeneration()
   }
-  worker.onerror = () => { feedback(false, '浏览器排班未完成，请检查规则后重试；原排班未改变。'); finishGeneration() }
-  workerTimer = window.setTimeout(() => { feedback(false, '浏览器排班已超时，尚未完成搜索，已保留原表。'); finishGeneration() }, 30000)
+  worker.onerror = () => { feedback(false, '排班未完成，请重试；原排班未改变。'); finishGeneration() }
+  workerTimer = window.setTimeout(() => { feedback(false, '排班等待超时，尚未找到方案，已保留原表。'); finishGeneration() }, 30000)
   worker.postMessage({ state: input, seed })
 }
 async function cancelGeneration() {
@@ -273,7 +271,10 @@ async function cancelGeneration() {
   }
 }
 async function download(data: string | Uint8Array, name: string, type: string): Promise<boolean> {
-  if (desktop) return exportDesktopFile(data, name)
+  if (desktop) {
+    try { return await exportDesktopFile(data, name) }
+    catch { throw new Error('文件保存失败，请确认保存位置可以写入，或更换位置后重试。') }
+  }
   const blob = new Blob([typeof data === 'string' ? data : new Uint8Array(data).buffer], { type })
   const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000)
   return true
@@ -287,9 +288,9 @@ async function exportRules(attempt: Attempt | null = null) {
   try {
     const source = attempt ? 'attempt' : 'current'
     const originalState = attempt?.originalState ?? clone(state.value)
-    const request = attempt?.request ?? createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: allowPartial.value, seed: Math.floor(Math.random() * 2147483647) }, solverRequestId())
+    const request = attempt?.request ?? createSolverRequest(originalState, { timeLimitSeconds: solveTimeLimit.value, allowPartial: false, seed: Math.floor(Math.random() * 2147483647) }, solverRequestId())
     const data = solverDebugJSON(request, { buildVersion: BUILD_VERSION, source, runtime: desktop ? 'desktop' : 'browser', originalState })
-    if (await download(data, solverDebugFileName(request, source), 'application/json')) flash(attempt ? '已导出失败当次的原始规则与求解参数，可直接复现' : '已导出当前成员、班次、规则及求解所需的完整上下文')
+    if (await download(data, solverDebugFileName(request, source), 'application/json')) flash(attempt ? '已导出失败当次的排班设置，可用于排查问题' : '已导出当前成员、班次、规则和相关排班记录')
   } catch (e) { flash(e instanceof Error ? e.message : String(e)) }
 }
 async function openDiagnostic(issue: Issue) {
@@ -312,7 +313,7 @@ async function exportBackup() {
 async function openImport() {
   if (!desktop) { importer.value?.click(); return }
   try {
-    const contents = await importDesktopBackup()
+    const contents = await importDesktopBackup().catch(() => { throw new Error('备份文件读取失败，请确认文件可以访问且不超过 8 MB，或重新选择文件。') })
     if (contents !== null) { importCandidate.value = { ...createPayrollConfig(), ...parseBackup(contents) } as Document; showBackup.value = false }
   } catch (e) { flash(e instanceof Error ? e.message : String(e)) }
 }
@@ -377,14 +378,14 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
-        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span aria-hidden="true">·</span><button @click="showGenerate = true">{{ desktop ? '本地 CP-SAT' : '浏览器启发式排班' }}</button></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" title="导出当前成员、班次、规则和求解上下文为 JSON" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '检查算法…' : '自动排班' }}</button></div></div>
+        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
         <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
-        <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消并停止本地任务…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成浏览器排班' }}</strong><p>总计 {{ elapsedSeconds }} 秒<span v-if="desktop"> · 当前阶段 {{ phaseSeconds }} 秒</span> · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `排班搜索时限 ${solveTimeLimit} 秒，结束后还需返回并校验结果。` : solvePhase === 'finishing' ? '搜索已结束，正在返回并校验结果。' : `正在准备本地算法，启动和加载不占 ${solveTimeLimit} 秒搜索时限。` }}</p><p v-else>浏览器搜索时限 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
+        <div v-if="generating" class="sp-solve-progress" role="status" aria-live="polite"><span class="sp-solve-spinner"></span><div><strong>{{ cancelling ? '正在取消排班…' : desktop ? solverPhaseLabels[solvePhase] : '正在生成排班' }}</strong><p>已用 {{ elapsedSeconds }} 秒 · 完成前保留原表</p><p v-if="desktop">{{ solvePhase === 'solving' ? `正在尝试满足全部规则，最长等待 ${solveTimeLimit} 秒。` : solvePhase === 'finishing' ? '正在检查排班是否符合要求，请稍候。' : '准备完成后会开始生成排班，请稍候。' }}</p><p v-else>正在尝试满足全部规则，最长等待 30 秒。</p></div><button class="sp-button" :disabled="cancelling" @click="cancelGeneration">取消</button></div>
         <div v-if="section === 'calendar' && solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status">
           <Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" />
           <div>
             <strong>{{ solverFeedback.message }}</strong>
-            <p v-if="!solverFeedback.success && solverFeedback.stale" class="sp-diagnostic-stale">设置已更改，下方诊断仍对应上一次求解；请重新排班验证修改。</p>
+            <p v-if="!solverFeedback.success && solverFeedback.stale" class="sp-diagnostic-stale">设置已更改，下方提示仍对应上一次排班；请重新生成以检查修改。</p>
             <p v-for="(detail,index) in solverFeedback.details" :key="index">{{ detail }}</p>
             <ol v-if="solverFeedback.issues.length" class="sp-conflict-list">
               <li v-for="(issue,index) in (expandedFeedback ? solverFeedback.issues : solverFeedback.issues.slice(0,5))" :key="`${issue.id}-${index}`">
@@ -396,11 +397,11 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
             <button v-if="solverFeedback.issues.length > 5" class="sp-link" @click="expandedFeedback = !expandedFeedback">{{ expandedFeedback ? '收起部分问题' : `查看其余 ${solverFeedback.issues.length - 5} 项问题` }}</button>
             <div v-if="!solverFeedback.success && solverFeedback.attempt" class="sp-diagnostic-actions">
               <button class="sp-button" @click="exportRules(solverFeedback.attempt)"><Icon name="download" :size="15" />导出本次规则</button>
-              <span>保留 {{ solverFeedback.attempt.request.state.month }} 当次的设置、锁定安排和求解参数。</span>
+              <span>保留 {{ solverFeedback.attempt.request.state.month }} 当次的完整设置和锁定安排。</span>
             </div>
-            <details v-if="solverFeedback.diagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>若重新检测后仍无法启动，开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查打包的算法组件与本机运行环境。</p></details>
+            <p v-if="solverFeedback.diagnostic" class="sp-solver-diagnostic">请重试；仍然无法使用时，可重新打开应用或更新到最新版本。</p>
           </div>
-          <button class="sp-icon-button" aria-label="关闭求解结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button>
+          <button class="sp-icon-button" aria-label="关闭排班结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button>
         </div>
         <dl v-if="section === 'calendar'" class="sp-overview" aria-label="本月排班概览">
           <div><dt>需求覆盖</dt><dd>{{ coverage.percentage }}<small>%</small></dd><span :class="coverage.percentage === 100 && !coverage.excess ? 'sp-text-green' : 'sp-text-amber'">{{ coverage.excess ? `固定班次超出 ${coverage.excess} 人次，请调整` : coverage.percentage === 100 ? `${coverage.filled} 个需求班位已满足` : `缺 ${coverage.total - coverage.filled} 个班位` }}</span></div>
@@ -469,17 +470,14 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
         <div class="sp-generation-summary"><Icon name="spark" :size="35" /><div><strong>{{ state.employees.length }} 位成员 · {{ state.shifts.length }} 个班次</strong><p>需求 {{ coverage.total }} 个班位 · 保留 {{ lockedCount }} 项锁定安排</p></div></div>
         <p class="sp-modal-copy">按成员工时、请假和已设置规则重新安排本月未锁定班次。每日最少人数可增派；每日固定人数须恰好满足。</p>
         <template v-if="desktop">
-          <div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>本地 OR-Tools CP-SAT</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div>
-          <p v-if="engineState === 'checking'" class="sp-engine-explanation">本地算法启动检测完成后即可开始排班。</p>
-          <details v-if="engineDiagnostic" class="sp-solver-diagnostic"><summary>本地算法诊断</summary><p>开发者可在项目目录运行 <code>npm run solver:doctor</code>，检查算法组件与运行环境。</p></details>
-          <details class="sp-generation-advanced"><summary>高级选项<span>{{ solveTimeLimit }} 秒搜索 · {{ allowPartial ? '允许缺员' : '严格满足人数' }}</span></summary>
-            <div class="sp-solver-options"><label>最长搜索时间<select v-model.number="solveTimeLimit" aria-label="最长搜索时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select></label><label class="sp-partial-option"><input v-model="allowPartial" type="checkbox" /><span>允许岗位缺编<small>允许人数不足，固定人数上限及其他硬规则仍须满足。</small></span></label></div>
+          <div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>{{ engineState === 'ready' ? '已准备就绪' : engineState === 'error' ? '暂时无法排班' : '正在准备' }}</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div>
+          <p v-if="engineDiagnostic" class="sp-solver-diagnostic">请先重试；仍然无法使用时，可重新打开应用或更新到最新版本。</p>
+          <details class="sp-generation-advanced"><summary>高级选项<span>最长等待 {{ solveTimeLimit }} 秒</span></summary>
+            <div class="sp-solver-options"><label>最长等待时间<select v-model.number="solveTimeLimit" aria-label="最长等待时间"><option v-for="seconds in [5,15,30,60]" :key="seconds" :value="seconds">{{ seconds }} 秒</option></select></label></div>
           </details>
-          <p v-if="allowPartial" class="sp-modal-note">当前允许缺员：生成后会列出未填满的班位。</p>
         </template>
-        <p v-else class="sp-modal-note">浏览器使用启发式排班，可能无法找到可行方案；桌面版提供本地约束求解器。</p>
-        <p class="sp-modal-note">找不到符合规则的方案时保留原排班。其他月份不变，生成后可以撤销。</p>
-        <div class="sp-modal-actions"><button class="sp-button" @click="showGenerate = false">取消</button><button class="sp-button sp-primary" :disabled="desktop && engineState !== 'ready'" @click="generate"><Icon name="spark" :size="17" />{{ desktop && engineState === 'checking' ? '等待启动检测' : '开始生成' }}</button></div>
+        <p class="sp-modal-note">人数和其他规则都满足后才会替换本月排班。未完成时保留原表，生成后可以撤销。</p>
+        <div class="sp-modal-actions"><button class="sp-button" @click="showGenerate = false">取消</button><button class="sp-button sp-primary" :disabled="desktop && engineState !== 'ready'" @click="generate"><Icon name="spark" :size="17" />{{ desktop && engineState === 'checking' ? '正在准备…' : '开始生成' }}</button></div>
       </section>
     </div>
 
@@ -495,7 +493,7 @@ watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidat
           <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数；也可逐条指定不连续的班次及每人每周次数上限。</p></li>
           <li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li>
           <li><strong>设置班次津贴</strong><p>在「班次设置」填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li>
-          <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，“备份与恢复”中的 JSON 用于恢复全部设置。排班日历的“导出规则”保存当前求解配置，失败提示里的“导出本次规则”保留失败当次输入，便于复现排查。首次进入展示的是可编辑示例团队。</p></li>
+          <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，完整备份用于恢复全部设置。“导出规则”保存当前排班设置，失败提示里的“导出本次规则”保留失败当次的设置，便于排查问题。首次进入展示的是可编辑示例团队。</p></li>
         </ol>
         <figure class="sp-help-qrcode">
           <img :src="helpQrCodeUrl" alt="公众号二维码" width="258" height="258" />

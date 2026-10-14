@@ -220,7 +220,7 @@ async function main() {
     assert.deepEqual((await state()).assignments, originalAssignments)
     await page.screenshot({ path: path.join(output, '03-unmet-minimum-feedback.png') })
     record('unsatisfied-browser-search-preserves-original-roster')
-    await page.getByRole('button', { name: '关闭求解结果', exact: true }).click()
+    await page.getByRole('button', { name: '关闭排班结果', exact: true }).click()
 
     await navigate('成员管理')
     await page.setViewportSize({ width: 390, height: 844 })

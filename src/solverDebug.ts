@@ -55,7 +55,7 @@ export function solverDebugJSON(request: SolverRequest, metadata: SolverDebugMet
   // Large histories may fit the protocol without indentation; never truncate
   // previous-month assignments or silently drop a constraint to reduce size.
   if (size(json) > MAX_INPUT_BYTES) json = stringify(payload) + '\n'
-  if (size(json) > MAX_INPUT_BYTES) throw new Error('规则文件超过求解器的 8 MiB 上限，无法完整导出。请缩减不再需要的历史数据后重试。')
+  if (size(json) > MAX_INPUT_BYTES) throw new Error('规则文件超过 8 MiB 大小上限，无法完整导出。请缩减不再需要的历史数据后重试。')
   return json
 }
 
