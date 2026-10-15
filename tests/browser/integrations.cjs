@@ -197,10 +197,10 @@ async function enableAfterReload(page) {
   await closeSettings(page)
 }
 async function setService(page, dialog, service, enabled) {
-  const toggle = dialog.getByRole('switch', { name: service === 'mcp' ? 'MCP' : 'HTTP API', exact: true })
-  await page.waitForFunction(label => [...document.querySelectorAll('[role="switch"]')].some(node => node.getAttribute('aria-labelledby') && document.getElementById(node.getAttribute('aria-labelledby'))?.textContent.trim() === label && !node.disabled), service === 'mcp' ? 'MCP' : 'HTTP API')
+  const toggle = dialog.getByRole('switch', { name: service === 'mcp' ? 'MCP' : 'HTTP', exact: true })
+  await page.waitForFunction(label => [...document.querySelectorAll('[role="switch"]')].some(node => node.getAttribute('aria-labelledby') && document.getElementById(node.getAttribute('aria-labelledby'))?.textContent.trim() === label && !node.disabled), service === 'mcp' ? 'MCP' : 'HTTP')
   if ((await toggle.getAttribute('aria-checked')) !== String(enabled)) await toggle.click()
-  await page.waitForFunction(({ label, enabled }) => [...document.querySelectorAll('[role="switch"]')].some(node => document.getElementById(node.getAttribute('aria-labelledby'))?.textContent.trim() === label && node.getAttribute('aria-checked') === String(enabled) && !node.disabled), { label: service === 'mcp' ? 'MCP' : 'HTTP API', enabled })
+  await page.waitForFunction(({ label, enabled }) => [...document.querySelectorAll('[role="switch"]')].some(node => document.getElementById(node.getAttribute('aria-labelledby'))?.textContent.trim() === label && node.getAttribute('aria-checked') === String(enabled) && !node.disabled), { label: service === 'mcp' ? 'MCP' : 'HTTP', enabled })
 }
 async function checkHttpDocs(page, dialog, httpInfo, mcpInfo) {
   const docs = dialog.locator('.integration-http-docs')
@@ -309,9 +309,9 @@ async function checkIndependentServices() {
   }
 
   await page.evaluate(() => { window.__integrationBridge.services.http.deferStop = true })
-  await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).click()
+  await dialog.getByRole('switch', { name: 'HTTP', exact: true }).click()
   await page.waitForFunction(() => typeof window.__integrationBridge.services.http.finishStop === 'function')
-  assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).isDisabled(), true)
+  assert.equal(await dialog.getByRole('switch', { name: 'HTTP', exact: true }).isDisabled(), true)
   assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).isDisabled(), false)
   assert.equal((await request(page, 'get_state', {}, { source: 'http', serviceId: firstHttp.serviceId })).response.error?.status, 503)
   const duringHttpStop = await snapshot(page)
@@ -339,7 +339,7 @@ async function checkIndependentServices() {
   assert.equal(continuedHttp.persisted.provenance.fields['employees.qa-1.name'].source, 'http')
   await page.evaluate(() => { const mcp = window.__integrationBridge.services.mcp; mcp.deferStop = false; mcp.finishStop() })
   await setService(page, dialog, 'mcp', false)
-  assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).getAttribute('aria-checked'), 'true')
+  assert.equal(await dialog.getByRole('switch', { name: 'HTTP', exact: true }).getAttribute('aria-checked'), 'true')
   assert.deepEqual(await page.evaluate(() => window.__integrationBridge.services.http.info), secondHttp)
   assert.equal((await snapshot(page, 'http')).state.employees[0].name, 'MCP 停止期间 HTTP 仍可修改')
   await screenshot(page, 'settings-http-survives-mcp-stop')
@@ -552,7 +552,7 @@ async function main() {
     await setService(page, dialog, 'http', false)
     assert.equal(await dialog.getByRole('switch').count(), 2)
     assert.equal(await toggle.getAttribute('aria-checked'), 'false')
-    assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).getAttribute('aria-checked'), 'false')
+    assert.equal(await dialog.getByRole('switch', { name: 'HTTP', exact: true }).getAttribute('aria-checked'), 'false')
     assert.equal(await dialog.getByRole('checkbox').count(), 4)
     for (const [name, checked] of [['成员', true], ['班次', false], ['排班规则', false], ['排班结果', false]]) {
       const checkbox = dialog.getByRole('checkbox', { name: `允许修改${name}`, exact: true })
@@ -564,7 +564,7 @@ async function main() {
     await toggle.click()
     await page.waitForFunction(() => document.querySelector('[role="switch"]').getAttribute('aria-checked') === 'true')
     const firstInfo = await page.evaluate(() => window.__integrationBridge.services.mcp.info)
-    assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).getAttribute('aria-checked'), 'false')
+    assert.equal(await dialog.getByRole('switch', { name: 'HTTP', exact: true }).getAttribute('aria-checked'), 'false')
     await setService(page, dialog, 'http', true)
     const httpInfo = await page.evaluate(() => window.__integrationBridge.services.http.info)
     assert.notEqual(httpInfo.token, firstInfo.token)
@@ -581,7 +581,7 @@ async function main() {
 
     await dialog.getByRole('button', { name: '复制 MCP 地址', exact: true }).click()
     assert.equal(await copied(page), `${firstInfo.url}/mcp`)
-    await dialog.getByRole('button', { name: '复制 HTTP API 地址', exact: true }).click()
+    await dialog.getByRole('button', { name: '复制 HTTP 地址', exact: true }).click()
     assert.equal(await copied(page), `${httpInfo.url}/api`)
     await dialog.getByRole('button', { name: '显示 MCP 访问令牌', exact: true }).click()
     assert.ok((await dialog.innerText()).includes(firstInfo.token))
@@ -1095,7 +1095,7 @@ async function main() {
     const web = await preparePage(false)
     dialog = await openSettings(web)
     assert.equal(await dialog.getByRole('switch').count(), 2)
-    for (const name of ['MCP', 'HTTP API']) {
+    for (const name of ['MCP', 'HTTP']) {
       assert.equal(await dialog.getByRole('switch', { name, exact: true }).isDisabled(), true)
       assert.equal(await dialog.getByRole('switch', { name, exact: true }).getAttribute('aria-checked'), 'false')
     }

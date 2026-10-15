@@ -8,7 +8,7 @@ import { loadIntegrationPermissions, setIntegrationPermission, type IntegrationP
 type ServiceInfo = { enabled: boolean; url: string; token: string; serviceId: string }
 type ServiceState = ServiceInfo & { pending: boolean; status: string }
 type Request = { requestId: string; serviceId: string; method: string; args: unknown; expiresAt: number; source: IntegrationSource }
-const serviceNames = { mcp: 'MCP', http: 'HTTP API' } as const
+const serviceNames = { mcp: 'MCP', http: 'HTTP' } as const
 const serviceKinds = ['mcp', 'http'] as const
 
 export function useIntegrations(read: () => PlannerDocument, apply: (state: PlannerDocument, source: IntegrationSource) => void, busy: () => boolean) {

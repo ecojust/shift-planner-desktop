@@ -4,7 +4,7 @@
 
 ## 开启与连接
 
-1. 点击桌面应用右上角最右侧的**齿轮（设置）**，按需开启 **MCP** 或 **HTTP API**，也可同时开启。
+1. 点击桌面应用右上角最右侧的**齿轮（设置）**，按需开启 **MCP** 或 **HTTP**，也可同时开启。
 2. 每项服务分别显示运行状态、连接地址和访问令牌。
 3. 使用 MCP 时，复制包含实际地址和 MCP 令牌的配置到支持 Streamable HTTP 的 AI 客户端；使用 HTTP API 时，复制 HTTP 地址和 HTTP 令牌，按下方接口说明调用。
 
@@ -71,7 +71,7 @@ MCP／HTTP 修改使用高对比底色、图标和「MCP 修改」「HTTP 修改
 
 ## HTTP
 
-先在设置中开启 **HTTP API**。每个请求均需要 `Authorization: Bearer <HTTP 访问令牌>`，写入请求体为 JSON。HTTP 服务只提供下列四种接口，不提供 `/mcp`；MCP 服务地址也不提供这些 HTTP 接口。以下示例使用 HTTP 默认端口 `4319`，请按设置中的实际地址调整。
+先在设置中开启 **HTTP**。每个请求均需要 `Authorization: Bearer <HTTP 访问令牌>`，写入请求体为 JSON。HTTP 服务只提供下列四种接口，不提供 `/mcp`；MCP 服务地址也不提供这些 HTTP 接口。以下示例使用 HTTP 默认端口 `4319`，请按设置中的实际地址调整。
 
 ```bash
 curl http://127.0.0.1:4319/api/state \

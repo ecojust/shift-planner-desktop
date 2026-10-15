@@ -10,7 +10,7 @@ type ServiceName = 'mcp' | 'http'
 const { supported, services, permissions } = props.integration
 const serviceOptions: { key: ServiceName; label: string; description: string }[] = [
   { key: 'mcp', label: 'MCP', description: '供支持 MCP 的 AI 客户端连接。' },
-  { key: 'http', label: 'HTTP API', description: '供脚本或应用通过 REST 接口访问。' },
+  { key: 'http', label: 'HTTP', description: '供脚本或应用通过 REST 接口访问。' },
 ]
 const serviceName = (service: ServiceName) => service === 'mcp' ? 'MCP' : 'HTTP'
 const endpoint = (service: ServiceName) => services[service].url.replace(/\/$/, '')
