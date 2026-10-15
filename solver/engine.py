@@ -223,7 +223,8 @@ def validate_request(request):
         employee_ids.add(eid)
         maximum = _num(emp.get('maxHoursPerWeek'), '每周工时上限', 0, 168)
         minimum = _num(emp.get('minHoursPerWeek', 0), '每周最低工时', 0, 168)
-        _num(emp.get('minHoursPerMonth', 0), '每月最低工时', 0, 744)
+        # minHoursPerMonth is a deprecated legacy field. Ignore it entirely,
+        # including unresolved null defaults from older exported requests.
         if minimum > maximum or _minutes(minimum, ROUND_CEILING) > _minutes(maximum, ROUND_FLOOR):
             raise InvalidInput('每周最低工时不能超过每周工时上限（按整数分钟计算）。')
         eligible = _list(emp.get('eligibleShiftIds'), '可排班次', MAX_SHIFTS)
@@ -301,7 +302,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
         rest = _minutes(state['rules']['minRestHours'], ROUND_CEILING)
         consecutive = int(state['rules']['maxConsecutiveDays'])
         caps = {e['id']: _minutes(e['maxHoursPerWeek'], ROUND_FLOOR) for e in employees}
-        monthly_minimums = {e['id']: _minutes(e.get('minHoursPerMonth', 0), ROUND_CEILING) for e in employees}
         weekly_minimums = {e['id']: _minutes(e.get('minHoursPerWeek', 0), ROUND_CEILING) for e in employees}
         active = set(dates)
         month_start, month_end = dates[0] * DAY, (dates[-1] + 1) * DAY
@@ -444,23 +444,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
             return response('INFEASIBLE', '固定排班存在硬约束冲突，原排班未修改。', conflicts)
-        # Minimum-mode counts never cap available monthly work. Fixed-mode
-        # ceilings are enforced per day below, including when shortages are allowed.
-        if all(s.get('staffingMode', 'minimum') == 'fixed' for s in shifts):
-            # This upper bound is valid only when EVERY shift has a hard daily
-            # ceiling. Include actual carry-in work, not a guessed prior-month quota.
-            capacity = sum(
-                overlap_minutes(day * DAY + clock, day * DAY + clock + duration, month_start, month_end) * smap[sid]['required']
-                for day in dates for sid, (clock, duration) in shift_times.items()
-            ) + sum(
-                overlap_minutes(start, end, month_start, month_end)
-                for work in fixed_work.values() for start, end, a in work if _date(a['date']) not in active
-            )
-            minimum = sum(monthly_minimums.values())
-            if minimum > capacity:
-                return response('INFEASIBLE', '全部班次的固定人数上限无法提供所需月工时，原排班未修改。', [problem(
-                    'monthly-min-hours', f'月最低工时合计 {_hours_text(minimum)} 小时，固定人数上限在本月最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时。', '在班次设置增加固定人数或将适合的班次改为每日最少人数，或核实成员月最低工时。', 'shifts'
-                )])
         check_time()
         model = cp_model.CpModel()
         diagnostics = ConstraintDiagnostics()
@@ -476,7 +459,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             check_time()
             eid = e['id']
             intervals = []
-            possible_month = fixed_current_minutes[eid]
             possible_weeks = dict(fixed_month_weeks[eid])
             for start, end, a in fixed_work[eid]:
                 intervals.append(model.new_fixed_size_interval_var(start, end - start + rest, f'fixed_{eid}_{a["date"]}'))
@@ -486,7 +468,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             for day in dates:
                 if (eid, day) in fixed_cells:
                     continue
-                day_maximum = 0
                 day_week_maximums = defaultdict(int)
                 for sid in e['eligibleShiftIds']:
                     if caps[eid] == 0:
@@ -509,7 +490,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                     coverage[(day, sid)].append(var)
                     month_minutes = overlap_minutes(start, end, month_start, month_end)
                     total_minutes[eid].append(month_minutes * var)
-                    day_maximum = max(day_maximum, month_minutes)
                     shift_counts[(eid, sid)].append(var)
                     for week, minutes in parts:
                         weekly[eid][week].append(minutes * var)
@@ -517,7 +497,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                         month_weekly[eid][week].append(minutes * var)
                         day_week_maximums[week] = max(day_week_maximums[week], minutes)
                     intervals.append(model.new_optional_fixed_size_interval_var(start, duration + rest, var, f'i_{eid}_{day}_{sid}'))
-                possible_month += day_maximum
                 for week, minutes in day_week_maximums.items():
                     possible_weeks[week] = possible_weeks.get(week, 0) + minutes
                 if cells[(eid, day)]:
@@ -550,16 +529,10 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                 diagnostics.track(model.add(sum(terms) + fixed_weeks[eid][week] <= caps[eid]), f'weekly-cap-{eid}-{week}', problem(
                     'weekly-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周最多 {_hours_text(caps[eid])} 小时，其中已有固定安排 {_hours_text(fixed_weeks[eid][week])} 小时（含跨月）。',
                     '核对该成员周最高工时及这周固定安排，或增加可分担班次的人员。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
-            # Weekly limits also bound monthly work, even if isolated candidate
-            # shifts would each fit. This remains an upper bound (not a promise
-            # that rest/consecutive constraints allow all of these minutes).
+            # Account for the whole week's cap, even if isolated candidates
+            # would each fit. This remains an upper bound, not a promise that
+            # rest/consecutive constraints allow all of these minutes.
             possible_weeks = {week: min(possible_weeks.get(week, 0), max(0, caps[eid] - fixed_weeks[eid][week] + fixed_month_weeks[eid][week])) for week in week_days}
-            possible_month = min(possible_month, sum(possible_weeks.values()))
-            if possible_month < monthly_minimums[eid]:
-                conflicts.append(problem('monthly-min-hours', f'{e.get("name", eid)}本月最低 {_hours_text(monthly_minimums[eid])} 小时，但现有班次资格、请假、固定安排和周上限 {_hours_text(caps[eid])} 小时的条件下，最多不超过 {_hours_text(possible_month)} 小时，至少相差 {_hours_text(monthly_minimums[eid] - possible_month)} 小时。', '在成员管理核对该成员最低工时、周上限、可上班次及请假日期；达到此上界也仍须满足休息等规则。', 'team', employeeId=eid))
-            diagnostics.track(model.add(sum(total_minutes[eid]) + fixed_current_minutes[eid] >= monthly_minimums[eid]), f'monthly-min-{eid}', problem(
-                'monthly-min-hours', f'{e.get("name", eid)}在 {state["month"]} 的月最低工时为 {_hours_text(monthly_minimums[eid])} 小时。',
-                '核对该成员月最低工时与可用班次；固定人数班次不能为了补工时超额排人。此条与同列要求组合冲突。', 'team', employeeId=eid))
             for week, target in weekly_targets[eid].items():
                 if possible_weeks.get(week, 0) < target:
                     conflicts.append(problem('weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，{weekly_requirement(eid, week)}，但现有班次、请假、固定安排和周上限下，本月最多不超过 {_hours_text(possible_weeks.get(week, 0))} 小时，至少相差 {_hours_text(target - possible_weeks.get(week, 0))} 小时。', '核对该成员这一周的可上班次、请假、锁定安排及最低/最高工时；月外已排工时已用于减去整周最低的剩余要求，也仍计入周上限。月内跨夜片段只计为本月完成量。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
@@ -579,7 +552,7 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
-            return response('INFEASIBLE', '员工最低工时无法达到，原排班未修改；允许缺员也不会放宽最低工时。', conflicts)
+            return response('INFEASIBLE', '员工周最低工时无法达到，原排班未修改；允许缺员也不会放宽周最低工时。', conflicts)
         check_time()
         conflicts = daily_capacity_issues(employees, shifts, dates, x, fixed_coverage, fixed_cells, leave, shift_times, fixed_work, fixed_weeks, caps, rest, state['rules'].get('separationGroups', []), allow_partial, check_time)
         if not conflicts:

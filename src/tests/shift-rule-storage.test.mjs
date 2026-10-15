@@ -9,7 +9,7 @@ import { withSolverGuidance } from '../solverGuidance.ts'
 function fixture() {
   return {
     version: 1, teamName: '规则测试', month: '2026-10',
-    employees: [{ id: 'e1', name: '甲', role: '', group: '', color: '#345678', minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['early', 'night'], unavailableDates: [] }],
+    employees: [{ id: 'e1', name: '甲', role: '', group: '', color: '#345678', minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['early', 'night'], unavailableDates: [] }],
     shifts: [
       { id: 'early', name: '早班', shortName: '早', start: '08:00', end: '16:00', color: '#345678', required: 0 },
       { id: 'night', name: '夜班', shortName: '夜', start: '22:00', end: '06:00', color: '#345678', required: 0 },

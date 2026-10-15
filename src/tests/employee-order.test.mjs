@@ -16,7 +16,7 @@ function fixture() {
   return {
     version: 1, teamName: '测试团队', month: '2026-10',
     employees: rows('e1', 'e2', 'e3', 'e4', 'e5').map(employee => ({
-      ...employee, role: '店员', group: '', color: '#123456', minHoursPerMonth: null,
+      ...employee, role: '店员', group: '', color: '#123456',
       minHoursPerWeek: 0, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: [],
     })),
     shifts: [{ id: 'day', name: '白班', shortName: '白', start: '09:00', end: '17:00', color: '#123456', required: 1 }],

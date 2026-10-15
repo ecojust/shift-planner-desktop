@@ -13,9 +13,9 @@ from engine import solve
 from ortools.sat.python import cp_model
 
 
-def employee(name, shifts=('early',), minimum=0):
+def employee(name, shifts=('early',), weekly_minimum=0):
     return dict(id=name, name=name, eligibleShiftIds=list(shifts), unavailableDates=[],
-                minHoursPerMonth=minimum, minHoursPerWeek=0, maxHoursPerWeek=168)
+                minHoursPerWeek=weekly_minimum, maxHoursPerWeek=168)
 
 
 def shift(sid='early', required=0, start='08:00', end='16:00'):
@@ -113,6 +113,25 @@ class ShiftRulesTest(unittest.TestCase):
         data['state']['rules']['nonConsecutiveShifts'][0]['id'] = 'shared_id-1'
         data['state']['rules']['weeklyShiftLimits'][0]['id'] = 'shared_id-1'
         self.assertFeasible(solve(data))
+
+    def test_weekly_minimum_composes_with_adjacency_and_shift_count_limit(self):
+        data = request(employees=[employee('a', weekly_minimum=16)],
+                       adjacency=['early'], weekly=[('early', 2)])
+        result = solve(data)
+        self.assertFeasible(result)
+        self.assertCalendarRules(data, result)
+        counts = Counter()
+        for record in result['assignments']:
+            date = dt.date.fromisoformat(record['date'])
+            counts[date - dt.timedelta(days=date.weekday())] += 1
+        # All five natural weeks need two whole eight-hour shifts, including
+        # October's four- and six-day fragments; zero coverage cannot force them.
+        self.assertEqual(len(counts), 5)
+        self.assertEqual(set(counts.values()), {2})
+        data['state']['rules']['weeklyShiftLimits'][0]['maxPerWeek'] = 1
+        result = solve(data)
+        self.assertConflict(result, 'weekly-shift-limit')
+        self.assertTrue(any(item['type'] == 'weekly-min-hours' for item in result['issues']), result)
 
     def test_fixed_adjacent_dates_have_actionable_proof(self):
         data = request(assignments=[assignment('2026-10-03'), assignment('2026-10-04')], adjacency=['early'])

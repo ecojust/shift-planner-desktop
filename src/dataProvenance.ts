@@ -12,10 +12,16 @@ export interface DataProvenance {
   invalidatedSchedules?: Record<string, ChangeStamp>
 }
 
+/** Retired monthly-hour settings cannot contribute changes or survive migration. */
+function retiredMonthlyPath(path: string): boolean {
+  return path === 'monthlyReferenceHours' || path.startsWith('monthlyReferenceHours.')
+    || /^employees\.[a-zA-Z0-9_-]+\.minHoursPerMonth(?:\.|$)/.test(path)
+}
+
 /** Summarize a card's own paths and descendants without including sibling cards. */
 export function latestConfigurationChange(provenance: DataProvenance | undefined, paths: readonly string[]): ChangeStamp | undefined {
   if (!provenance || !paths.length) return undefined
-  const scopes = paths.filter(Boolean)
+  const scopes = paths.filter(path => !!path && !retiredMonthlyPath(path))
   let latest: ChangeStamp | undefined
   // Prefer an existing card summary when timestamps tie with its field records.
   for (const path of scopes) {
@@ -23,6 +29,7 @@ export function latestConfigurationChange(provenance: DataProvenance | undefined
     if (stamp && (!latest || stamp.at > latest.at)) latest = stamp
   }
   for (const [path, stamp] of Object.entries(provenance.fields)) {
+    if (retiredMonthlyPath(path)) continue
     if ((!latest || stamp.at > latest.at) && scopes.some(scope => path.startsWith(`${scope}.`))) latest = stamp
   }
   return latest
@@ -32,16 +39,16 @@ export const MAX_PROVENANCE_FIELDS = 100000
 export const MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 const categories = ['团队', '成员', '班次', '排班规则', '日期设置', '工时设置', '津贴'] as const
 const entityCollections = new Set(['employees', 'shifts', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits'])
-const roots = ['teamName', 'employees', 'shifts', 'rules', 'calendar', 'monthlyReferenceHours', 'payroll'] as const
-const scheduleConfigurationRoots = new Set(['employees', 'shifts', 'rules', 'calendar', 'monthlyReferenceHours'])
-const resettableRoots = new Set(['calendar', 'monthlyReferenceHours', 'rules.weekdayWeights', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits'])
+const roots = ['teamName', 'employees', 'shifts', 'rules', 'calendar', 'payroll'] as const
+const scheduleConfigurationRoots = new Set(['employees', 'shifts', 'rules'])
+const resettableRoots = new Set(['calendar', 'rules.weekdayWeights', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits'])
 
 /** Arrays of entities use persistent IDs; arrays of field values are a single leaf. */
 function collectConfiguration(state: PlannerDocument): { fields: Record<string, unknown>; paths: Set<string> } {
   const fields: Record<string, unknown> = Object.create(null)
   const paths = new Set<string>()
   function walk(path: string, value: unknown): void {
-    if (value === undefined) return
+    if (value === undefined || retiredMonthlyPath(path)) return
     paths.add(path)
     if (entityCollections.has(path) && Array.isArray(value)) {
       for (const entity of value) {
@@ -70,13 +77,11 @@ function allowedProvenancePath(state: PlannerDocument, present: Set<string>): (p
   const employees = new Set(state.employees.map(employee => employee.id))
   const shifts = new Set(state.shifts.map(shift => shift.id))
   return path => {
+    if (retiredMonthlyPath(path)) return false
     if (present.has(path) || resettableRoots.has(path)) return true
     const parts = path.split('.')
     if (parts.length === 2 && parts[0] === 'calendar') {
       return parts[1]!.slice(0, 4) !== '0000' && isCivilDate(parts[1]!)
-    }
-    if (parts.length === 2 && parts[0] === 'monthlyReferenceHours') {
-      return validMonth(parts[1]!)
     }
     if (parts.length === 3 && parts[0] === 'employees') return employees.has(parts[1]!) && parts[2] === 'avatar'
     if (parts.length === 3 && parts[0] === 'shifts') return shifts.has(parts[1]!) && (parts[2] === 'staffingMode' || parts[2] === 'normalAllowance')
@@ -90,7 +95,6 @@ function category(path: string): string {
   if (path.startsWith('shifts.')) return path.endsWith('.normalAllowance') ? '津贴' : '班次'
   if (path.startsWith('rules.')) return '排班规则'
   if (path.startsWith('calendar.')) return '日期设置'
-  if (path.startsWith('monthlyReferenceHours.')) return '工时设置'
   return '津贴'
 }
 
@@ -200,6 +204,9 @@ export function parseDataProvenance(value: unknown, state: PlannerDocument): Dat
   const allowedPath = allowedProvenancePath(state, collectConfiguration(state).paths)
   const fields: Record<string, ChangeStamp> = Object.create(null)
   for (const [path, value] of Object.entries(rawFields)) {
+    // Discard retired metadata before validating its old stamp or value shape.
+    // Unknown paths outside these retired settings remain strict below.
+    if (retiredMonthlyPath(path)) continue
     // This is a flat dictionary, never a path setter. Actual IDs may themselves be
     // named "constructor"; they remain harmless dotted keys in a null-prototype map.
     if (path.length > 256 || !/^[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)*$/.test(path) || !allowedPath(path)) fail('字段路径无效')

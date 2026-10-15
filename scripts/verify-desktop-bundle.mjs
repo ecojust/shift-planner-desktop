@@ -24,19 +24,20 @@ export function makeBundleScheduleFixtures() {
   base.assignments = [];
   const coverage = {
     ...base,
-    employees: base.employees.map(employee => ({ ...employee, minHoursPerMonth: 0, minHoursPerWeek: 0 })),
+    employees: base.employees.map(({ minHoursPerMonth: _legacy, ...employee }) => ({ ...employee, minHoursPerWeek: 0 })),
   };
   // Retain the historical fixture/report key for native-workflow consumers.
-  // A normal 144-hour reference is no longer an infeasibility fixture: staffing
-  // can exceed the daily minimum. 744 hours cannot fit these eight-hour shifts.
+  // Weekly minima are individually valid, but fixed staffing offers only 280
+  // hours per complete week against the team's 480-hour minimum requirement.
   const reference = {
     ...base,
-    employees: base.employees.map(employee => ({ ...employee, minHoursPerMonth: 744, minHoursPerWeek: 0 })),
+    employees: base.employees.map(({ minHoursPerMonth: _legacy, ...employee }) => ({ ...employee, minHoursPerWeek: 40, maxHoursPerWeek: 48 })),
+    shifts: base.shifts.map(shift => ({ ...shift, staffingMode: 'fixed' })),
   };
   const weighted = {
     ...base, teamName: 'Installed runtime hours and weekday-weight verification',
-    employees: base.employees.slice(0, 2).map(employee => ({
-      ...employee, minHoursPerMonth: 120, minHoursPerWeek: 14, eligibleShiftIds: ['day'],
+    employees: base.employees.slice(0, 2).map(({ minHoursPerMonth: _legacy, ...employee }) => ({
+      ...employee, minHoursPerWeek: 14, eligibleShiftIds: ['day'],
     })),
     shifts: [{ ...base.shifts[0], id: 'day', required: 1 }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5, weekdayWeights: { days: [6, 7], percent: 40 } },
@@ -79,15 +80,15 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
   const independentRuleIssues = feasible(coverage, 155);
 
   const reference = await solve('reference');
-  assert.ok(reference.state.employees.every(employee => employee.minHoursPerMonth === 744));
-  assert.equal(reference.result.status, 'INFEASIBLE', 'A 744-hour monthly minimum cannot fit the available eight-hour shifts and weekly caps');
+  assert.ok(reference.state.employees.every(employee => employee.minHoursPerWeek === 40 && employee.maxHoursPerWeek === 48));
+  assert.ok(reference.state.shifts.every(shift => shift.staffingMode === 'fixed'));
+  assert.equal(reference.result.status, 'INFEASIBLE', 'The 480-hour weekly minimum cannot fit the fixed staffing capacity of 280 hours');
   assert.equal(Object.hasOwn(reference.result, 'assignments'), false, 'An infeasible model must not supply a replacement roster');
-  assert.ok(reference.result.issues.some(issue => issue.type === 'monthly-min-hours'));
+  assert.ok(reference.result.issues.some(issue => issue.type === 'weekly-fixed-capacity'));
 
   const weighted = await solve('weighted');
   const weightedIssues = feasible(weighted, datesOfMonth(weighted.state.month).length);
   const monthlyHours = Object.fromEntries(monthlyHoursByEmployee({ ...weighted.state, assignments: weighted.result.assignments }));
-  for (const employee of weighted.state.employees) assert.ok(monthlyHours[employee.id] >= employee.minHoursPerMonth);
   const weeks = new Map();
   for (const date of datesOfMonth(weighted.state.month)) {
     const day = new Date(`${date}T00:00:00Z`);
@@ -96,6 +97,16 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
     weeks.set(week, [...(weeks.get(week) ?? []), date]);
   }
   const rule = weighted.state.rules.weekdayWeights;
+  const weeklyHours = [...weeks].flatMap(([week, dates]) => weighted.state.employees.map(employee => {
+    // This day-shift fixture has no outside-month history. Audit actual minutes
+    // independently, including prorated first/last weeks and the full weekly cap.
+    const minutes = weighted.result.assignments.filter(item => item.employeeId === employee.id && dates.includes(item.date) && item.shiftId === 'day').length * 8 * 60;
+    const minimumMinutes = Math.ceil(employee.minHoursPerWeek * 60 * dates.length / 7);
+    const maximumMinutes = Math.floor(employee.maxHoursPerWeek * 60);
+    assert.ok(minutes >= minimumMinutes, `${week} ${employee.id}: weekly minimum is missing`);
+    assert.ok(minutes <= maximumMinutes, `${week} ${employee.id}: weekly maximum is exceeded`);
+    return { week, employeeId: employee.id, minutes, minimumMinutes, maximumMinutes };
+  }));
   const weeklyQuotas = [...weeks].map(([week, dates]) => {
     const assignments = weighted.result.assignments.filter(item => dates.includes(item.date) && item.shiftId !== 'off');
     const selectedDates = dates.filter(date => rule.days.includes((new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7 + 1));
@@ -119,11 +130,11 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
     return { week, totalTarget: assignments.length, selectedTarget: selectedCount, assignmentCount: assignments.length, selectedCount, fullWeekCountCandidates: candidates };
   });
   return { ...coverage, independentRuleIssues, constraintChecks: {
-    defaultReference: { fixtureKind: 'impossible-monthly-minimum', status: reference.result.status, minimumHoursPerEmployee: 744, issueTypes: reference.result.issues.map(issue => issue.type), suppliedAssignments: false },
+    defaultReference: { fixtureKind: 'impossible-weekly-fixed-capacity', status: reference.result.status, minimumWeeklyHoursPerEmployee: 40, totalMinimumWeeklyHours: 480, fixedWeeklyCapacityHours: 280, issueTypes: reference.result.issues.map(issue => issue.type), suppliedAssignments: false },
     positiveMinimumsAndWeights: { status: weighted.result.status, month: weighted.state.month, employeeCount: weighted.state.employees.length,
-      minHoursPerMonth: 120, minHoursPerWeek: 14, weekdayWeights: weighted.state.rules.weekdayWeights,
+      minHoursPerWeek: 14, weekdayWeights: weighted.state.rules.weekdayWeights,
       assignmentCount: weighted.result.assignments.length, shortageCount: weighted.result.stats.shortageCount,
-      monthlyHours, weeklyQuotas, independentRuleIssues: weightedIssues, elapsedSeconds: weighted.execution.elapsedSeconds },
+      monthlyHours, weeklyHours, weeklyQuotas, independentRuleIssues: weightedIssues, elapsedSeconds: weighted.execution.elapsedSeconds },
   } };
 }
 

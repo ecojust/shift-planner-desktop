@@ -104,7 +104,7 @@ onBeforeUnmount(() => {
           <p v-if="avatarError" class="sp-employee-error sp-employee-avatar-error" role="alert">{{ avatarError }}</p>
           <div class="sp-employee-field"><div class="sp-employee-field-heading"><label :for="nameId">员工姓名</label></div><input :id="nameId" ref="nameInput" v-model="draft.name" maxlength="80" required autocomplete="off" placeholder="例如：陈晨" /></div>
           <div class="sp-employee-fields"><div class="sp-employee-field"><div class="sp-employee-field-heading"><label :for="roleId">岗位</label></div><input :id="roleId" v-model="draft.role" maxlength="80" placeholder="例如：值班主管" /></div><div class="sp-employee-field"><div class="sp-employee-field-heading"><label :for="groupId">所属分组</label></div><input :id="groupId" v-model="draft.group" maxlength="80" placeholder="例如：一组" /></div></div>
-          <p class="sp-employee-help">{{ employee.id ? '工时、可上班次与请假日期保留最新设置。' : '默认每周 40–48 小时，月最低跟随月参考值，可上全部班次。' }}</p>
+          <p class="sp-employee-help">{{ employee.id ? '工时、可上班次与请假日期保留最新设置。' : '默认每周 40–48 小时，可上全部班次。' }}</p>
           <p v-if="error" class="sp-employee-error" role="alert">{{ error }}</p>
         </div>
         <footer><button type="button" @click="emit('close')">取消</button><button type="submit" class="is-primary" :disabled="avatarLoading">保存人员</button></footer>

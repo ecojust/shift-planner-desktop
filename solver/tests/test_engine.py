@@ -1,6 +1,7 @@
 import copy
 import datetime as dt
 import json
+import math
 from pathlib import Path
 import subprocess
 import shutil
@@ -34,8 +35,8 @@ def assignment(eid, date, sid='early', locked=True):
     return dict(employeeId=eid, date=date, shiftId=sid, locked=locked)
 
 
-def actual_month_minutes(s, assignments, eid):
-    """Independent minute-by-minute oracle for monthly / natural-week totals."""
+def actual_month_minutes(s, assignments, eid, *, include_outside=False):
+    """Independent minute oracle, optionally including complete boundary weeks."""
     shifts = {item['id']: item for item in s['shifts']}
     weekly = {}
     total = 0
@@ -49,7 +50,7 @@ def actual_month_minutes(s, assignments, eid):
             end += dt.timedelta(days=1)
         minute = start
         while minute < end:
-            if minute.strftime('%Y-%m') == s['month']:
+            if include_outside or minute.strftime('%Y-%m') == s['month']:
                 week = (minute.date() - dt.timedelta(days=minute.weekday())).isoformat()
                 weekly[week] = weekly.get(week, 0) + 1
                 total += 1
@@ -191,35 +192,47 @@ class SolverTest(unittest.TestCase):
         self.assertFeasible(result)
         self.assertFalse(any(a['employeeId'] == 'a' for a in result['assignments']))
 
-    def test_monthly_minimum_changes_assignment_distribution(self):
-        s = state(employees=[employee('a', cap=168, minimum_month=160), employee('b', cap=168)])
-        s['rules']['maxConsecutiveDays'] = 31
+    def test_legacy_monthly_values_do_not_change_weekly_constraints_or_staffing(self):
+        # Each of the five natural weeks needs exactly one eight-hour shift.
+        # Legacy values must neither reject this request nor add more work.
+        for legacy in (None, 0, 160, 1000000, -1, True, float('inf'), 'obsolete', {'old': 1}):
+            with self.subTest(legacy=legacy):
+                s = state(employees=[employee('a', cap=8, minimum_week=8, minimum_month=legacy)],
+                          shifts=[shift(required=0)])
+                original = copy.deepcopy(s)
+                result = solve(request(s))
+                self.assertFeasible(result)
+                self.assertEqual(len(result['assignments']), 5)
+                self.assert_prorated_weekly_hours(s, result['assignments'], 'a')
+                self.assertEqual(s, original)
+
+    def test_high_legacy_monthly_minimum_does_not_make_zero_weekly_capacity_infeasible(self):
+        s = state(employees=[employee('a', cap=0, minimum_month=1000000)], shifts=[shift(required=0)])
         result = solve(request(s))
         self.assertFeasible(result)
-        self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 160 * 60)
+        self.assertEqual(result['assignments'], [])
 
-    def test_monthly_minimum_can_add_people_above_daily_minimum(self):
-        s = state(employees=[employee('a', minimum_month=160), employee('b', minimum_month=160)])
+    def test_weekly_minimum_can_add_people_above_daily_minimum(self):
+        s = state(employees=[employee('a', minimum_week=40), employee('b', minimum_week=40)])
         original = copy.deepcopy(s)
         for allow_partial in (False, True):
             r = request(s)
             r['options']['allowPartial'] = allow_partial
             result = solve(r)
             self.assertFeasible(result)
-            self.assertGreaterEqual(len(result['assignments']), 40)
-            self.assertLess(len(result['assignments']), 62)
+            self.assertEqual(len(result['assignments']), 46)
             for eid in ('a', 'b'):
-                self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], eid)[0], 160 * 60)
+                self.assert_prorated_weekly_hours(s, result['assignments'], eid)
             self.assert_daily_minimum(s, result['assignments'])
         self.assertEqual(s, original)
 
     def test_required_zero_is_available_for_extra_work_but_not_filled_without_a_reason(self):
-        s = state(employees=[employee('a', minimum_month=16)], shifts=[shift(required=0)])
+        s = state(employees=[employee('a', minimum_week=8)], shifts=[shift(required=0)])
         result = solve(request(s))
         self.assertFeasible(result)
-        self.assertEqual(len(result['assignments']), 2)
-        self.assertEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 16 * 60)
-        s['employees'][0]['minHoursPerMonth'] = 0
+        self.assertEqual(len(result['assignments']), 5)
+        self.assert_prorated_weekly_hours(s, result['assignments'], 'a')
+        s['employees'][0]['minHoursPerWeek'] = 0
         result = solve(request(s))
         self.assertFeasible(result)
         self.assertEqual(result['assignments'], [])
@@ -243,16 +256,16 @@ class SolverTest(unittest.TestCase):
         self.assertEqual(len(result['assignments']), 31)
         self.assert_daily_minimum(s, result['assignments'])
 
-    def test_fixed_and_minimum_shifts_can_mix_to_meet_employee_minimum_hours(self):
-        s = state(employees=[employee(str(i), ['early', 'late'], minimum_month=80) for i in range(4)],
+    def test_fixed_and_minimum_shifts_can_mix_to_meet_employee_weekly_hours(self):
+        s = state(employees=[employee(str(i), ['early', 'late'], minimum_week=20) for i in range(4)],
                   shifts=[shift(mode='fixed'), shift('late', '14:00', '22:00', 0, mode='minimum')])
         result = solve(request(s))
         self.assertFeasible(result)
         self.assert_daily_minimum(s, result['assignments'])
         self.assertEqual(sum(a['shiftId'] == 'early' for a in result['assignments']), 31)
-        self.assertGreaterEqual(sum(a['shiftId'] == 'late' for a in result['assignments']), 9)
+        self.assertGreaterEqual(sum(a['shiftId'] == 'late' for a in result['assignments']), 25)
         for eid in map(str, range(4)):
-            self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], eid)[0], 80 * 60)
+            self.assert_prorated_weekly_hours(s, result['assignments'], eid)
 
     def test_fixed_zero_never_generates_work_and_cannot_supply_minimum_hours(self):
         old = assignment('a', '2026-10-01', locked=False)
@@ -262,7 +275,7 @@ class SolverTest(unittest.TestCase):
         self.assertFeasible(result)
         self.assertEqual(result['assignments'], [])
         self.assertEqual(s, original)
-        s['employees'][0]['minHoursPerMonth'] = 8
+        s['employees'][0]['minHoursPerWeek'] = 8
         for allow_partial in (False, True):
             r = request(s); r['options']['allowPartial'] = allow_partial
             result = solve(r)
@@ -271,7 +284,8 @@ class SolverTest(unittest.TestCase):
         s['shifts'][0]['staffingMode'] = 'minimum'
         result = solve(request(s))
         self.assertFeasible(result)
-        self.assertEqual(len(result['assignments']), 1)
+        self.assertEqual(len(result['assignments']), 5)
+        self.assert_prorated_weekly_hours(s, result['assignments'], 'a')
 
     def test_fixed_zero_locked_work_is_a_hard_conflict_even_when_shortage_is_allowed(self):
         locked = assignment('a', '2026-10-01')
@@ -295,44 +309,15 @@ class SolverTest(unittest.TestCase):
             self.assertNotIn('assignments', result)
             self.assertTrue(any(item['type'] == 'overstaffed' for item in result['issues']))
 
-    def test_fixed_daily_count_cannot_expand_to_bypass_month_or_week_minimum_conflicts(self):
-        for minimum_month, minimum_week in ((160, 0), (0, 40)):
-            s = state(employees=[employee('a', minimum_month=minimum_month, minimum_week=minimum_week), employee('b', minimum_month=minimum_month, minimum_week=minimum_week)],
-                      shifts=[shift(mode='fixed')])
-            for allow_partial in (False, True):
-                r = request(s); r['options']['allowPartial'] = allow_partial
-                result = solve(r)
-                self.assertEqual(result['status'], 'INFEASIBLE')
-                self.assertNotIn('assignments', result)
-                if minimum_month:
-                    self.assertIn('320', result['issues'][0]['message'])
-                    self.assertIn('248', result['issues'][0]['message'])
-                    self.assertLess(result['stats']['wallTimeSeconds'], 1)
-
-    def test_all_fixed_zero_still_counts_actual_previous_month_night_carry_for_monthly_minimum(self):
-        history = assignment('a', '2026-09-30', 'night', False)
-        s = state(employees=[employee('a', ['night'], minimum_month=6)], shifts=[shift('night', '22:00', '06:00', 0, mode='fixed')], assignments=[history])
-        result = solve(request(s))
-        self.assertFeasible(result)
-        self.assertEqual(result['assignments'], [history])
-        self.assertEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 6 * 60)
-        s['employees'][0]['minHoursPerMonth'] = 7
-        result = solve(request(s))
-        self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertIn('最多提供 6 小时', result['issues'][0]['message'])
-
-    def test_all_fixed_capacity_clips_outgoing_nights_and_adds_only_real_carry_in(self):
-        s = state(employees=[employee('a', ['night'], cap=168, minimum_month=243), employee('b', ['night'], cap=168)],
-                  shifts=[shift('night', '22:00', '06:00', 1, mode='fixed')])
-        s['rules']['maxConsecutiveDays'] = 32
-        result = solve(request(s))
-        self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertIn('最多提供 242 小时', result['issues'][0]['message'])
-        s['assignments'] = [assignment('a', '2026-09-30', 'night', False)]
-        result = solve(request(s))
-        self.assertFeasible(result)
-        self.assert_daily_minimum(s, result['assignments'])
-        self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 243 * 60)
+    def test_fixed_daily_count_cannot_expand_to_bypass_weekly_minimum_conflicts(self):
+        s = state(employees=[employee('a', minimum_week=40), employee('b', minimum_week=40)],
+                  shifts=[shift(mode='fixed')])
+        for allow_partial in (False, True):
+            r = request(s); r['options']['allowPartial'] = allow_partial
+            result = solve(r)
+            self.assertEqual(result['status'], 'INFEASIBLE')
+            self.assertNotIn('assignments', result)
+            self.assertTrue(any(item['type'] == 'weekly-fixed-capacity' for item in result['issues']))
 
     def test_fixed_partial_allows_understaffing_but_preserves_the_daily_ceiling(self):
         s = state(employees=[employee('a', cap=168), employee('b', cap=168)], shifts=[shift(required=3, mode='fixed')])
@@ -351,10 +336,11 @@ class SolverTest(unittest.TestCase):
 
     def test_legacy_missing_mode_and_explicit_minimum_both_allow_extra_assignments(self):
         for mode in (None, 'minimum'):
-            s = state(employees=[employee('a', minimum_month=16)], shifts=[shift(required=0, mode=mode)])
+            s = state(employees=[employee('a', minimum_week=8)], shifts=[shift(required=0, mode=mode)])
             result = solve(request(s))
             self.assertFeasible(result)
-            self.assertEqual(len(result['assignments']), 2)
+            self.assertEqual(len(result['assignments']), 5)
+            self.assert_prorated_weekly_hours(s, result['assignments'], 'a')
 
     def test_invalid_staffing_modes_are_rejected_without_a_replacement(self):
         for mode in (None, 0, 1, True, False, {}, [], '', 'Fixed', 'minimum ', 'maximum'):
@@ -375,19 +361,26 @@ class SolverTest(unittest.TestCase):
         self.assert_daily_minimum(s, result['assignments'])
 
     def test_extra_staffing_preserves_separation_and_cannot_relax_weekly_maxima(self):
-        s = state(employees=[employee('a', minimum_month=160), employee('b', minimum_month=160)])
+        s = state(employees=[employee('a', minimum_week=40), employee('b', minimum_week=40)])
         s['rules']['separationGroups'] = [dict(id='g', name='分开', employeeIds=['a', 'b'], shiftIds=[])]
         self.assertEqual(solve(request(s))['status'], 'INFEASIBLE')
-        s = state(employees=[employee('a', minimum_month=160, cap=8)], shifts=[shift(required=0)])
-        self.assertEqual(solve(request(s))['status'], 'INFEASIBLE')
+        # Five-hour shifts cannot meet an eight-hour weekly minimum without
+        # breaching the eight-hour ceiling; allowing shortages cannot help.
+        s = state(employees=[employee('a', minimum_week=8, cap=8)],
+                  shifts=[shift(start='08:00', end='13:00', required=0)])
+        for allow_partial in (False, True):
+            r = request(s); r['options']['allowPartial'] = allow_partial
+            result = solve(r)
+            self.assertEqual(result['status'], 'INFEASIBLE')
+            self.assertNotIn('assignments', result)
 
-    def test_individual_unreachable_monthly_minimum_is_explained(self):
+    def test_individual_unreachable_weekly_minimum_is_explained(self):
         leaves = [f'2026-10-{day:02d}' for day in range(1, 32)]
-        s = state(employees=[employee('a', leave=leaves, minimum_month=8), employee('b', cap=168)])
+        s = state(employees=[employee('a', leave=leaves, minimum_week=8), employee('b', cap=168)])
         s['rules']['maxConsecutiveDays'] = 31
         result = solve(request(s))
         self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertTrue(any(i['type'] == 'monthly-min-hours' and i.get('employeeId') == 'a' for i in result['issues']))
+        self.assertTrue(any(i['type'] == 'weekly-min-hours' and i.get('employeeId') == 'a' for i in result['issues']))
         self.assertNotIn('assignments', result)
 
     def test_weekly_minimum_prorates_both_month_boundaries(self):
@@ -402,12 +395,11 @@ class SolverTest(unittest.TestCase):
     def test_minimum_rounding_uses_ceil_then_partial_week_ceil(self):
         # .02 hours becomes two minutes, then the first 4/7 week still
         # requires two minutes, rather than rounding .02 * 60 * 4/7 to one.
-        s = state(employees=[employee('a', cap=1, minimum_month=.02, minimum_week=.02), employee('b', cap=1)], shifts=[shift(start='12:00', end='12:01')])
+        s = state(employees=[employee('a', cap=1, minimum_week=.02), employee('b', cap=1)], shifts=[shift(start='12:00', end='12:01')])
         s['rules']['maxConsecutiveDays'] = 31
         result = solve(request(s))
         self.assertFeasible(result)
-        total, weekly = actual_month_minutes(s, result['assignments'], 'a')
-        self.assertGreaterEqual(total, 2)
+        _, weekly = actual_month_minutes(s, result['assignments'], 'a')
         self.assertTrue(all(weekly.get(week, 0) >= 2 for week in ['2026-09-28', '2026-10-05', '2026-10-12', '2026-10-19', '2026-10-26']))
 
     def test_outside_month_work_reduces_but_does_not_erase_remaining_week_minimum(self):
@@ -423,17 +415,6 @@ class SolverTest(unittest.TestCase):
         self.assertIn('月外已排 24 小时', first[0]['message'])
         self.assertIn('本月实际最低要求为 4 小时', first[0]['message'])
         self.assertIn('0 小时', first[0]['message'])
-
-    def test_overnight_month_minimum_counts_carry_in_excludes_carry_out(self):
-        s = state(employees=[employee('a', ['night'], cap=168, minimum_month=248)], shifts=[shift('night', '23:00', '07:00')], assignments=[assignment('a', '2026-09-30', 'night', False)])
-        s['rules']['maxConsecutiveDays'] = 32
-        result = solve(request(s))
-        self.assertFeasible(result)
-        self.assertEqual(actual_month_minutes(s, result['assignments'], 'a')[0], 248 * 60)
-        s['assignments'] = []
-        result = solve(request(s))
-        self.assertEqual(result['status'], 'INFEASIBLE')
-        self.assertIn('241', result['issues'][0]['message'])
 
     def test_previous_month_night_tail_satisfies_first_partial_week_minimum(self):
         # February 2026 begins on Sunday. One known Saturday hour leaves six
@@ -465,12 +446,11 @@ class SolverTest(unittest.TestCase):
             del e['minHoursPerWeek']
         self.assertFeasible(solve(request(s)))
 
-    def test_invalid_minimum_fields_and_rounded_week_range(self):
-        cases = [('minHoursPerMonth', None), ('minHoursPerMonth', -1), ('minHoursPerMonth', 745), ('minHoursPerMonth', True), ('minHoursPerMonth', float('inf')), ('minHoursPerWeek', None), ('minHoursPerWeek', -1), ('minHoursPerWeek', 169), ('minHoursPerWeek', 49)]
-        for field, value in cases:
-            with self.subTest(field=field, value=value):
+    def test_invalid_weekly_minimum_and_rounded_week_range(self):
+        for value in (None, -1, 169, 49, True, float('inf'), '8', {}):
+            with self.subTest(value=value):
                 s = state()
-                s['employees'][0][field] = value
+                s['employees'][0]['minHoursPerWeek'] = value
                 self.assertEqual(solve(request(s))['status'], 'MODEL_INVALID')
         s = state(employees=[employee('a', cap=.025, minimum_week=.025)])
         self.assertEqual(solve(request(s))['status'], 'MODEL_INVALID')
@@ -490,6 +470,25 @@ class SolverTest(unittest.TestCase):
                 else:
                     self.assertGreaterEqual(actual, item['required'])
             date += dt.timedelta(days=1)
+
+    def assert_prorated_weekly_hours(self, s, assignments, eid):
+        """Independent minute totals for fixtures without previous-month history."""
+        person = next(item for item in s['employees'] if item['id'] == eid)
+        first = dt.date.fromisoformat(s['month'] + '-01')
+        dates_per_week = {}
+        date = first
+        while date.month == first.month:
+            week = (date - dt.timedelta(days=date.weekday())).isoformat()
+            dates_per_week[week] = dates_per_week.get(week, 0) + 1
+            date += dt.timedelta(days=1)
+        _, actual = actual_month_minutes(s, assignments, eid)
+        _, full_weeks = actual_month_minutes(s, assignments, eid, include_outside=True)
+        minimum = math.ceil(person.get('minHoursPerWeek', 0) * 60)
+        maximum = math.floor(person['maxHoursPerWeek'] * 60)
+        for week, days in dates_per_week.items():
+            self.assertGreaterEqual(actual.get(week, 0), (minimum * days + 6) // 7, (eid, week))
+        for week, minutes in full_weeks.items():
+            self.assertLessEqual(minutes, maximum, (eid, week))
 
     def assert_weighted_actual(self, s, assignments):
         weights = s['rules']['weekdayWeights']
@@ -573,7 +572,7 @@ class SolverTest(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
     def test_mixed_staffing_mode_solution_matches_frontend_validator(self):
-        s = state(employees=[employee(str(i), ['early', 'late'], minimum_month=80) for i in range(4)],
+        s = state(employees=[employee(str(i), ['early', 'late'], minimum_week=20) for i in range(4)],
                   shifts=[shift(mode='fixed'), shift('late', '14:00', '22:00', 0, mode='minimum')])
         result = solve(request(s))
         self.assertFeasible(result)
@@ -779,13 +778,19 @@ class SolverTest(unittest.TestCase):
                              for item in result['assignments']), 12)
 
     def test_zero_weight_partial_week_can_be_empty_only_when_daily_minimum_permits_it(self):
-        s = state(month='2026-02', employees=[employee(str(i), cap=168, minimum_month=8) for i in range(7)], shifts=[shift(required=0)])
+        locked = [assignment(str(i), '2026-02-02') for i in range(7)]
+        s = state(month='2026-02', employees=[employee(str(i), cap=168) for i in range(7)],
+                  shifts=[shift(required=0)], assignments=locked)
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
         self.assertFalse(any(a['date'] == '2026-02-01' for a in result['assignments']))
         self.assertEqual(len(result['assignments']), 7)
         self.assert_weighted_actual(s, result['assignments'])
+        s['shifts'][0]['required'] = 1
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE')
+        self.assertNotIn('assignments', result)
 
     def test_all_weekdays_at_100_percent_is_uniform(self):
         s = state(month='2026-06', employees=[employee('a', cap=168), employee('b', cap=168)])
@@ -796,17 +801,19 @@ class SolverTest(unittest.TestCase):
         self.assert_daily_minimum(s, result['assignments'])
         self.assert_weighted_actual(s, result['assignments'])
 
-    def test_weighted_zero_required_nights_can_supply_monthly_minimum(self):
-        s = state(month='2026-06', employees=[employee(str(i), ['night'], cap=168, minimum_month=40) for i in range(7)], shifts=[shift('night', '23:00', '07:00', 0)])
+    def test_weighted_zero_required_nights_can_supply_weekly_minimum(self):
+        s = state(month='2026-06', employees=[employee(str(i), ['night'], cap=168, minimum_week=8) for i in range(7)], shifts=[shift('night', '23:00', '07:00', 0)])
         s['rules'].update(weekdayWeights={'days': [1], 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
-        self.assertEqual(sum(actual_month_minutes(s, result['assignments'], str(i))[0] for i in range(7)), 280 * 60)
+        self.assertEqual(len(result['assignments']), 35)
+        for eid in map(str, range(7)):
+            self.assert_prorated_weekly_hours(s, result['assignments'], eid)
         self.assert_weighted_actual(s, result['assignments'])
 
-    def test_user_twelve_employee_monthly_and_weekly_minimum_screenshot(self):
+    def test_twelve_employees_meet_weekly_minimum_and_maximum_hours(self):
         ids = ['early', 'late', 'night']
-        s = state(employees=[employee(str(i), ids, cap=56, minimum_month=144, minimum_week=40) for i in range(12)],
+        s = state(employees=[employee(str(i), ids, cap=56, minimum_week=40) for i in range(12)],
                   shifts=[shift(), shift('late', '14:00', '22:00'), shift('night', '22:00', '06:00')])
         s['rules']['maxConsecutiveDays'] = 5
         # CI hosts vary; the product's 15-second budget is checked separately.
@@ -817,17 +824,11 @@ class SolverTest(unittest.TestCase):
         self.assertGreater(len(result['assignments']), 31 * 3)
         self.assertLess(len(result['assignments']), 31 * 12)
         for employee_id in map(str, range(12)):
-            minutes, weeks = actual_month_minutes(s, result['assignments'], employee_id)
-            self.assertGreaterEqual(minutes, 144 * 60)
-            for week, actual in weeks.items():
-                start = dt.date.fromisoformat(week)
-                days = sum((start + dt.timedelta(days=d)).strftime('%Y-%m') == s['month'] for d in range(7))
-                self.assertGreaterEqual(actual, (40 * 60 * days + 6) // 7)
-                self.assertLessEqual(actual, 56 * 60)
+            self.assert_prorated_weekly_hours(s, result['assignments'], employee_id)
 
     def test_twelve_employee_minimums_also_work_with_uniform_hard_weekday_weights(self):
         ids = ['early', 'late', 'night']
-        s = state(employees=[employee(str(i), ids, cap=56, minimum_month=144, minimum_week=40) for i in range(12)],
+        s = state(employees=[employee(str(i), ids, cap=56, minimum_week=40) for i in range(12)],
                   shifts=[shift(), shift('late', '14:00', '22:00'), shift('night', '22:00', '06:00')])
         s['rules'].update(maxConsecutiveDays=5, weekdayWeights={'days': list(range(1, 8)), 'percent': 100})
         r = request(s); r['options']['timeLimitSeconds'] = 30
@@ -836,7 +837,7 @@ class SolverTest(unittest.TestCase):
         self.assert_daily_minimum(s, result['assignments'])
         self.assert_weighted_actual(s, result['assignments'])
         for eid in map(str, range(12)):
-            self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], eid)[0], 144 * 60)
+            self.assert_prorated_weekly_hours(s, result['assignments'], eid)
 
     def test_invalid_weekday_weight_schemas_and_deprecated_switch(self):
         invalid = [None, {}, {'days': [], 'percent': 50}, {'days': [1, 1], 'percent': 50}, {'days': [0], 'percent': 50}, {'days': [8], 'percent': 50}, {'days': [True], 'percent': 50}, {'days': [1], 'percent': -1}, {'days': [1], 'percent': 101}, {'days': [1], 'percent': 1.5}, {'days': list(range(1, 8)), 'percent': 99}]
@@ -882,32 +883,35 @@ class SolverTest(unittest.TestCase):
         validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
-    @unittest.skipUnless(shutil.which('node'), 'Node required for frontend reference resolution')
-    def test_frontend_reference_defaults_can_add_staff_to_meet_monthly_hours(self):
+    @unittest.skipUnless(shutil.which('node'), 'Node required for frontend request serialization')
+    def test_frontend_request_omits_deprecated_monthly_fields_and_keeps_weekly_hours(self):
         folder = Path(__file__).resolve().parent
         fixture = subprocess.run(['node', str(folder / 'default_fixture.mjs'), '--reference'], text=True, encoding='utf-8', capture_output=True, check=True)
         s = json.loads(fixture.stdout)
-        self.assertTrue(all(isinstance(e['minHoursPerMonth'], (int, float)) and e['minHoursPerMonth'] > 0 for e in s['employees']))
+        self.assertTrue(all('minHoursPerMonth' not in e for e in s['employees']))
+        self.assertNotIn('monthlyReferenceHours', s)
+        for e in s['employees']:
+            e['minHoursPerWeek'] = 14
         r = request(s); r['options']['timeLimitSeconds'] = 10
         result = solve(r)
         self.assertFeasible(result)
         self.assert_daily_minimum(s, result['assignments'])
         for e in s['employees']:
-            self.assertGreaterEqual(actual_month_minutes(s, result['assignments'], e['id'])[0], e['minHoursPerMonth'] * 60)
+            self.assert_prorated_weekly_hours(s, result['assignments'], e['id'])
+        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        self.assertEqual(json.loads(validation.stdout), [])
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
-    def test_positive_month_and_week_minimums_match_js_validator(self):
-        s = state(employees=[employee('a', minimum_month=120, minimum_week=14), employee('b', minimum_month=120, minimum_week=14)])
+    def test_positive_weekly_minimums_with_legacy_month_fields_match_js_validator(self):
+        s = state(employees=[employee('a', minimum_month=1000000, minimum_week=14), employee('b', minimum_month=None, minimum_week=14)])
         result = solve(request(s))
         self.assertFeasible(result)
         folder = Path(__file__).resolve().parent
         validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
+        self.assertEqual(len(result['assignments']), 31)
         for eid in ('a', 'b'):
-            total, weekly = actual_month_minutes(s, result['assignments'], eid)
-            self.assertGreaterEqual(total, 120 * 60)
-            self.assertGreaterEqual(weekly['2026-09-28'], 8 * 60)
-            self.assertGreaterEqual(weekly['2026-10-26'], 12 * 60)
+            self.assert_prorated_weekly_hours(s, result['assignments'], eid)
 
     def test_cli_stdout_single_json_and_info(self):
         main = Path(__file__).resolve().parents[1] / 'main.py'

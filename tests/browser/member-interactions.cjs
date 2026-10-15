@@ -48,13 +48,11 @@ async function main() {
     if (compact) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
   async function importDocument(document) {
-    await page.locator('input[type=file]').setInputFiles({ name: 'member-fixture.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.locator('input.sp-hidden[type=file]:not([aria-label])').setInputFiles({ name: 'member-fixture.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     return persisted(s => s.teamName === document.teamName && JSON.stringify(s.employees.map(e => e.unavailableDates)) === JSON.stringify(document.employees.map(e => e.unavailableDates)))
   }
-  const card = name => page.locator('.sp-settings-employee-card').filter({ has: page.getByRole('heading', { name, exact: true }) })
-  const follow = name => page.getByLabel(`${name}月最低工时跟随月参考值`, { exact: true })
-  const monthHours = name => page.getByLabel(`${name}每月最低工时`, { exact: true })
+  const card = name => page.locator('.sp-settings-employee-card').filter({ has: page.getByRole('button', { name: `编辑${name}`, exact: true }) })
   const minWeek = name => page.getByLabel(`${name}每周最低工时`, { exact: true })
   const maxWeek = name => page.getByLabel(`${name}每周最高工时`, { exact: true })
   const chip = (name, shift) => page.getByRole('button', { name: `${name}可上${shift}`, exact: true })
@@ -75,14 +73,13 @@ async function main() {
     await importDocument(original)
     await navigate('成员管理')
     for (const name of ['陈小满', '李青']) {
-      assert.equal(await monthHours(name).isVisible(), true)
-      assert.equal(await monthHours(name).isDisabled(), true)
-      assert.equal(await monthHours(name).inputValue(), '144')
       assert.equal(await minWeek(name).inputValue(), '0')
       assert.equal(await maxWeek(name).inputValue(), '40')
     }
     assert.equal(await profile().count(), 0)
-    record('hours-are-visible-on-member-cards-without-opening-editor')
+    assert.equal(await page.getByLabel(/每月最低工时|月最低工时跟随|手动月参考工时/).count(), 0)
+    assert.ok((await state()).employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+    record('weekly-hours-are-visible-without-editor-and-retired-month-fields-are-absent')
     await minWeek('陈小满').fill('24')
     await minWeek('李青').fill('20')
     await persisted(s => s.employees[0].minHoursPerWeek === 24 && s.employees[1].minHoursPerWeek === 20)
@@ -98,19 +95,13 @@ async function main() {
     await persisted(s => s.employees[0].minHoursPerWeek === 24 && s.employees[1].minHoursPerWeek === 22)
     assert.equal(await page.getByRole('button', { name: /保存.+设置|取消.+设置修改/ }).count(), 0)
     record('valid-member-edits-autosave-independently-and-invalid-weekly-pairs-do-not-write')
-    await follow('陈小满').uncheck()
-    await monthHours('陈小满').fill('120')
-    await minWeek('陈小满').fill('24')
     await maxWeek('陈小满').fill('48')
-    await persisted(s => s.employees[0].minHoursPerMonth === 120 && s.employees[0].maxHoursPerWeek === 48)
-    await page.getByLabel('手动月参考工时', { exact: true }).fill('160')
-    await persisted(s => s.monthlyReferenceHours?.['2026-10'] === 160)
-    assert.equal(await monthHours('陈小满').inputValue(), '120')
-    assert.equal(await monthHours('李青').inputValue(), '160')
-    await follow('陈小满').check()
-    await persisted(s => s.employees[0].minHoursPerMonth === null)
-    assert.equal(await monthHours('陈小满').inputValue(), '160')
-    record('inline-month-follow-and-custom-minimum-track-reference-correctly')
+    await minWeek('陈小满').fill('0')
+    await persisted(s => s.employees[0].minHoursPerWeek === 0 && s.employees[0].maxHoursPerWeek === 48)
+    assert.equal(await minWeek('李青').inputValue(), '22')
+    await minWeek('陈小满').fill('24')
+    await persisted(s => s.employees[0].minHoursPerWeek === 24 && s.employees[0].maxHoursPerWeek === 48)
+    record('weekly-zero-and-independent-personal-ranges-auto-save-without-monthly-inputs')
     await widthCheck('desktop-member-cards-no-overflow')
     await closeNotice()
     await page.screenshot({ path: path.join(output, '01-member-cards-desktop.png') })
@@ -170,6 +161,10 @@ async function main() {
     for (let i = 0; i < 40; i++) { await page.keyboard.press('Tab'); assert.equal(await dialog().evaluate(e => e.contains(document.activeElement)), true) }
     for (let i = 0; i < 4; i++) { await page.keyboard.press('Shift+Tab'); assert.equal(await dialog().evaluate(e => e.contains(document.activeElement)), true) }
     await leaveDay('2026-10-15').focus()
+    // Source badges visited by Tab close their tooltip on blur. Escape first
+    // dismisses an open tooltip, so let that transient layer finish closing
+    // before testing the leave dialog's own Escape behavior.
+    await page.getByRole('tooltip').waitFor({ state: 'hidden' })
     await page.keyboard.press('Space')
     assert.equal(await leaveDay('2026-10-15').getAttribute('aria-pressed'), 'true')
     await page.keyboard.press('Escape')
@@ -213,6 +208,8 @@ async function main() {
     assert.equal(await profile().evaluate(e => e.contains(document.activeElement)), true)
     await profile().getByLabel('岗位', { exact: true }).fill('未保存岗位')
     for (let i = 0; i < 16; i++) { await page.keyboard.press('Tab'); assert.equal(await profile().evaluate(e => e.contains(document.activeElement)), true) }
+    await profile().getByLabel('岗位', { exact: true }).focus()
+    await page.getByRole('tooltip').waitFor({ state: 'hidden' })
     await page.keyboard.press('Escape')
     assert.equal(await profile().count(), 0)
     assert.equal((await state()).employees[0].role, '值班员')

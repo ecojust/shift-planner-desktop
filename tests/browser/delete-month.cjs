@@ -161,7 +161,7 @@ async function main() {
     assert.equal(await page.locator('[data-employee-allowance="qa-a"]').getAttribute('data-allowance'), '0')
     assert.match(await page.locator('.sp-schedule-table tbody tr').filter({ hasText: '陈小满' }).locator('.sp-hours-col strong').innerText(), /^6\s*h$/)
     record('confirmation-removes-every-selected-month-start-including-hidden-members-locked-and-off-records', { deletedCount: 6, retainedCount: deleted.assignments.length })
-    record('other-month-night-starts-and-all-members-leave-rules-calendar-reference-payroll-remain-intact', { retainedCarryInHours: 6, selectedMonthAllowance: 0 })
+    record('other-month-night-starts-and-all-members-leave-rules-calendar-payroll-remain-intact', { retainedCarryInHours: 6, selectedMonthAllowance: 0 })
 
     await undo().click(); await equals(baseline)
     assert.equal(await source(), originalSource)

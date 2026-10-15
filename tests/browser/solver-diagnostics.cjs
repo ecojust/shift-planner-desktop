@@ -28,8 +28,8 @@ const python = process.env.SHIFT_FLOW_PYTHON || path.join(repo, 'solver/.venv', 
 const report = { url, startedAt: new Date().toISOString(), checks: [], failures: [], errors: [], screenshots: [] };
 const names = ['陈晨','林晚晴','周予安','许知夏','江远','沈一诺','陆星遥','顾南风','宋宁','唐悦','苏念','程屿'];
 const fixture = {
-  version: 1, teamName: '我的排班', month: '2026-10', monthlyReferenceHours: { '2026-10': 144 },
-  employees: names.map((name,i) => ({ id:`employee-${i+1}`,name,role:'服务专员',group:'测试组',color:'#d7e8f8',minHoursPerMonth:null,minHoursPerWeek:40,maxHoursPerWeek:56,eligibleShiftIds:['morning','evening','night'],unavailableDates:[] })),
+  version: 1, teamName: '我的排班', month: '2026-10',
+  employees: names.map((name,i) => ({ id:`employee-${i+1}`,name,role:'服务专员',group:'测试组',color:'#d7e8f8',minHoursPerWeek:24,maxHoursPerWeek:56,eligibleShiftIds:['morning','evening','night'],unavailableDates:[] })),
   shifts: [
     {id:'morning',name:'早班',shortName:'早',start:'08:00',end:'16:00',color:'#dbeee6',required:1,staffingMode:'fixed',normalAllowance:0},
     {id:'evening',name:'晚班',shortName:'晚',start:'14:00',end:'22:00',color:'#e5def7',required:1,staffingMode:'fixed',normalAllowance:0},
@@ -89,7 +89,7 @@ async function fillState(page,desktop=false,state=fixture) {
       const data=JSON.parse(await fs.readFile(path.join(out,'browser-current.json'),'utf8'));
       assert.equal(data.protocolVersion,1);assert.equal(data.state.employees.length,12);assert.equal(data.state.shifts.length,3);
       assert.deepEqual(data.state.rules,fixture.rules);assert.deepEqual(data.state.assignments,fixture.assignments);
-      assert.ok(data.state.employees.every(e=>e.minHoursPerMonth===144));assert.equal(data.debug.source,'current');assert.equal(data.debug.runtime,'browser');
+      assert.ok(data.state.employees.every(e=>e.minHoursPerWeek===24&&!Object.hasOwn(e,'minHoursPerMonth')));assert.equal(Object.hasOwn(data.state,'monthlyReferenceHours'),false);assert.equal(data.debug.source,'current');assert.equal(data.debug.runtime,'browser');
       assert.equal(data.options.timeLimitSeconds,15);assert.equal(data.options.allowPartial,false);assert.equal(Number.isInteger(data.options.seed),true);
       report.browserFileName=d.suggestedFilename();report.browserJSONKeys=Object.keys(data);
     });
@@ -116,7 +116,7 @@ async function fillState(page,desktop=false,state=fixture) {
       const text=await desktop.locator('.sp-solve-result').innerText();report.failureText=text;
       await plainInterface(desktop);
       assert.equal(lastRequest.options.allowPartial,false,'actual generation must require complete staffing');
-      assert.equal(lastResult.status,'INFEASIBLE');assert.match(text,/1728/);assert.match(text,/原排班未改变/);assert.ok(await desktop.locator('.sp-conflict-list button').count()>0);
+      assert.equal(lastResult.status,'INFEASIBLE');assert.ok(lastResult.issues.some(issue=>issue.type==='weekly-fixed-capacity'));assert.match(text,/自然周|本周/);assert.match(text,/固定.*人数|固定.*容量/);assert.match(text,/原排班未改变/);assert.ok(await desktop.locator('.sp-conflict-list button').count()>0);
       assert.doesNotMatch(text,/请检查月\/周最低工时、周最高工时、锁定安排/);assert.ok(text.includes('建议：'));
     });
     await check('failed solve leaves assignments unchanged',async()=>{await desktop.waitForTimeout(500);const state=await desktop.evaluate(()=>JSON.parse(localStorage.getItem('shift-planner:v1')));assert.deepEqual(state.assignments,fixture.assignments);});
@@ -148,7 +148,7 @@ async function fillState(page,desktop=false,state=fixture) {
     // A second real solver request exercises member-specific and date-specific
     // guidance, including a previously active member search hiding the target.
     const actionState=JSON.parse(JSON.stringify(fixture));
-    actionState.employees.forEach(e=>{e.minHoursPerMonth=0;e.minHoursPerWeek=0;});
+    actionState.employees.forEach(e=>{e.minHoursPerWeek=0;});
     actionState.employees[0].eligibleShiftIds=['morning'];
     actionState.shifts.forEach(s=>s.staffingMode='minimum');
     actionState.assignments=[

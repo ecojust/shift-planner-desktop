@@ -25,7 +25,6 @@ export function openingWeekNotice(state: Pick<PlannerState, 'month' | 'employees
 }
 
 const guidance: Record<string, { target: NonNullable<Issue['target']>; suggestion: string }> = {
-  'monthly-min-hours': { target: 'team', suggestion: '查看该成员的月最低工时、可上班次和请假日期；如需保留最低工时，请增加实际可安排的班位。' },
   'weekly-min-hours': { target: 'team', suggestion: '核对该自然周的跨月排班、请假和可上班次。已计入上月排班的月初周须补足整周最低工时；无上月记录及月末部分周仍按本月天数折算，并考虑已知月外工时。' },
   'weekly-hours': { target: 'team', suggestion: '查看成员的周最高工时及该自然周的跨月安排，调整超出的班次。' },
   qualification: { target: 'team', suggestion: '在成员的“可上班次”中核对资格，或调整对应的锁定安排。' },

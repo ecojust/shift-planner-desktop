@@ -264,24 +264,25 @@ test('valid results survive a host exit-cleanup timeout while retaining raw diag
   assert.deepEqual(response.hostDiagnostics, { exitTimedOut: true, phase: 'finishing', code: 'EXIT_TIMEOUT' })
 })
 
-test('native claimed success cannot bypass monthly or prorated weekly minimums, even with shortage allowed', () => {
-  for (const field of ['minHoursPerMonth', 'minHoursPerWeek']) {
-    const request = fixture(true)
-    request.state.employees[0][field] = 8
-    const checked = checkDesktopResult(request, result(request))
-    assert.equal(checked.success, false)
-    assert.equal(checked.assignments, undefined)
-    assert.ok(checked.issues.some(issue => issue.type === (field === 'minHoursPerMonth' ? 'monthly-min-hours' : 'weekly-min-hours')))
-  }
+test('native claimed success cannot bypass prorated weekly minimums, even with shortage allowed', () => {
+  const request = fixture(true)
+  request.state.employees[0].minHoursPerWeek = 8
+  const checked = checkDesktopResult(request, result(request))
+  assert.equal(checked.success, false)
+  assert.equal(checked.assignments, undefined)
+  assert.ok(checked.issues.some(issue => issue.type === 'weekly-min-hours'))
 })
 
-test('unresolved reference-based minimum is independently enforced against forged native output', () => {
-  const request = fixture(true)
-  request.state.employees[0].minHoursPerMonth = null
-  request.state.monthlyReferenceHours = { '2026-10': 16 }
-  const checked = checkDesktopResult(request, result(request, { assignments: [{ employeeId: 'e1', date: '2026-10-01', shiftId: 'day', locked: false }] }))
-  assert.equal(checked.success, false)
-  assert.match(checked.message, /月最低工时 16/)
+test('native result validation ignores retired monthly minimums and references', () => {
+  for (const minimum of [null, 744, 9999]) {
+    const request = fixture(true)
+    request.state.employees[0].minHoursPerMonth = minimum
+    request.state.employees[0].minHoursPerWeek = 0
+    request.state.monthlyReferenceHours = { '2026-10': 744 }
+    const checked = checkDesktopResult(request, result(request, { assignments: [{ employeeId: 'e1', date: '2026-10-01', shiftId: 'day', locked: false }] }))
+    assert.equal(checked.success, true)
+    assert.ok(!checked.issues.some(issue => issue.type === 'monthly-min-hours'))
+  }
 })
 
 test('native weekday quotas are independently checked even when partial staffing is allowed', () => {

@@ -55,14 +55,14 @@ async function main() {
     if (mobile) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
   async function importDocument(document) {
-    await page.locator('input[type=file]').setInputFiles({ name: 'staffing-modes.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.locator('input[type=file]:not([aria-label="导入规则文件"])').setInputFiles({ name: 'staffing-modes.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     return persisted(value => value.teamName === document.teamName && JSON.stringify(modes(value)) === JSON.stringify(modes(document)) && JSON.stringify(value.assignments) === JSON.stringify(document.assignments))
   }
   const editor = () => page.getByRole('dialog', { name: /^(编辑|新建)班次$/ })
   const radio = mode => page.getByRole('radio', { name: mode === 'fixed' ? '人数模式：每日固定人数' : '人数模式：每日最少人数', exact: true })
   const amount = mode => page.getByLabel(mode === 'fixed' ? '每日固定人数' : '每日最少人数', { exact: true })
-  const card = name => page.locator('.sp-settings-shift-card').filter({ has: page.getByRole('heading', { name, exact: true }) })
+  const card = name => page.locator('.sp-settings-shift-card').filter({ has: page.getByRole('button', { name: `编辑${name}`, exact: true }) })
   async function editShift(name, mode, value) {
     await card(name).getByRole('button', { name: `编辑${name}`, exact: true }).click()
     await radio(mode).check()
@@ -196,7 +196,7 @@ async function main() {
 
     const exact = fixture()
     exact.teamName = '固定人数精确覆盖'
-    exact.employees = exact.employees.slice(0, 6).map(employee => ({ ...employee, minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 168 }))
+    exact.employees = exact.employees.slice(0, 6).map(employee => ({ ...employee, minHoursPerWeek: 0, maxHoursPerWeek: 168 }))
     exact.rules = { minRestHours: 0, maxConsecutiveDays: 31 }
     exact.shifts = exact.shifts.map((shift, index) => ({ ...shift, staffingMode: 'fixed', required: [1, 2, 0][index] }))
     await importDocument(exact)
@@ -208,7 +208,7 @@ async function main() {
 
     const zero = fixture()
     zero.teamName = '固定零与最少零的差异'
-    zero.employees = zero.employees.slice(0, 2).map(employee => ({ ...employee, minHoursPerMonth: 144, minHoursPerWeek: 0, maxHoursPerWeek: 168 }))
+    zero.employees = zero.employees.slice(0, 2).map(employee => ({ ...employee, minHoursPerWeek: 40, maxHoursPerWeek: 168 }))
     zero.rules = { minRestHours: 0, maxConsecutiveDays: 31 }
     zero.shifts = zero.shifts.map((shift, index) => ({ ...shift, staffingMode: index === 2 ? 'minimum' : 'fixed', required: index === 0 ? 1 : 0 }))
     await importDocument(zero)

@@ -26,7 +26,7 @@ const original = [
 ];
 const fixture = {
   version: 1, teamName: '班次排序验收', month: '2026-10',
-  employees: [{ id: 'qa', name: '验收成员', role: '员工', group: '测试组', color: '#d7e8f8', minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 168, eligibleShiftIds: original.map(item => item.id), unavailableDates: [] }],
+  employees: [{ id: 'qa', name: '验收成员', role: '员工', group: '测试组', color: '#d7e8f8', minHoursPerWeek: 0, maxHoursPerWeek: 168, eligibleShiftIds: original.map(item => item.id), unavailableDates: [] }],
   shifts: original, rules: { minRestHours: 0, maxConsecutiveDays: 31 }, assignments: [],
 };
 const originalIds = original.map(item => item.id);
@@ -220,12 +220,12 @@ async function closedWithFocus(modal, trigger) {
       record(`${width}px modal body scrolls independently with fixed header, reachable footer and keyboard focus containment`);
     }
 
-    // With no coverage floor, the eight-hour minimum can only be met by the
+    // With no coverage floor, the eight-hour weekly minimum can only be met by the
     // minimum-zero shift. Fixed-zero must remain unused even when eligible.
     const zeroState = structuredClone(fixture);
     zeroState.shifts = [shift('zero-fixed', '零人固定', '08:00', '16:00', 0, 'fixed'), shift('zero-minimum', '零人最少', '08:00', '16:00', 0, 'minimum')];
     zeroState.employees[0].eligibleShiftIds = ['zero-fixed', 'zero-minimum'];
-    zeroState.employees[0].minHoursPerMonth = 8;
+    zeroState.employees[0].minHoursPerWeek = 8;
     const zeroPage = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     await open(zeroPage, zeroState);
     await zeroPage.getByRole('button', { name: '自动排班', exact: true }).click();

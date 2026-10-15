@@ -15,7 +15,7 @@ const clone = value => JSON.parse(JSON.stringify(value))
 const stamp = { source: 'manual', at: '2026-10-15T08:00:00.000Z' }
 const fixture = {
   version: 1, teamName: '外部真实排班验收', month: '2026-10', calendar: {},
-  employees: ['甲', '乙'].map((name, i) => ({ id: `generation-${i + 1}`, name: `外部成员${name}`, role: '值班员', group: '测试', color: '#d7e8f8', minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: [] })),
+  employees: ['甲', '乙'].map((name, i) => ({ id: `generation-${i + 1}`, name: `外部成员${name}`, role: '值班员', group: '测试', color: '#d7e8f8', minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: [] })),
   shifts: [{ id: 'day', name: '日班', shortName: '日', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, staffingMode: 'fixed', normalAllowance: 0 }],
   rules: { minRestHours: 11, maxConsecutiveDays: 5 },
   payroll: { monthlySalary: 6000, monthlyWorkdays: 21.75, hoursPerDay: 8, ordinaryMultiplier: 1.5, restdayMultiplier: 2, statutoryMultiplier: 3, restdayCompensated: false, dateShiftMultipliers: {}, employeeSalaries: {} },

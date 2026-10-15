@@ -29,7 +29,7 @@ def unique_request(locked=False, partial=False):
     """All 31 days must be worked, with either fixed cells or real x variables."""
     fixed = [assignment('only', f'2026-10-{day:02}') for day in range(1, 32)] if locked else []
     data = request(state(
-        employees=[employee('only', cap=168, minimum_month=0 if locked else 248)],
+        employees=[employee('only', cap=168, minimum_week=56)],
         shifts=[shift(mode='fixed')], assignments=fixed,
     ))
     data['state']['rules'].update(minRestHours=0, maxConsecutiveDays=31)

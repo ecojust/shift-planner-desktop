@@ -105,10 +105,10 @@ test('an unlocked outgoing night cannot lower its own boundary target; locked ou
   assert.equal(minimumAt(state, '2026-11-30'), undefined, 'The locked 22-hour December tail already covers the full minimum')
 })
 
-test('boundary credits never relax monthly minimums or full-week maximums', () => {
+test('boundary credits preserve full-week maximums while retired monthly minimums are ignored', () => {
   const state = employee(fixture({ assignments: history(previousDates) }), { minHoursPerMonth: 8 })
   assert.equal(minimumAt(state), undefined)
-  assert.ok(validateSchedule(state).some(issue => issue.type === 'monthly-min-hours'))
+  assert.ok(!validateSchedule(state).some(issue => issue.type === 'monthly-min-hours'))
   state.assignments.push(assignment('2026-11-01'))
   assert.ok(validateSchedule(state).some(issue => issue.type === 'weekly-hours'))
 })

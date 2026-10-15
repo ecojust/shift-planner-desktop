@@ -150,8 +150,6 @@ test('configuration and assignment changes in the same replacement stay invalida
       next => { next.employees[0].name = '新的成员名' },
       next => { next.shifts[0].normalAllowance = 25 },
       next => { next.rules.minRestHours = 1 },
-      next => { next.calendar = { '2026-10-01': 'workday' } },
-      next => { next.monthlyReferenceHours = { '2026-10': 168 } },
     ]) {
       const app = setup(staleSchedule(), source)
       const result = replace(app, next => { next.assignments = fullMonth('2026-10'); editConfiguration(next) })
@@ -175,6 +173,23 @@ test('single assignment writes never acknowledge a month even when they finish i
     assert.equal(app.saves(), 1)
     const rescheduled = replace(app, next => { next.assignments.at(-1).locked = true })
     assert.equal(rescheduled.state.provenance.invalidatedSchedules?.['2026-10'], undefined)
+  }
+})
+
+test('external date annotations record their source without invalidating or acknowledging existing schedules', () => {
+  for (const source of ['mcp', 'http']) {
+    for (const invalidated of [false, true]) {
+      const initial = staleSchedule(['2026-10'], true)
+      if (!invalidated) delete initial.provenance.invalidatedSchedules
+      const assignments = structuredClone(initial.assignments)
+      const previousInvalidation = structuredClone(initial.provenance.invalidatedSchedules)
+      const app = setup(initial, source)
+      const result = replace(app, next => { next.calendar = { '2026-10-01': 'restday' } })
+      assert.deepEqual(structuredClone(result.state.provenance.invalidatedSchedules), previousInvalidation)
+      assert.equal(result.state.provenance.fields['calendar.2026-10-01'].source, source)
+      assert.deepEqual(result.state.assignments, assignments)
+      assert.equal(app.saves(), 1)
+    }
   }
 })
 

@@ -171,13 +171,13 @@ async function assertRestored(page, original, prior, confirmationStarted) {
   assert.equal(actual.teamName, fixture.teamName)
   assert.equal(actual.month, fixture.month)
   assert.equal(actual.employees[0].role, fixture.employees[0].role)
-  assert.equal(actual.employees[0].minHoursPerMonth, null)
+  assert.equal(Object.hasOwn(actual.employees[0], 'minHoursPerMonth'), false)
   assert.equal(actual.employees[0].minHoursPerWeek, 0)
   assert.equal(actual.employees[0].avatar, prior.employees[0].avatar)
   assert.equal(actual.shifts[0].name, fixture.shifts[0].name)
   assert.equal(actual.rules.minRestHours, fixture.rules.minRestHours)
   assert.deepEqual(actual.assignments, fixture.assignments)
-  assert.deepEqual(actual.monthlyReferenceHours, fixture.monthlyReferenceHours)
+  assert.equal(Object.hasOwn(actual, 'monthlyReferenceHours'), false)
   for (const field of ['employees.import-1.role', 'shifts.day.name', 'rules.minRestHours']) {
     assert.equal(actual.provenance.fields[field].source, 'manual', field)
     assert.ok(Date.parse(actual.provenance.fields[field].at) >= confirmationStarted, `${field} needs a new saved timestamp`)
@@ -191,7 +191,7 @@ async function assertRestored(page, original, prior, confirmationStarted) {
   await assertScheduleStatus(page, 'invalid')
   assert.deepEqual(actual.provenance.scheduleUpdates, prior.provenance.scheduleUpdates)
   assert.equal(await page.locator('.sp-schedule-update time').getAttribute('datetime'), currentAt)
-  assert.equal(original.data.debug.originalHourDefaults[0].minHoursPerMonth, null)
+  assert.equal(Object.hasOwn(original.data.debug.originalHourDefaults[0], 'minHoursPerMonth'), false)
   return actual
 }
 async function main() {
@@ -207,8 +207,9 @@ async function main() {
     assert.equal(exported.data.state.shifts.length, 2)
     assert.equal(exported.data.state.assignments.length, 3)
     assert.equal(exported.data.state.employees[0].avatar, undefined)
-    assert.equal(typeof exported.data.state.employees[0].minHoursPerMonth, 'number')
-    assert.equal(exported.data.debug.originalHourDefaults[0].minHoursPerMonth, null)
+    assert.ok(exported.data.state.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+    assert.equal(Object.hasOwn(exported.data.state, 'monthlyReferenceHours'), false)
+    assert.equal(Object.hasOwn(exported.data.debug.originalHourDefaults[0], 'minHoursPerMonth'), false)
     assert.equal(exported.data.debug.originalHourDefaults[0].minHoursPerWeek, 0)
     record('browser downloads the actual exported rules protocol with defaults and complete historical assignments')
 

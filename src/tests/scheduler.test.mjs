@@ -21,23 +21,15 @@ test('calendar and overnight durations are deterministic civil dates', () => {
   assert.equal(shiftHours({ ...night, start: '25:00' }), 0)
 })
 
-test('default demo retains its illustrative roster and regeneration adds people to meet reference minimums', () => {
+test('default demo has only weekly limits and regenerates its valid daily coverage', () => {
   const value = makeDefaultState('2026-10')
   assert.equal(value.employees.length, 12)
   assert.equal(value.assignments.length, 31 * 5)
-  assert.ok(value.employees.every(employee => employee.minHoursPerMonth === null))
-  const initialIssues = validateSchedule(value)
-  assert.ok(initialIssues.some(issue => issue.type === 'monthly-min-hours'))
-  assert.ok(initialIssues.every(issue => issue.type === 'monthly-min-hours'))
-  const expanded = generateSchedule(value, 41)
-  assert.equal(expanded.success, true)
-  assert.ok(expanded.assignments.length > value.assignments.length)
-  assert.deepEqual(validateSchedule({ ...value, assignments: expanded.assignments }), [])
-  // The unchanged demonstration is feasible under its original, zero-minimum rules.
-  value.employees.forEach(employee => { employee.minHoursPerMonth = 0 })
+  assert.ok(value.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth') && employee.minHoursPerWeek === 0))
   assert.deepEqual(validateSchedule(value), [])
   const generated = generateSchedule(value, 41)
   assert.equal(generated.success, true)
+  assert.equal(generated.assignments.length, value.assignments.length)
   assert.deepEqual(generated, generateSchedule(value, 41))
   assert.deepEqual(generated.issues, [])
   for (const item of generated.assignments) {
@@ -213,27 +205,30 @@ test('impossible separated staffing leaves shortages without permitting incompat
   assert.equal(result.assignments.length, 31)
 })
 
-const minimumIssues = value => validateSchedule(value).filter(issue => ['monthly-min-hours', 'weekly-min-hours'].includes(issue.type))
+const minimumIssues = value => validateSchedule(value).filter(issue => issue.type === 'weekly-min-hours')
 
-test('monthly minimum counts actual in-month hours, including carried nights and excluding outgoing hours', () => {
-  const value = state({ employees: [employee('a', { minHoursPerMonth: 8 })], assignments: [assignment('2026-09-30', 'night'), assignment('2026-10-31', 'night')] })
-  assert.deepEqual(minimumIssues(value), []) // 6 hours carried in + 2 before November.
-  value.employees[0].minHoursPerMonth = 8.001
-  const issue = minimumIssues(value)[0]
-  assert.equal(issue.type, 'monthly-min-hours')
-  assert.match(issue.message, /实际工时 8 小时/)
-  assert.match(issue.message, /8\.02 小时/)
-  assert.equal(issue.employeeId, 'a')
-  assert.equal(issue.date, '2026-10-01')
+test('retired monthly minimums never validate or add work when weekly minimums are disabled', () => {
+  for (const minimum of [null, 0, 744, 9999, -1, NaN, Infinity]) {
+    const value = state({ monthlyReferenceHours: { '2026-10': 744 }, employees: [employee('a', { minHoursPerMonth: minimum, minHoursPerWeek: 0 })], shifts: [{ ...morning, required: 0 }, night] })
+    assert.deepEqual(validateSchedule(value), [])
+    const result = generateSchedule(value, 42)
+    assert.equal(result.success, true)
+    assert.deepEqual(result.assignments, [])
+    assert.deepEqual(result.issues, [])
+  }
 })
 
-test('null monthly minimum follows the selected month reference; missing legacy values and explicit zero stay disabled', () => {
-  const value = state({ monthlyReferenceHours: { '2026-10': 16, '2026-11': 24 }, employees: [employee('a', { minHoursPerMonth: null })], assignments: [assignment('2026-10-01')] })
-  assert.match(minimumIssues(value)[0].message, /月最低工时 16 小时/)
-  value.employees[0].minHoursPerMonth = 0
-  assert.deepEqual(minimumIssues(value), [])
-  delete value.employees[0].minHoursPerMonth
-  assert.deepEqual(minimumIssues(value), [])
+test('legacy monthly values do not change weekly minimums, candidate scoring, or weighted targets', () => {
+  for (const rules of [{ minRestHours: 11, maxConsecutiveDays: 5 }, { minRestHours: 11, maxConsecutiveDays: 5, weekdayWeights: { days: [6, 7], percent: 40 } }]) {
+    const baseline = state({ employees: ['a', 'b', 'c', 'd'].map(id => employee(id, { minHoursPerWeek: 24 })), rules })
+    const old = structuredClone(baseline)
+    old.monthlyReferenceHours = { '2026-10': 744 }
+    old.employees.forEach((employee, index) => { employee.minHoursPerMonth = index % 2 ? null : 744 })
+    assert.deepEqual(validateSchedule(old), validateSchedule(baseline))
+    const generated = generateSchedule(baseline, 42)
+    assert.equal(generated.success, true)
+    assert.deepEqual(generateSchedule(old, 42), generated)
+  }
 })
 
 test('every Monday-Sunday week intersecting the month is checked, including empty and partial weeks', () => {
@@ -279,7 +274,7 @@ test('Sunday night contributes only its actual hours to each weekly minimum', ()
 })
 
 test('minimum configuration rejects negatives, nonfinite values, excessive bounds and weekly minimum above maximum', () => {
-  for (const extra of [{ minHoursPerMonth: -1 }, { minHoursPerMonth: NaN }, { minHoursPerMonth: 745 }, { minHoursPerWeek: -1 }, { minHoursPerWeek: Infinity }, { minHoursPerWeek: 169 }, { minHoursPerWeek: 41 }, { minHoursPerWeek: null }]) {
+  for (const extra of [{ minHoursPerWeek: -1 }, { minHoursPerWeek: Infinity }, { minHoursPerWeek: 169 }, { minHoursPerWeek: 41 }, { minHoursPerWeek: null }]) {
     const value = state({ employees: [employee('a', extra)], assignments: [assignment('2026-10-01')] })
     assert.ok(types(value).includes('configuration'), JSON.stringify(extra))
     const generated = generateSchedule(value)
@@ -289,7 +284,7 @@ test('minimum configuration rejects negatives, nonfinite values, excessive bound
 })
 
 test('heuristic gives minimum deficits priority while keeping weekly caps and staff coverage', () => {
-  const value = state({ employees: [employee('a', { minHoursPerMonth: 160, minHoursPerWeek: 24 }), employee('b', { minHoursPerMonth: 40 })] })
+  const value = state({ employees: [employee('a', { minHoursPerWeek: 24 }), employee('b')] })
   const original = JSON.stringify(value)
   const generated = generateSchedule(value, 42)
   assert.equal(generated.success, true)
@@ -299,21 +294,19 @@ test('heuristic gives minimum deficits priority while keeping weekly caps and st
   assert.deepEqual(generated, generateSchedule(value, 42))
 })
 
-test('unmet monthly or weekly minimum retains the original when no eligible extra work is possible', () => {
-  for (const minimum of [{ minHoursPerMonth: 32 }, { minHoursPerWeek: 40 }]) {
-    const original = [assignment('2026-10-02', 'off', true), assignment('2026-09-30', 'night')]
-    const value = state({ employees: [employee('a', { ...minimum, eligibleShiftIds: [] })], shifts: [{ ...morning, required: 0 }, night], assignments: original })
-    const result = generateSchedule(value)
-    assert.equal(result.success, false)
-    assert.deepEqual(result.assignments, original)
-    assert.notEqual(result.assignments, original)
-    assert.ok(result.issues.some(issue => ['monthly-min-hours', 'weekly-min-hours'].includes(issue.type)))
-    assert.ok(!result.issues.some(issue => issue.type === 'overstaffed'))
-  }
+test('unmet weekly minimum retains the original when no eligible extra work is possible', () => {
+  const original = [assignment('2026-10-02', 'off', true), assignment('2026-09-30', 'night')]
+  const value = state({ employees: [employee('a', { minHoursPerWeek: 40, eligibleShiftIds: [] })], shifts: [{ ...morning, required: 0 }, night], assignments: original })
+  const result = generateSchedule(value)
+  assert.equal(result.success, false)
+  assert.deepEqual(result.assignments, original)
+  assert.notEqual(result.assignments, original)
+  assert.ok(result.issues.some(issue => issue.type === 'weekly-min-hours'))
+  assert.ok(!result.issues.some(issue => issue.type === 'overstaffed'))
 })
 
-test('generation includes carried night hours when satisfying a monthly minimum without new work', () => {
-  const value = state({ employees: [employee('a', { minHoursPerMonth: 6 })], shifts: [{ ...morning, required: 0 }, night], assignments: [assignment('2026-09-30', 'night')] })
+test('retired monthly minimums never add work and carried night assignments remain intact', () => {
+  const value = state({ employees: [employee('a', { minHoursPerMonth: 744 })], shifts: [{ ...morning, required: 0 }, night], assignments: [assignment('2026-09-30', 'night')] })
   const result = generateSchedule(value)
   assert.equal(result.success, true)
   assert.deepEqual(result.assignments, value.assignments)
@@ -321,23 +314,22 @@ test('generation includes carried night hours when satisfying a monthly minimum 
 })
 
 test('minimum rounding agrees with decimal solver arithmetic for tiny positive numbers and exact decimal minutes', () => {
-  const tiny = state({ employees: [employee('a', { minHoursPerMonth: 1e-12, minHoursPerWeek: 1e-12 })] })
+  const tiny = state({ employees: [employee('a', { minHoursPerWeek: 1e-12 })] })
   const issues = minimumIssues(tiny)
-  assert.equal(issues.length, 6) // One minute still required for month and each of five weeks.
+  assert.equal(issues.length, 5) // One minute remains required for each of five weeks.
   assert.ok(issues.every(issue => /0\.02 小时/.test(issue.message)))
-  const decimal = state({ employees: [employee('a', { minHoursPerMonth: 2.05, maxHoursPerWeek: 2.05 })], shifts: [{ ...morning, end: '10:03' }], assignments: [assignment('2026-10-01')] })
+  const decimal = state({ employees: [employee('a', { minHoursPerWeek: 2.05, maxHoursPerWeek: 2.05 })], shifts: [{ ...morning, end: '10:03' }], assignments: ['2026-10-01', '2026-10-05', '2026-10-12', '2026-10-19', '2026-10-26'].map(date => assignment(date)) })
   assert.deepEqual(minimumIssues(decimal), [])
   assert.ok(!types(decimal).includes('weekly-hours')) // 2.05 hours means exactly 123 minutes.
 })
 
-test('duplicate or overlapping manual assignments cannot inflate actual monthly or weekly minimum hours', () => {
-  const value = state({ employees: [employee('a', { minHoursPerMonth: 16, minHoursPerWeek: 28 })], assignments: [assignment('2026-10-01'), assignment('2026-10-01')] })
+test('duplicate or overlapping manual assignments cannot inflate actual weekly minimum hours', () => {
+  const value = state({ employees: [employee('a', { minHoursPerWeek: 28 })], assignments: [assignment('2026-10-01'), assignment('2026-10-01')] })
   const issues = minimumIssues(value)
-  assert.match(issues.find(issue => issue.type === 'monthly-min-hours').message, /实际工时 8 小时/)
   assert.match(issues.find(issue => issue.type === 'weekly-min-hours' && issue.date === '2026-10-01').message, /实际工时 8 小时/)
 })
 
-test('an invalid month with a reference-linked minimum reports configuration errors without throwing', () => {
+test('an invalid month with legacy monthly data reports configuration errors without throwing', () => {
   const value = state({ month: '2026-99', employees: [employee('a', { minHoursPerMonth: null })] })
   assert.ok(types(value).includes('configuration'))
   assert.equal(generateSchedule(value).success, false)
@@ -469,10 +461,10 @@ test('a partial week without selected weekdays has zero quota at a 100 percent s
 
 
 test('zero daily minimum permits additional assignments needed for positive employee minimums', () => {
-  const value = state({ employees: [employee('a', { minHoursPerMonth: 32 })], shifts: [{ ...morning, required: 0 }, night] })
+  const value = state({ employees: [employee('a', { minHoursPerWeek: 7 })], shifts: [{ ...morning, required: 0 }, night] })
   const result = generateSchedule(value)
   assert.equal(result.success, true)
-  assert.equal(result.assignments.length, 4)
+  assert.equal(result.assignments.length, 5)
   assert.deepEqual(result.issues, [])
 })
 
@@ -488,7 +480,6 @@ for (const seed of [1010, 42, 12345]) {
     const late = { ...morning, id: 'late', name: '晚班', shortName: '晚', start: '14:00', end: '22:00' }
     const value = state({
       employees: Array.from({ length: 12 }, (_, index) => employee(`member-${index}`, {
-        minHoursPerMonth: 144,
         minHoursPerWeek: 40,
         maxHoursPerWeek: 56,
         eligibleShiftIds: ['morning', 'late', 'night'],
@@ -558,7 +549,7 @@ test('current fixed staffing does not retroactively cap preserved out-of-month h
 })
 
 test('fixed zero prohibits assignments while minimum zero can supply employee hours', () => {
-  const value = state({ employees: [employee('a', { minHoursPerMonth: 32 })], shifts: [{ ...morning, staffingMode: 'fixed', required: 0 }, { ...night, staffingMode: 'minimum', required: 0 }] })
+  const value = state({ employees: [employee('a', { minHoursPerWeek: 7 })], shifts: [{ ...morning, staffingMode: 'fixed', required: 0 }, { ...night, staffingMode: 'minimum', required: 0 }] })
   const generated = generateSchedule(value, 42)
   assert.equal(generated.success, true)
   assert.deepEqual(generated.issues, [])
@@ -571,20 +562,20 @@ test('fixed zero prohibits assignments while minimum zero can supply employee ho
 test('fixed capacity cannot be exceeded to satisfy otherwise impossible employee minimums', () => {
   const original = [assignment('2026-10-01', 'off', true, 'a')]
   const value = state({
-    employees: ['a', 'b', 'c'].map(id => employee(id, { minHoursPerMonth: 160, maxHoursPerWeek: 56, eligibleShiftIds: ['morning'] })),
+    employees: ['a', 'b', 'c'].map(id => employee(id, { minHoursPerWeek: 40, maxHoursPerWeek: 56, eligibleShiftIds: ['morning'] })),
     shifts: [{ ...morning, staffingMode: 'fixed', required: 1 }],
     assignments: original,
   })
   const generated = generateSchedule(value, 42)
   assert.equal(generated.success, false)
   assert.deepEqual(generated.assignments, original)
-  assert.ok(generated.issues.some(issue => issue.type === 'monthly-min-hours'))
+  assert.ok(generated.issues.some(issue => issue.type === 'weekly-min-hours'))
   assert.ok(!generated.issues.some(issue => issue.type === 'overstaffed'), 'heuristic must not exceed fixed counts while trying to fill hours')
 })
 
 test('mixed fixed and minimum staffing adds needed work only to uncapped shifts', () => {
   const value = state({
-    employees: ['a', 'b', 'c', 'd'].map(id => employee(id, { minHoursPerMonth: 160, maxHoursPerWeek: 56 })),
+    employees: ['a', 'b', 'c', 'd'].map(id => employee(id, { minHoursPerWeek: 32, maxHoursPerWeek: 56 })),
     shifts: [{ ...morning, staffingMode: 'fixed', required: 1 }, { ...night, staffingMode: 'minimum', required: 1 }],
   })
   const generated = generateSchedule(value, 1010)

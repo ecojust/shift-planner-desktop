@@ -11,7 +11,7 @@ const url = process.env.INTEGRATIONS_TEST_URL || 'http://127.0.0.1:5190/'
 const out = path.resolve(__dirname, '../../test-results/integrations')
 const fixture = {
   version: 1, teamName: 'MCP 验收', month: '2026-10',
-  employees: ['甲', '乙'].map((name, index) => ({ id: `qa-${index + 1}`, name: `测试成员${name}`, role: '服务员', group: '测试', color: '#d7e8f8', minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: [] })),
+  employees: ['甲', '乙'].map((name, index) => ({ id: `qa-${index + 1}`, name: `测试成员${name}`, role: '服务员', group: '测试', color: '#d7e8f8', minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: [] })),
   shifts: [{ id: 'day', name: '日班', shortName: '日', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, staffingMode: 'fixed', normalAllowance: 0 }],
   rules: { minRestHours: 11, maxConsecutiveDays: 5 },
   assignments: [{ employeeId: 'qa-1', date: '2026-10-01', shiftId: 'day', locked: true }],
@@ -878,33 +878,41 @@ async function main() {
     await screenshot(page, 'pending-external-review')
     record('acknowledging external changes persistently clears the notice without losing sources and a later change restores it')
 
-    const referenceMonth = (await snapshot(page)).state.month
-    const referencePath = `monthlyReferenceHours.${referenceMonth}`
+    const weeklyEmployee = (await snapshot(page)).state.employees.find(employee => employee.id === 'qa-2')
+    const referencePath = 'employees.qa-2'
+    const weeklyPath = 'employees.qa-2.minHoursPerWeek'
     await section(page, '成员管理')
-    const referenceInput = page.getByRole('spinbutton', { name: '手动月参考工时', exact: true })
-    await referenceInput.fill('160')
-    await referenceInput.blur()
-    await page.waitForFunction(month => JSON.parse(localStorage.getItem('shift-planner:v1')).monthlyReferenceHours?.[month] === 160, referenceMonth)
+    assert.equal(await page.getByRole('spinbutton', { name: '手动月参考工时', exact: true }).count(), 0)
+    const weeklyInput = page.getByRole('spinbutton', { name: `${weeklyEmployee.name}每周最低工时`, exact: true })
+    await weeklyInput.fill('8')
+    await weeklyInput.blur()
+    await page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).employees.find(employee => employee.id === 'qa-2').minHoursPerWeek === 8)
     await badge(page, referencePath, 'manual', '手动修改')
-    await page.getByRole('button', { name: '恢复自动', exact: true }).click()
-    const resetDialog = page.getByRole('alertdialog', { name: `恢复 ${referenceMonth} 的自动参考工时？`, exact: true })
-    await resetDialog.getByRole('button', { name: '确认恢复', exact: true }).click()
-    await resetDialog.waitFor({ state: 'detached' })
-    await badge(page, referencePath, 'manual', '手动修改')
-    await page.waitForFunction(month => {
+    await weeklyInput.fill('0')
+    await weeklyInput.blur()
+    await page.waitForFunction(() => {
       const state = JSON.parse(localStorage.getItem('shift-planner:v1'))
-      return !Object.hasOwn(state.monthlyReferenceHours ?? {}, month) && state.provenance.fields[`monthlyReferenceHours.${month}`]?.source === 'manual'
-    }, referenceMonth)
-    const resetStamp = clone((await stored(page)).provenance.fields[referencePath])
+      return state.employees.find(employee => employee.id === 'qa-2').minHoursPerWeek === 0 && state.provenance.fields['employees.qa-2.minHoursPerWeek']?.source === 'manual'
+    })
+    const resetStamp = clone((await stored(page)).provenance.fields[weeklyPath])
     await enableAfterReload(page)
-    assert.equal(Object.hasOwn((await snapshot(page)).state.monthlyReferenceHours ?? {}, referenceMonth), false)
-    assert.deepEqual((await stored(page)).provenance.fields[referencePath], resetStamp)
+    assert.equal((await snapshot(page)).state.employees.find(employee => employee.id === 'qa-2').minHoursPerWeek, 0)
+    assert.deepEqual((await stored(page)).provenance.fields[weeklyPath], resetStamp)
     await section(page, '成员管理')
     await badge(page, referencePath, 'manual', '手动修改')
-    assert.equal(await page.getByRole('button', { name: '恢复自动', exact: true }).isDisabled(), true)
-    await screenshot(page, 'restored-reference-source')
+    assert.equal(await page.getByRole('spinbutton', { name: `${weeklyEmployee.name}每周最低工时`, exact: true }).inputValue(), '0')
+    await screenshot(page, 'restored-weekly-zero-source')
     await section(page, '排班日历')
-    record('restoring automatic reference hours retains the manual source for the omitted override through persistence and reload')
+    record('setting the weekly minimum back to explicit zero retains its manual source through persistence and reload')
+
+    const beforeLegacyOnly = clone(await snapshot(page))
+    const legacyOnly = clone(beforeLegacyOnly)
+    legacyOnly.state.monthlyReferenceHours = { [legacyOnly.state.month]: 744 }
+    legacyOnly.state.employees.forEach(employee => { employee.minHoursPerMonth = 744 })
+    const legacyReply = await request(page, 'replace_state', legacyOnly)
+    assert.deepEqual(legacyReply.response.result, beforeLegacyOnly)
+    assert.deepEqual(await snapshot(page), beforeLegacyOnly)
+    record('legacy monthly minimum and reference fields alone are ignored without changing revision, sources or month invalidity')
 
     const backup = clone((await snapshot(page)).state)
     assert.equal(backup.provenance.fields['employees.qa-1.name'].source, 'manual')
@@ -1069,23 +1077,29 @@ async function main() {
     await dismissSourceTooltip(page, pendingBadge)
     await pendingDialog.getByRole('button', { name: '取消', exact: true }).click()
     await pendingDialog.waitFor({ state: 'detached' })
-    await page.getByRole('button', { name: '编辑测试成员乙', exact: true }).click()
-    const unknownDialog = page.getByRole('dialog', { name: '编辑成员资料', exact: true })
+    const untrackedPage = await preparePage(true)
+    await section(untrackedPage, '成员管理')
+    await untrackedPage.getByRole('button', { name: '编辑测试成员乙', exact: true }).click()
+    const unknownDialog = untrackedPage.getByRole('dialog', { name: '编辑成员资料', exact: true })
     assert.equal(await unknownDialog.locator('.sp-source-badge').count(), 0)
     await unknownDialog.getByRole('textbox', { name: '员工姓名', exact: true }).fill('旧数据未保存的修改')
     const unknownBadge = unknownDialog.locator('[data-source-path="employees.qa-2"]')
-    await sourceTooltip(page, unknownBadge, undefined, { pending: true, focus: true })
-    await dismissSourceTooltip(page, unknownBadge)
+    await sourceTooltip(untrackedPage, unknownBadge, undefined, { pending: true, focus: true })
+    await dismissSourceTooltip(untrackedPage, unknownBadge)
     await unknownDialog.getByRole('textbox', { name: '员工姓名', exact: true }).fill('测试成员乙')
     assert.equal(await unknownDialog.locator('.sp-source-badge').count(), 0, 'restoring the original draft hides an untracked pending badge')
     await unknownDialog.getByRole('button', { name: '取消', exact: true }).click()
     await unknownDialog.waitFor({ state: 'detached' })
+    assert.equal(await untrackedPage.locator('#member-qa-2 .sp-source-badge').count(), 0)
+    await untrackedPage.close()
+    activePage = page
     record('each edit dialog has one pending card badge with the last saved time, and untracked drafts hide it again when restored')
 
     await page.setViewportSize({ width: 320, height: 480 })
     const narrowBadge = page.locator('[data-source-path="employees.qa-1"]').first()
     assert.equal(await page.locator('#member-qa-1 .sp-source-badge').count(), 1)
-    assert.equal(await page.locator('#member-qa-2 .sp-source-badge').count(), 0)
+    assert.equal(await page.locator('#member-qa-2 .sp-source-badge').count(), 1)
+    await badge(page, referencePath, 'manual', '手动修改')
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
     await sourceTooltip(page, narrowBadge, fieldStamps['employees.qa-1'])
     await screenshot(page, 'source-tooltip-320px')

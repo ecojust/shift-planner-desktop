@@ -24,7 +24,7 @@ import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain'
 import { desktop, solveDesktop, cancelDesktop, desktopSolverInfo, importDesktopBackup, exportDesktopFile, checkDesktopResult, listenSolverProgress, matchingSolverPhase, matchingSolverSolutionCount, solverPhaseLabels, formatSolverError, formatUserMessage, formatUserIssue } from './DesktopSolver'
 import type { SolverRequest, SolverPhase } from './DesktopSolver'
 import { BUILD_VERSION } from './buildInfo'
-import { minimumMonthHours, monthlyHoursByEmployee } from './hours.ts'
+import { monthlyHoursByEmployee } from './hours.ts'
 import { createSolverRequest, solverDebugJSON, solverDebugFileName } from './solverDebug'
 import { parseRulesImport } from './rulesImport'
 import { withSolverGuidance, diagnosticActionLabel, openingWeekNotice } from './solverGuidance'
@@ -335,11 +335,8 @@ function solverRequestId() { return `${Array.from(crypto.getRandomValues(new Uin
 function flash(message: string) { notice.value = formatUserMessage(message); window.clearTimeout(noticeTimer); noticeTimer = window.setTimeout(() => notice.value = '', 5500) }
 function scheduleConfigurationKey(document: Document) {
   return JSON.stringify(Object.entries(configurationFields(document))
-    .filter(([path]) => /^(employees|shifts|rules|calendar|monthlyReferenceHours)(\.|$)/.test(path))
+    .filter(([path]) => /^(employees|shifts|rules)(\.|$)/.test(path))
     .sort(([a], [b]) => a.localeCompare(b)))
-}
-function configurationContentKey(document: PlannerState) {
-  return JSON.stringify(Object.entries(configurationFields(document)).sort(([a], [b]) => a.localeCompare(b)))
 }
 function remember() {
   history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value, configuration: scheduleConfigurationKey(state.value), invalidatedSchedules: clone(state.value.provenance?.invalidatedSchedules ?? {}) })
@@ -427,7 +424,7 @@ function saveCell() {
   flash(conflict ? `已保存，请处理冲突：${conflict.message}` : '班次已更新，锁定班次会在重新生成时保留')
 }
 function openDate(date: string) { calendarDate.value = date; calendarKind.value = info(date).kind }
-function saveCalendar() { state.value.calendar[calendarDate.value] = calendarKind.value; calendarDate.value = ''; flash('日期类型已更新，自动月参考工时已重新计算；津贴按排班领取固定金额') }
+function saveCalendar() { state.value.calendar[calendarDate.value] = calendarKind.value; calendarDate.value = ''; flash('日期类型已更新；津贴按排班领取固定金额') }
 function requestCalendarReset() {
   if (generating.value || !Object.hasOwn(state.value.calendar, calendarDate.value)) return
   calendarReset.value = { date: calendarDate.value, revision }
@@ -438,7 +435,7 @@ function confirmCalendarReset() {
   if (!target || generating.value || target.revision !== revision || target.date !== calendarDate.value) return
   delete state.value.calendar[target.date]
   calendarDate.value = ''
-  flash(`${target.date} 已恢复默认日期类型，自动月参考工时已重新计算。`)
+  flash(`${target.date} 已恢复默认日期类型。`)
 }
 let worker: Worker | null = null
 let workerTimer = 0
@@ -768,7 +765,7 @@ let provenanceSnapshot = clone({ ...state.value, assignments: [] })
 watch(state, () => {
   if (recordingProvenance) return
   employeeReorder.cancel()
-  const configurationChanged = configurationContentKey(provenanceSnapshot) !== configurationContentKey(state.value)
+  const configurationChanged = scheduleConfigurationKey(provenanceSnapshot) !== scheduleConfigurationKey(state.value)
   recordingProvenance = true
   try {
     if (!acceptingProvenance) {
@@ -921,7 +918,7 @@ watch([generating, cancelling], async () => {
                         <span v-if="(dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0" class="sp-allowance-badge" :data-allowance="dayAllowance(employee.id,date)!.totalAllowance" :data-allowance-date="date" :data-allowance-employee="employee.id">＋¥{{ money(dayAllowance(employee.id,date)!.totalAllowance) }}</span>
                       </button>
                     </td>
-                    <td class="sp-hours-col"><strong>{{ employeeHours(employee.id) }}<small> h</small></strong><span>{{ employeeDays(employee.id) }} 个班次</span><span>最低 {{ minimumMonthHours(state, employee) }} h</span></td>
+                    <td class="sp-hours-col"><strong>{{ employeeHours(employee.id) }}<small> h</small></strong><span>{{ employeeDays(employee.id) }} 个班次</span></td>
                     <td class="sp-allowance-col" :data-employee-allowance="employee.id" :data-allowance="payrollError ? null : employeeAllowances.get(employee.id)?.totalAllowance ?? 0"><strong v-if="payrollError">无法计算</strong><template v-else><strong>¥{{ money(employeeAllowances.get(employee.id)?.totalAllowance ?? 0) }}</strong><span>按班次固定金额累计</span></template></td>
                   </tr>
                   <tr v-if="!employees.length"><td :colspan="visibleDates.length+3" class="sp-empty">没有找到成员，请修改筛选条件或添加成员。</td></tr>
@@ -935,7 +932,7 @@ watch([generating, cancelling], async () => {
             <p class="sp-allowance-legend"><span aria-hidden="true">✦</span> 金色金额为该班次的固定津贴，排一次领取一份。跨夜班全部津贴记在开始日期，只领一次。右侧汇总整月金额。</p>
             <div class="sp-calendar-bottom"><span><Icon name="lock" :size="14" />点击班次调整，锁定后自动排班保留</span><button class="sp-check-status" :class="{ warning: issues.length }" :aria-expanded="showIssues" @click="showIssues = !showIssues"><Icon :name="issues.length ? 'info' : 'shield'" :size="15" />{{ issues.length ? `${issues.length} 项排班提醒` : '排班检查通过' }}<Icon name="arrow" :size="13" /></button></div>
           </section>
-          <div v-if="showIssues" class="sp-issues"><template v-if="issues.length"><button v-for="issue in issues.slice(0, 100)" :key="issue.id" @click="jumpToIssue(issue.date)"><span :class="issue.severity">{{ issue.severity === 'error' ? '冲突' : '提醒' }}</span><span>{{ issue.message }}</span><small v-if="issue.date">{{ issue.date }} ↗</small></button><p v-if="issues.length > 100">还有 {{ issues.length - 100 }} 项，请先处理当前提醒。</p></template><p v-else>休假、班次资格、月最低与周工时上下限、连续工作和休息间隔均通过检查。<button class="sp-link" @click="chooseSection('rules')">自定义规则 →</button></p></div>
+          <div v-if="showIssues" class="sp-issues"><template v-if="issues.length"><button v-for="issue in issues.slice(0, 100)" :key="issue.id" @click="jumpToIssue(issue.date)"><span :class="issue.severity">{{ issue.severity === 'error' ? '冲突' : '提醒' }}</span><span>{{ issue.message }}</span><small v-if="issue.date">{{ issue.date }} ↗</small></button><p v-if="issues.length > 100">还有 {{ issues.length - 100 }} 项，请先处理当前提醒。</p></template><p v-else>休假、班次资格、周工时上下限、连续工作和休息间隔均通过检查。<button class="sp-link" @click="chooseSection('rules')">自定义规则 →</button></p></div>
         </template>
 
         <SettingsPanel v-if="section !== 'calendar'" ref="settingsPanel" :state="state" :section="section" :payroll="state.payroll" @change="settingsChanged" />
@@ -960,7 +957,7 @@ watch([generating, cancelling], async () => {
 
     <div v-if="editing" class="sp-overlay" @click.self="editing = null"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-edit-title"><div class="sp-modal-heading"><div><h2 id="sp-edit-title">调整班次</h2><p>{{ editing.employee.name }} · {{ editing.date }} · 周{{ weekday(editing.date) }}</p></div><button class="sp-icon-button" aria-label="关闭班次编辑" @click="editing = null"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="s in state.shifts" :key="s.id" :disabled="!editing.employee.eligibleShiftIds.includes(s.id)" :class="{ selected: editing.shiftId === s.id }" @click="editing.shiftId = s.id"><span class="sp-shift-swatch" :style="{ background: s.color }">{{ s.shortName }}</span><span><strong>{{ s.name }}</strong><small>{{ s.start }}–{{ s.end }} · {{ shiftHours(s) }} 小时{{ editing.employee.eligibleShiftIds.includes(s.id) ? '' : ' · 未获得该班资格' }}</small></span><Icon v-if="editing.shiftId === s.id" name="check" /></button><button :class="{ selected: editing.shiftId === 'off' }" @click="editing.shiftId = 'off'"><span class="sp-shift-swatch">休</span><span><strong>安排休息</strong><small>锁定后，自动排班不会占用这一天</small></span></button><button :class="{ selected: editing.shiftId === 'leave' }" @click="editing.shiftId = 'leave'"><span class="sp-shift-swatch sp-leave-swatch">假</span><span><strong>全天请假</strong><small>作为不可排班日期保存</small></span></button></div><div class="sp-edit-allowance" role="note"><strong>已保存排班的当日津贴</strong><p>{{ allowanceDescription(editing.employee.id, editing.date) }}</p><small>保存班次调整后会重新计算。</small></div><label v-if="editing.shiftId !== 'leave'" class="sp-lock-toggle"><input v-model="editing.locked" type="checkbox" /><Icon name="lock" :size="15" /><span>锁定本次安排，重新排班时保留</span></label><div class="sp-modal-actions"><button class="sp-button" @click="editing = null">取消</button><button class="sp-button sp-primary" @click="saveCell">保存安排</button></div></section></div>
 
-    <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p><SourceBadge :state="state" :path="`calendar.${calendarDate}`" /></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" :disabled="!Object.hasOwn(state.calendar, calendarDate)" @click="requestCalendarReset">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
+    <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历标记；津贴按排班领取固定金额。</p><SourceBadge :state="state" :path="`calendar.${calendarDate}`" /></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'在日历中标记为工作日'},{kind:'restday',label:'休息日',note:'在日历中标记为休息日'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" :disabled="!Object.hasOwn(state.calendar, calendarDate)" @click="requestCalendarReset">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
 
     <div v-if="showGenerate" class="sp-overlay" @click.self="!generating && (showGenerate = false)">
       <section class="sp-modal sp-generate-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title" tabindex="-1">
@@ -1009,7 +1006,7 @@ watch([generating, cancelling], async () => {
 
     <div v-if="showBackup" class="sp-overlay" @click.self="showBackup = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-backup-title"><div class="sp-modal-heading"><div><h2 id="sp-backup-title">备份与恢复</h2><p>数据保存在{{ storageLocation }}，不会自动云同步。</p></div><button class="sp-icon-button" aria-label="关闭备份面板" @click="showBackup = false"><Icon name="close" /></button></div><div class="sp-shift-options"><button @click="exportBackup"><Icon name="download" /><span><strong>导出完整备份</strong><small>JSON 文件，可在另一台设备恢复</small></span><Icon name="arrow" :size="16" /></button><button @click="openImport"><Icon name="upload" /><span><strong>导入备份文件</strong><small>确认后替换当前工作空间，建议先导出备份</small></span><Icon name="arrow" :size="16" /></button></div></section></div>
 
-    <ConfirmDialog v-if="rulesImportCandidate" title="导入这个规则文件？" description="将用文件中的成员、班次、排班规则和所有月份排班替换当前工作空间。日期类型、月参考工时和津贴设置也按文件恢复。" confirm-label="确认导入" @confirm="confirmRulesImport" @cancel="cancelRulesImport">
+    <ConfirmDialog v-if="rulesImportCandidate" title="导入这个规则文件？" description="将用文件中的成员、班次、排班规则和所有月份排班替换当前工作空间。日期类型和津贴设置也按文件恢复。" confirm-label="确认导入" @confirm="confirmRulesImport" @cancel="cancelRulesImport">
       <div class="sp-rules-import-preview">
         <p class="sp-rules-import-file">{{ rulesImportCandidate.name }}</p>
         <strong>{{ rulesImportCandidate.parsed.document.teamName }} · {{ rulesImportCandidate.parsed.document.month }}</strong>
@@ -1036,7 +1033,7 @@ watch([generating, cancelling], async () => {
       <section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-help-title">
         <div class="sp-modal-heading"><h2 id="sp-help-title">几步，安排好下个月</h2><button class="sp-icon-button" aria-label="关闭帮助" @click="showHelp = false"><Icon name="close" /></button></div>
         <ol class="sp-help-list">
-          <li><strong>添加团队成员</strong><p>月参考工时默认按工作日 × 8 计算；设置每人的月最低工时、周最低/最高工时、班次资格和请假日期。</p></li>
+          <li><strong>添加团队成员</strong><p>设置每人的周最低/最高工时、班次资格和请假日期。</p></li>
           <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数；也可逐条指定不连续的班次及每人每周次数上限。</p></li>
           <li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li>
           <li><strong>设置班次津贴</strong><p>在「班次设置」填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li>

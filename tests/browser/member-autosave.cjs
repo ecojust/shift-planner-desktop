@@ -54,9 +54,7 @@ async function main() {
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
   const state = () => page.evaluate(() => JSON.parse(localStorage.getItem('shift-planner:v1') || 'null'))
   const member = async (name = firstName) => (await state()).employees.find(employee => employee.name === name)
-  const card = (name = firstName) => page.locator('.sp-settings-employee-card').filter({ has: page.getByRole('heading', { name, exact: true }) })
-  const follow = (name = firstName) => page.getByLabel(`${name}月最低工时跟随月参考值`, { exact: true })
-  const monthHours = (name = firstName) => page.getByLabel(`${name}每月最低工时`, { exact: true })
+  const card = (name = firstName) => page.locator('.sp-settings-employee-card').filter({ has: page.getByRole('button', { name: `编辑${name}`, exact: true }) })
   const minWeek = (name = firstName) => page.getByLabel(`${name}每周最低工时`, { exact: true })
   const maxWeek = (name = firstName) => page.getByLabel(`${name}每周最高工时`, { exact: true })
   const chip = (shift, name = firstName) => page.getByRole('button', { name: `${name}可上${shift}`, exact: true })
@@ -80,7 +78,7 @@ async function main() {
     if (await mobile.isVisible()) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
   async function stageImport(document) {
-    await page.locator('input[type=file]').setInputFiles({ name: 'member-autosave.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.locator('input.sp-hidden[type=file]:not([aria-label])').setInputFiles({ name: 'member-autosave.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).waitFor()
   }
   async function importDocument(document) {
@@ -134,7 +132,10 @@ async function main() {
     assert.equal(await page.getByRole('button', { name: /^保存.+设置$/ }).count(), 0)
     const chipNames = await card().locator('button[aria-pressed]').evaluateAll(buttons => buttons.map(button => button.getAttribute('aria-label')))
     assert.deepEqual(chipNames, [`${firstName}可上夜班`, `${firstName}可上日班`])
-    record('legacy-weekly-values-load-unchanged-and-all-shift-choices-are-present')
+    assert.equal(await page.getByLabel(/每月最低工时|月最低工时跟随|手动月参考工时/).count(), 0)
+    assert.ok((await state()).employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+    assert.equal(Object.hasOwn(await state(), 'monthlyReferenceHours'), false)
+    record('legacy-weekly-values-load-unchanged-and-retired-month-fields-are-removed')
 
     await add().click()
     await profile().waitFor()
@@ -160,7 +161,8 @@ async function main() {
     await saveProfile()
     await persistedMember(employee => employee.role === '轮班专员', '周小夏')
     const created = await member('周小夏')
-    assert.deepEqual([created.minHoursPerMonth, created.minHoursPerWeek, created.maxHoursPerWeek], [null, 40, 48])
+    assert.deepEqual([created.minHoursPerWeek, created.maxHoursPerWeek], [40, 48])
+    assert.equal(Object.hasOwn(created, 'minHoursPerMonth'), false)
     assert.deepEqual([...created.eligibleShiftIds].sort(), ['day', 'night'])
     assert.equal(await minWeek('周小夏').inputValue(), '40')
     assert.equal(await maxWeek('周小夏').inputValue(), '48')
@@ -260,25 +262,15 @@ async function main() {
     await persistedMember(employee => employee.eligibleShiftIds.length === 2)
     record('qualification-chips-auto-save-including-empty-selection-and-preserve-assignments')
 
-    await follow().uncheck()
-    await monthHours().fill('120')
-    await persistedMember(employee => employee.minHoursPerMonth === 120)
-    for (const value of ['', '-1', '745']) {
-      await monthHours().fill(value)
+    for (const value of ['', '-1', '169']) {
+      await maxWeek().fill(value)
       await page.waitForTimeout(settleMs)
-      assert.equal((await member()).minHoursPerMonth, 120)
+      assert.equal((await member()).maxHoursPerWeek, 58)
+      assert.match(await card().getByRole('alert').innerText(), /每周最高工时/)
     }
-    await monthHours().fill('126')
-    await persistedMember(employee => employee.minHoursPerMonth === 126)
-    await page.getByLabel('手动月参考工时', { exact: true }).fill('160')
-    await persisted(value => value.monthlyReferenceHours['2026-10'] === 160)
-    assert.equal(await monthHours().inputValue(), '126')
-    assert.equal(await monthHours('李青').inputValue(), '160')
-    await follow().check()
-    await persistedMember(employee => employee.minHoursPerMonth === null)
-    assert.equal(await monthHours().isDisabled(), true)
-    assert.equal(await monthHours().inputValue(), '160')
-    record('custom-month-hours-validate-and-follow-toggle-auto-saves-inheritance')
+    await maxWeek().fill('58')
+    assert.equal((await member('李青')).minHoursPerWeek, 0)
+    record('invalid-weekly-maximum-drafts-do-not-save-and-existing-zero-remains-zero')
 
     await inputThen(`${firstName}每周最低工时`, '48', { navigation: true, button: '班次设置' })
     await persistedMember(employee => employee.minHoursPerWeek === 48)
@@ -294,23 +286,17 @@ async function main() {
     await page.waitForTimeout(settleMs)
     assert.equal((await member()).minHoursPerWeek, 44)
     assert.equal(await minWeek().inputValue(), '44')
-    assert.equal((await member()).minHoursPerMonth, null)
-    assert.equal(await monthHours().inputValue(), '168')
-    assert.equal(await monthHours('李青').inputValue(), '168')
-    await follow().uncheck()
-    await inputThen(`${firstName}每月最低工时`, '151', { month: '2026-10' })
+    assert.equal(await maxWeek().inputValue(), '58')
+    assert.equal(await minWeek('李青').inputValue(), '0')
+    await inputThen(`${firstName}每周最低工时`, '43', { month: '2026-10' })
+    await persisted(value => value.month === '2026-10' && value.employees[0].minHoursPerWeek === 43)
+    await minWeek().fill('44')
+    await selectGlobalMonth(page, '2026-11')
+    await persisted(value => value.month === '2026-11' && value.employees[0].minHoursPerWeek === 44)
+    await selectGlobalMonth(page, '2026-10')
     await persisted(value => value.month === '2026-10')
-    await page.waitForTimeout(settleMs)
-    assert.equal((await member()).minHoursPerMonth, 151)
-    assert.equal(await monthHours('李青').inputValue(), '160')
-    assert.equal(await monthHours().inputValue(), '151')
-    await monthHours().fill('152')
-    await selectGlobalMonth(page, '2026-11');
-    await persisted(value => value.month === '2026-11' && value.employees[0].minHoursPerMonth === 152)
-    await selectGlobalMonth(page, '2026-10');
-    await persisted(value => value.month === '2026-10')
-    await monthHours().fill('151')
-    await persistedMember(employee => employee.minHoursPerMonth === 151)
+    assert.equal(await minWeek().inputValue(), '44')
+    assert.equal(await maxWeek().inputValue(), '58')
     record('month-change-flushes-valid-pending-edits-with-and-without-blur')
 
     await leaveButton().click()
@@ -327,7 +313,7 @@ async function main() {
     await saveProfile()
     await persistedMember(employee => employee.role === '资深轮班员')
     const merged = await member()
-    assert.deepEqual([merged.minHoursPerMonth, merged.minHoursPerWeek, merged.maxHoursPerWeek], [151, 42, 58])
+    assert.deepEqual([merged.minHoursPerWeek, merged.maxHoursPerWeek], [42, 58])
     assert.deepEqual(merged.eligibleShiftIds, ['day'])
     assert.deepEqual(merged.unavailableDates, ['2026-09-30', '2026-10-02', '2026-10-18', '2026-11-01'])
     assert.deepEqual((await state()).assignments, initial.assignments)
@@ -338,7 +324,6 @@ async function main() {
     await navigate('成员管理')
     assert.deepEqual(await state(), beforeReload)
     assert.equal(await minWeek().inputValue(), '42')
-    assert.equal(await monthHours().inputValue(), '151')
     assert.equal(await chip('日班').getAttribute('aria-pressed'), 'true')
     assert.equal(await chip('夜班').getAttribute('aria-pressed'), 'false')
     record('refresh-restores-auto-saved-hours-qualifications-profile-and-leave')
@@ -354,13 +339,12 @@ async function main() {
 
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle' }),
-      page.getByLabel('手动月参考工时', { exact: true }).evaluate(element => { element.value = '164'; element.dispatchEvent(new Event('input', { bubbles: true })); location.reload() }),
+      maxWeek().evaluate(element => { element.value = '60'; element.dispatchEvent(new Event('input', { bubbles: true })); location.reload() }),
     ])
     await navigate('成员管理')
-    assert.equal((await state()).monthlyReferenceHours['2026-10'], 164)
-    assert.equal((await member()).minHoursPerMonth, 151)
-    assert.equal(await monthHours('李青').inputValue(), '164')
-    record('immediate-refresh-also-flushes-month-reference-and-preserves-custom-minimum')
+    assert.deepEqual([(await member()).minHoursPerWeek, (await member()).maxHoursPerWeek], [40, 60])
+    assert.equal(await minWeek('李青').inputValue(), '0')
+    record('immediate-refresh-also-flushes-weekly-maximum-without-changing-other-member-minimum')
 
     for (const width of [1440, 1024, 390, 320]) {
       await page.setViewportSize({ width, height: width === 1440 ? 1050 : 844 })
@@ -400,7 +384,7 @@ async function main() {
     await inputThen(`${firstName}每周最低工时`, '30', { button: '确认导入' })
     await persisted(value => value.teamName === replacement.teamName)
     await page.waitForTimeout(settleMs)
-    assert.deepEqual([(await member()).minHoursPerWeek, (await member()).maxHoursPerWeek, (await member()).minHoursPerMonth], [40, 48, null])
+    assert.deepEqual([(await member()).minHoursPerWeek, (await member()).maxHoursPerWeek], [40, 48])
     assert.equal(await minWeek().inputValue(), '40')
     assert.deepEqual((await member()).unavailableDates, replacement.employees[0].unavailableDates)
     record('import-with-same-member-id-cancels-old-pending-draft-and-timer')

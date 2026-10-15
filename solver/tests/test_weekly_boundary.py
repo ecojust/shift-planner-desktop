@@ -18,12 +18,12 @@ def assignment(date, sid='day', locked=False):
     return dict(employeeId='a', date=date, shiftId=sid, locked=locked)
 
 
-def request(month='2026-11', minimum=40, maximum=40, shifts=None, assignments=None, monthly=0):
+def request(month='2026-11', minimum=40, maximum=40, shifts=None, assignments=None):
     shifts = shifts or [shift()]
     return dict(protocolVersion=1, requestId='boundary-week-test',
                 state=dict(version=1, month=month, teamName='跨月回归', shifts=shifts,
                            employees=[dict(id='a', name='甲', minHoursPerWeek=minimum, maxHoursPerWeek=maximum,
-                                           minHoursPerMonth=monthly, eligibleShiftIds=[item['id'] for item in shifts], unavailableDates=[])],
+                                           eligibleShiftIds=[item['id'] for item in shifts], unavailableDates=[])],
                            assignments=assignments or [], rules=dict(minRestHours=0, maxConsecutiveDays=31)),
                 options=dict(timeLimitSeconds=3, seed=1010, allowPartial=False))
 
@@ -229,10 +229,19 @@ class WeeklyBoundaryTest(unittest.TestCase):
         self.assertIn('已有 48 小时', issues[0]['message'])
         self.assertIn('超过周上限 40 小时', issues[0]['message'])
 
-    def test_month_minimum_cannot_be_satisfied_by_outside_credit(self):
-        data = request(assignments=[assignment(f'2026-10-{day}') for day in range(26, 31)], monthly=8)
-        data['state']['employees'][0]['unavailableDates'] = [f'2026-11-{day:02d}' for day in range(2, 31)]
-        self.assertFailure(data, 'monthly-min-hours')
+    def test_legacy_month_minimum_is_ignored_but_known_week_must_be_complete(self):
+        data = request(assignments=[assignment(f'2026-10-{day}') for day in range(26, 31)])
+        data['state']['employees'][0].update(minHoursPerMonth=744, unavailableDates=['2026-11-01'])
+        result = self.assertFeasible(data)
+        self.assertFalse(any(item['date'] == '2026-11-01' for item in result['assignments']))
+        _, inside = minutes_by_week(data, result['assignments'])
+        self.assertLess(sum(inside.values()), 744 * 60)
+        # Ignoring the legacy monthly field must not relax the remaining
+        # eight hours of the same known natural week when history changes.
+        data['state']['assignments'].pop()
+        issues = self.assertFailure(data, 'weekly-min-hours', '2026-10-26')
+        self.assertIn('本月实际最低要求为 8 小时', issues[0]['message'])
+        self.assertIn('本月最多不超过 0 小时', issues[0]['message'])
 
     def test_team_capacity_uses_individual_remaining_target(self):
         # Seven members each need an hour per full week. The old boundary

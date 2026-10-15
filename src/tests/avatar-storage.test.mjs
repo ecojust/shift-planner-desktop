@@ -11,7 +11,7 @@ const avatar = localJpeg([0, 2, 0, 3])
 function fixture() {
   return {
     version: 1, month: '2026-10', teamName: '头像存储测试',
-    employees: [{ id: 'a', name: '甲', role: '', group: '', color: '#123456', minHoursPerMonth: 0, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: [], avatar }],
+    employees: [{ id: 'a', name: '甲', role: '', group: '', color: '#123456', minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: [], avatar }],
     shifts: [{ id: 'day', name: '早班', shortName: '早', start: '08:00', end: '16:00', color: '#123456', required: 0 }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5 }, assignments: [],
   }

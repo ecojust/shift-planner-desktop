@@ -31,7 +31,9 @@ test('rules JSON is a complete solver request with resolved defaults and cross-m
   const request = createSolverRequest(original, solverOptions, 'export-test')
   assert.deepEqual(original, before)
   assert.equal(original.employees[0].minHoursPerMonth, null)
-  assert.deepEqual(request.state.employees.map(employee => [employee.minHoursPerMonth, employee.minHoursPerWeek]), [[160, 40], [80, 0]])
+  assert.deepEqual(request.state.employees.map(employee => employee.minHoursPerWeek), [40, 0])
+  assert.ok(request.state.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+  assert.equal(Object.hasOwn(request.state, 'monthlyReferenceHours'), false)
   const exported = JSON.parse(solverDebugJSON(request, { buildVersion: '2026.1014.1200', exportedAt: '2026-10-14T04:00:00.000Z', source: 'current', runtime: 'desktop', originalState: original }))
   assert.equal(exported.protocolVersion, 1)
   assert.equal(exported.requestId, 'export-test')
@@ -40,7 +42,7 @@ test('rules JSON is a complete solver request with resolved defaults and cross-m
   assert.deepEqual(exported.state.assignments, original.assignments)
   assert.deepEqual(exported.state.rules, original.rules)
   assert.deepEqual(exported.state.shifts, original.shifts)
-  assert.equal(exported.debug.originalHourDefaults[0].minHoursPerMonth, null)
+  assert.deepEqual(exported.debug.originalHourDefaults, [{ employeeId: 'a', minHoursPerWeek: 40 }, { employeeId: 'b' }])
   assert.equal(exported.debug.buildVersion, '2026.1014.1200')
   assert.equal(exported.debug.exportedAt, '2026-10-14T04:00:00.000Z')
   assert.equal(exported.debug.runtime, 'desktop')
@@ -61,7 +63,7 @@ test('snapshot is detached in both directions, including reactive Vue objects an
   assert.deepEqual(request.state.rules.weekdayWeights.days, [1, 6])
   assert.deepEqual(request.state.rules.separationGroups[0].employeeIds, ['a', 'b'])
   assert.equal(request.options.seed, 12345)
-  assert.equal(request.state.employees[0].minHoursPerMonth, 160)
+  assert.equal(request.state.employees[0].minHoursPerWeek, 40)
   request.state.employees[1].name = 'request-only'
   assert.equal(state.employees[1].name, '小张')
 })
@@ -78,17 +80,32 @@ test('exporting a cached attempt never resolves its hours again or alters its op
   assert.deepEqual(result.options, before.options)
   assert.equal(result.debug.source, 'attempt')
   assert.equal(result.state.month, '2026-10')
-  assert.equal(result.state.employees[0].minHoursPerMonth, 160)
+  assert.equal(result.state.employees[0].minHoursPerWeek, 40)
 })
 
-test('automatic reference uses calendar overrides and old missing defaults stay zero', () => {
-  const state = fixture()
-  delete state.monthlyReferenceHours
-  delete state.employees[1].minHoursPerMonth
-  const request = createSolverRequest(state, options(), 'auto-reference')
-  assert.equal(request.state.employees[0].minHoursPerMonth, 152)
-  assert.equal(request.state.employees[1].minHoursPerMonth, 0)
-  assert.equal(state.employees[0].minHoursPerMonth, null)
+test('old monthly defaults never reappear in requests or exports and explicit weekly zero remains zero', () => {
+  for (const minimum of [null, 744, 10000, NaN, Infinity]) {
+    const state = fixture()
+    state.employees[0].minHoursPerMonth = minimum
+    state.employees[0].minHoursPerWeek = 0
+    state.monthlyReferenceHours['2026-10'] = Infinity
+    const request = createSolverRequest(state, options(), 'weekly-only')
+    assert.deepEqual(request.state.employees.map(employee => employee.minHoursPerWeek), [0, 0])
+    const exported = solverDebugJSON(request, { originalState: state })
+    assert.doesNotMatch(exported, /minHoursPerMonth|monthlyReferenceHours/)
+    assert.equal(state.employees[0].minHoursPerMonth, minimum)
+  }
+})
+
+test('cached legacy requests export only current constraints without modifying the original attempt', () => {
+  const request = { protocolVersion: 1, requestId: 'old-attempt', state: fixture(), options: options() }
+  const before = structuredClone(request)
+  const result = JSON.parse(solverDebugJSON(request, { source: 'attempt', originalState: request.state }))
+  assert.doesNotMatch(JSON.stringify(result), /minHoursPerMonth|monthlyReferenceHours/)
+  assert.deepEqual(request, before)
+  assert.deepEqual(result.options, before.options)
+  assert.equal(result.state.employees[1].minHoursPerWeek, undefined, 'export does not resolve the cached weekly value again')
+  assert.deepEqual(result.state.assignments, before.state.assignments)
 })
 
 test('invalid numbers and oversized JSON cannot silently produce a changed solver request', () => {

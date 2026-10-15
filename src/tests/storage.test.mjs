@@ -7,7 +7,7 @@ import { createPayrollConfig, calculatePayroll } from '../payroll.ts'
 function fixture() {
   return {
     version: 1, teamName: '桥西门店', month: '2028-02',
-    employees: [{ id: 'e1', name: '小林', role: '店员', group: '一组', color: '#28a', minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: ['early', 'night'], unavailableDates: ['2028-02-03'] }],
+    employees: [{ id: 'e1', name: '小林', role: '店员', group: '一组', color: '#28a', minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: ['early', 'night'], unavailableDates: ['2028-02-03'] }],
     shifts: [{ id: 'early', name: '早班', shortName: '早', start: '08:00', end: '16:00', color: '#339966', required: 1 }, { id: 'night', name: '晚班', shortName: '晚', start: '22:00', end: '06:00', color: '#8899aa', required: 0 }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5, balanceWeekends: true },
     assignments: [{ employeeId: 'e1', date: '2028-01-31', shiftId: 'night', locked: true }, { employeeId: 'e1', date: '2028-02-01', shiftId: 'early', locked: false }, { employeeId: 'e1', date: '2028-02-02', shiftId: 'night', locked: false }, { employeeId: 'e1', date: '2028-02-04', shiftId: 'off', locked: true }],
@@ -20,7 +20,7 @@ function rejected(change) {
 function weightedFixture() {
   const state = fixture()
   state.month = '2026-10'
-  state.employees = ['e1', 'e2', 'e3'].map(id => ({ ...state.employees[0], id, name: id, minHoursPerMonth: 0, maxHoursPerWeek: 168, unavailableDates: [] }))
+  state.employees = ['e1', 'e2', 'e3'].map(id => ({ ...state.employees[0], id, name: id, maxHoursPerWeek: 168, unavailableDates: [] }))
   state.rules = { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [6, 7], percent: 40 } }
   state.assignments = Array.from({ length: 7 }, (_, index) => ({ employeeId: 'e1', date: `2026-10-${String(index + 5).padStart(2, '0')}`, shiftId: 'early', locked: false }))
   state.assignments.push(...['06', '10', '11'].map(day => ({ employeeId: 'e2', date: `2026-10-${day}`, shiftId: 'night', locked: false })))
@@ -193,39 +193,40 @@ test('CSV and Excel date headers share built-in holidays, adjusted workdays and 
   assert.match(scheduleCSV(state), /2028-02-01（工作日·待核对）/)
 })
 
-test('legacy backups gain reference-based monthly minimums without changing saved assignments or weekly caps', () => {
+test('legacy backups default missing weekly minimums to zero without inventing monthly constraints', () => {
   const old = fixture()
   delete old.employees[0].minHoursPerMonth
   delete old.employees[0].minHoursPerWeek
   const migrated = parseBackup(JSON.stringify(old))
-  assert.equal(migrated.employees[0].minHoursPerMonth, null)
+  assert.equal(Object.hasOwn(migrated.employees[0], 'minHoursPerMonth'), false)
   assert.equal(migrated.employees[0].minHoursPerWeek, 0)
   assert.equal(migrated.employees[0].maxHoursPerWeek, 40)
   assert.deepEqual(migrated.assignments, old.assignments)
   assert.deepEqual(parseBackup(backupJSON(migrated)), migrated)
 })
 
-test('month reference overrides and employee minimums survive backup without replacing auto with a snapshot', () => {
-  const data = fixture()
-  data.monthlyReferenceHours = { '2028-02': 160, '2028-03': 0 }
-  data.employees[0].minHoursPerWeek = 24
-  const roundtrip = JSON.parse(JSON.stringify(parseBackup(backupJSON(data))))
-  assert.deepEqual(roundtrip, data)
-  assert.equal(roundtrip.employees[0].minHoursPerMonth, null)
-  data.employees[0].minHoursPerMonth = 80.5
-  assert.equal(parseBackup(backupJSON(data)).employees[0].minHoursPerMonth, 80.5)
+test('retired monthly fields are discarded regardless of their old JSON values while weekly limits and saved data survive', () => {
+  const monthlyValues = [undefined, null, 0, 80.5, 744, 1000000, -1, '160', false, [], { automatic: true }]
+  const referenceValues = [undefined, null, 0, '160', false, [], { '2028-02': 160, '2028-03': 0 }, { '2028-13': 99999, invalid: null }]
+  for (const minimum of [0, 24]) for (const minHoursPerMonth of monthlyValues) for (const monthlyReferenceHours of referenceValues) {
+    const data = fixture()
+    data.employees[0].minHoursPerWeek = minimum
+    const expected = structuredClone(data)
+    data.employees[0].minHoursPerMonth = minHoursPerMonth
+    data.monthlyReferenceHours = monthlyReferenceHours
+    const before = structuredClone(data)
+    assert.deepEqual(parseBackup(JSON.stringify(data)), expected)
+    assert.deepEqual(parseBackup(backupJSON(data)), expected)
+    assert.deepEqual(data, before, 'migration must not mutate its source')
+    assert.doesNotMatch(backupJSON(data), /minHoursPerMonth|monthlyReferenceHours/)
+  }
 })
 
-test('import rejects invalid reference months, nonnumeric minimums, and minute-rounded inverted weekly ranges', () => {
+test('weekly minimum validation remains strict, including minute-rounded inverted ranges', () => {
   for (const change of [
-    s => s.monthlyReferenceHours = { '2028-13': 160 },
-    s => s.monthlyReferenceHours = { '2028-2': 160 },
-    s => s.monthlyReferenceHours = { '2028-02': null },
-    s => s.monthlyReferenceHours = { '2028-02': 745 },
-    s => s.employees[0].minHoursPerMonth = '160',
-    s => s.employees[0].minHoursPerMonth = -1,
-    s => s.employees[0].minHoursPerMonth = 745,
     s => s.employees[0].minHoursPerWeek = null,
+    s => s.employees[0].minHoursPerWeek = '24',
+    s => s.employees[0].minHoursPerWeek = -1,
     s => s.employees[0].minHoursPerWeek = 41,
     s => { s.employees[0].minHoursPerWeek = 1.001; s.employees[0].maxHoursPerWeek = 1.01 },
     s => { s.employees[0].minHoursPerWeek = 1e-12; s.employees[0].maxHoursPerWeek = 1e-11 },

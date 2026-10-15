@@ -39,7 +39,6 @@ test('default permissions allow member add, update and delete, but reject every 
   assert.equal(app.saves(), 3)
   deniedWithoutSave(app, state => { state.shifts[0].name = '禁止改班次' }, /班次/)
   deniedWithoutSave(app, state => { state.rules.minRestHours = 12 }, /排班规则/)
-  deniedWithoutSave(app, state => { state.monthlyReferenceHours = { '2026-10': 160 } }, /排班规则/)
   deniedWithoutSave(app, state => { state.calendar = { '2026-10-15': 'restday' } }, /排班规则/)
   deniedWithoutSave(app, state => { state.assignments = [{ employeeId: 'e1', date: '2026-10-15', shiftId: 'day', locked: false }] }, /排班结果/)
 })
@@ -70,7 +69,7 @@ test('permission changes apply to already-read documents and independent grants 
   app.permissions({ ...allPermissions, members: false })
   assert.throws(() => app.handle('replace_state', pending, 'mcp'), error => error.status === 403 && /成员/.test(error.message))
   assert.equal(app.saves(), 0)
-  edit(app, state => { state.shifts[0].name = '新班次'; state.rules.minRestHours = 12; state.calendar = { '2026-10-15': 'restday' }; state.monthlyReferenceHours = { '2026-10': 160 } }, 'http')
+  edit(app, state => { state.shifts[0].name = '新班次'; state.rules.minRestHours = 12; state.calendar = { '2026-10-15': 'restday' } }, 'http')
   assert.equal(app.saves(), 1)
   assert.deepEqual(app.sources, ['http'])
 })
@@ -276,4 +275,27 @@ test('permission settings persist independently and failed writes cannot change 
   }
   assert.throws(() => setIntegrationPermission(permissions, '__proto__', true, storage), /无效/)
   assert.throws(() => setIntegrationPermission(permissions, 'assignments', 'true', storage), /无效/)
+})
+
+
+test('retired monthly values are ignored for both external sources without a save or configuration invalidation', () => {
+  for (const source of ['mcp', 'http']) {
+    const initial = fixture()
+    initial.employees[0].minHoursPerMonth = 744
+    initial.monthlyReferenceHours = { '2026-10': 744 }
+    initial.assignments = [{ employeeId: 'e1', date: '2026-10-15', shiftId: 'day', locked: true }]
+    const app = setup(initial, { members: false, shifts: false, rules: false, assignments: false })
+    const before = read(app, source)
+    assert.equal(before.state.monthlyReferenceHours, undefined)
+    assert.ok(before.state.employees.every(employee => employee.minHoursPerMonth === undefined))
+    for (const value of [null, 0, 744, 9999, 'retired', {}]) {
+      const next = structuredClone(before)
+      next.state.monthlyReferenceHours = value
+      next.state.employees[0].minHoursPerMonth = value
+      assert.deepEqual(app.handle('replace_state', next, source), before)
+    }
+    assert.equal(app.saves(), 0)
+    assert.deepEqual(app.sources, [])
+    assert.deepEqual(app.state().assignments, initial.assignments)
+  }
 })

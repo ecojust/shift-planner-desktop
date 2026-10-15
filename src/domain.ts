@@ -8,7 +8,7 @@ export interface Employee {
   color: string
   /** Optional local JPEG thumbnail; absent or null means no avatar. */
   avatar?: string | null
-  /** null follows this month's team reference; missing is a legacy zero minimum. */
+  /** @deprecated Read-only legacy backup field; ignored by scheduling and omitted from new output. */
   minHoursPerMonth?: number | null
   minHoursPerWeek?: number
   maxHoursPerWeek: number
@@ -71,7 +71,7 @@ export interface PlannerState {
   teamName: string
   /** YYYY-MM */
   month: string
-  /** Manual reference hours by YYYY-MM. Missing months use calendar workdays × 8. */
+  /** @deprecated Read-only legacy backup field; ignored by scheduling and omitted from new output. */
   monthlyReferenceHours?: Record<string, number>
   employees: Employee[]
   shifts: Shift[]

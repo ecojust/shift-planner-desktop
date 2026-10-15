@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import { parseRulesImport } from '../rulesImport.ts'
 import { createSolverRequest, solverDebugJSON } from '../solverDebug.ts'
 import { backupJSON, parseBackup, MAX_BACKUP_BYTES } from '../storage.ts'
-import { minimumMonthHours } from '../hours.ts'
 import { createPayrollConfig } from '../payroll.ts'
 
 function fixture() {
@@ -50,7 +49,6 @@ test('current exported rules import the complete document, cross-month assignmen
   const original = fixture(), before = structuredClone(original)
   const result = parseRulesImport(exported(original))
   const expected = structuredClone(original)
-  expected.employees[2].minHoursPerMonth = 0
   expected.employees[2].minHoursPerWeek = 0
   assert.deepEqual(result.document, parseBackup(backupJSON(expected)))
   assert.equal(result.source, 'current')
@@ -73,43 +71,50 @@ test('failed-attempt export restores the captured attempt instead of subsequentl
   assert.equal(result.document.month, '2026-10')
   assert.equal(result.document.employees[0].name, '小林')
   assert.equal(result.document.rules.minRestHours, 11)
-  assert.equal(result.document.employees[0].minHoursPerMonth, null)
+  assert.equal(result.document.employees[0].minHoursPerMonth, undefined)
 })
 
-test('following-reference null, explicit minima and legacy missing zero retain their semantics after saving', () => {
-  const imported = parseRulesImport(exported()).document
-  const saved = parseBackup(backupJSON(imported))
-  saved.monthlyReferenceHours['2026-10'] = 208
-  assert.deepEqual(saved.employees.map(employee => minimumMonthHours(saved, employee)), [208, 80, 0])
-  assert.deepEqual(saved.employees.map(employee => employee.minHoursPerWeek), [40, 16, 0])
-  assert.equal(saved.employees[0].minHoursPerMonth, null)
-  assert.equal(saved.employees[2].minHoursPerMonth, 0)
+test('old monthly fields are discarded while weekly minima and all schedule records survive import and saving', () => {
+  for (const oldMonth of [null, 0, 744, 9999, 'old-value', { unused: true }]) {
+    const payload = JSON.parse(exported())
+    payload.state.monthlyReferenceHours = { '2026-10': 9999 }
+    payload.state.employees[0].minHoursPerMonth = oldMonth
+    payload.debug.originalHourDefaults[0].minHoursPerMonth = oldMonth
+    const saved = parseBackup(backupJSON(parseRulesImport(JSON.stringify(payload)).document))
+    assert.equal(Object.hasOwn(saved, 'monthlyReferenceHours'), false)
+    assert.ok(saved.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+    assert.deepEqual(saved.employees.map(employee => employee.minHoursPerWeek), [40, 16, 0])
+    assert.deepEqual(saved.assignments, fixture().assignments)
+  }
 })
 
-test('original automatic monthly defaults resolve with the exported calendar before being restored', () => {
-  const state = fixture()
-  delete state.monthlyReferenceHours
-  const payload = JSON.parse(exported(state))
-  assert.ok(payload.state.employees[0].minHoursPerMonth > 0)
+test('retired monthly metadata cannot override weekly constraints or revive a reference default', () => {
+  const payload = JSON.parse(exported())
+  payload.state.monthlyReferenceHours = { '2026-10': 160 }
+  payload.state.employees[0].minHoursPerMonth = 160
+  payload.debug.originalHourDefaults[0].minHoursPerMonth = null
+  payload.debug.originalHourDefaults[1].minHoursPerMonth = 9999
   const result = parseRulesImport(JSON.stringify(payload))
-  assert.equal(result.document.employees[0].minHoursPerMonth, null)
-  assert.equal(minimumMonthHours(result.document, result.document.employees[0]), payload.state.employees[0].minHoursPerMonth)
+  assert.equal(result.document.monthlyReferenceHours, undefined)
+  assert.deepEqual(result.document.employees.map(employee => employee.minHoursPerWeek), [40, 16, 0])
+  assert.ok(result.document.employees.every(employee => employee.minHoursPerMonth === undefined))
 })
 
-test('old requests without debug metadata keep their resolved hours and optional payroll/calendar remain absent', () => {
+test('old requests without debug metadata retain weekly settings and optional payroll/calendar remain absent', () => {
   const state = fixture()
   delete state.calendar
   delete state.payroll
-  const payload = createSolverRequest(state, { timeLimitSeconds: 30, allowPartial: false, seed: 8 }, 'old-export')
+  const payload = { protocolVersion: 1, requestId: 'old-export', state, options: { timeLimitSeconds: 30 } }
   const result = parseRulesImport(JSON.stringify(payload))
   assert.equal(result.source, 'unknown')
   assert.equal(result.timeLimitSeconds, 30)
-  assert.equal(result.document.employees[0].minHoursPerMonth, 160)
+  assert.equal(result.document.employees[0].minHoursPerMonth, undefined)
+  assert.equal(result.document.employees[0].minHoursPerWeek, 40)
   assert.equal(result.document.calendar, undefined)
   assert.equal(result.document.payroll, undefined)
   const debugWithoutDefaults = JSON.parse(exported())
   delete debugWithoutDefaults.debug.originalHourDefaults
-  assert.equal(parseRulesImport(JSON.stringify(debugWithoutDefaults)).document.employees[0].minHoursPerMonth, 160)
+  assert.equal(parseRulesImport(JSON.stringify(debugWithoutDefaults)).document.employees[0].minHoursPerWeek, 40)
 })
 
 test('historical provenance is discarded, including malformed or forged source and schedule metadata', () => {
@@ -159,7 +164,7 @@ test('business validation rejects invalid references, dates, duplicates and nume
     [payload => { payload.state.rules.weeklyShiftLimits[0].maxPerWeek = 8 }, /超出范围/],
     [payload => { payload.state.assignments.push(payload.state.assignments[0]) }, /多条排班/],
     [payload => { payload.state.assignments[0].date = '2026-02-30' }, /日期不存在/],
-    [payload => { payload.state.employees[0].minHoursPerMonth = -1 }, /超出范围/],
+    [payload => { payload.state.employees[0].minHoursPerWeek = -1 }, /超出范围/],
   ]
   for (const [change, expected] of cases) assert.throws(() => parseRulesImport(edited(change)), expected)
 })
@@ -170,16 +175,13 @@ test('original-hour metadata must cover each real member exactly once', () => {
   for (const employeeId of ['missing', '__proto__', 42]) assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[0].employeeId = employeeId })), /不存在的成员/)
   assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[0] = [] })), /必须是对象/)
   const reordered = parseRulesImport(edited(payload => { payload.debug.originalHourDefaults.reverse() }))
-  assert.equal(reordered.document.employees[0].minHoursPerMonth, null, 'metadata is joined by stable employee ID')
+  assert.equal(reordered.document.employees[0].minHoursPerWeek, 40, 'metadata is joined by stable employee ID')
 })
 
 test('invalid or inconsistent original minima cannot override an otherwise valid request', () => {
-  for (const value of [-1, 745, '160', {}, []]) assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[0].minHoursPerMonth = value })), /原始每月最低工时/)
   for (const value of [-1, 169, null, '40', {}]) assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[0].minHoursPerWeek = value })), /原始每周最低工时/)
   assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[0].minHoursPerWeek = 57 })), /最低工时不能超过最高工时/)
-  assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[1].minHoursPerMonth = 81 })), /不一致/)
   assert.throws(() => parseRulesImport(edited(payload => { payload.debug.originalHourDefaults[0].minHoursPerWeek = 39 })), /不一致/)
-  assert.throws(() => parseRulesImport(edited(payload => { payload.state.monthlyReferenceHours['2026-10'] = 161 })), /不一致/)
 })
 
 test('UTF-8 byte limits include the BOM and reject oversized multibyte files before parsing', () => {

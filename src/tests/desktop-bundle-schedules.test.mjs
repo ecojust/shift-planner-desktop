@@ -8,7 +8,7 @@ import { datesOfMonth, generateSchedule, validateSchedule } from '../scheduler.t
 // the same verifier with captureFrozen and the actual installed OR-Tools binary.
 function response(request) {
   const common = { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', stats: { shortageCount: 0 } };
-  if (request.requestId.endsWith('-reference')) return { ...common, status: 'INFEASIBLE', issues: [{ type: 'monthly-min-hours' }] };
+  if (request.requestId.endsWith('-reference')) return { ...common, status: 'INFEASIBLE', issues: [{ type: 'weekly-fixed-capacity' }] };
   const schedule = generateSchedule(request.state, 1010);
   assert.equal(schedule.success, true);
   return { ...common, status: 'FEASIBLE', assignments: schedule.assignments };
@@ -21,13 +21,16 @@ function runner(change = () => {}) {
   };
 }
 
-test('bundle fixtures distinguish minimum staffing from genuinely impossible monthly hours', () => {
+test('bundle fixtures distinguish minimum staffing from genuinely impossible weekly fixed capacity', () => {
   const { coverage, reference, weighted } = makeBundleScheduleFixtures();
   assert.equal(coverage.employees.length, 12);
-  assert.ok(coverage.employees.every(employee => employee.minHoursPerMonth === 0 && employee.minHoursPerWeek === 0));
-  assert.ok(reference.employees.every(employee => employee.minHoursPerMonth === 744 && employee.minHoursPerWeek === 0));
+  assert.ok(coverage.employees.every(employee => employee.minHoursPerWeek === 0));
+  assert.ok(reference.employees.every(employee => employee.minHoursPerWeek === 40 && employee.maxHoursPerWeek === 48));
+  assert.ok(reference.shifts.every(shift => shift.staffingMode === 'fixed'));
+  assert.equal(reference.shifts.reduce((sum, shift) => sum + shift.required * 8 * 7, 0), 280);
+  assert.equal(reference.employees.reduce((sum, employee) => sum + employee.minHoursPerWeek, 0), 480);
   assert.equal(weighted.employees.length, 2);
-  assert.ok(weighted.employees.every(employee => employee.minHoursPerMonth === 120 && employee.minHoursPerWeek === 14));
+  assert.ok(weighted.employees.every(employee => employee.minHoursPerWeek === 14));
   assert.deepEqual(weighted.rules.weekdayWeights, { days: [6, 7], percent: 40 });
   for (const state of [coverage, reference, weighted]) assert.deepEqual(state.assignments, []);
 });
@@ -42,8 +45,10 @@ test('bundle verifier checks daily staffing minimums and actual weighted totals 
   }
   assert.deepEqual(checked.independentRuleIssues, []);
   assert.equal(checked.constraintChecks.defaultReference.status, 'INFEASIBLE');
-  assert.equal(checked.constraintChecks.defaultReference.fixtureKind, 'impossible-monthly-minimum');
-  assert.equal(checked.constraintChecks.defaultReference.minimumHoursPerEmployee, 744);
+  assert.equal(checked.constraintChecks.defaultReference.fixtureKind, 'impossible-weekly-fixed-capacity');
+  assert.equal(checked.constraintChecks.defaultReference.minimumWeeklyHoursPerEmployee, 40);
+  assert.equal(checked.constraintChecks.defaultReference.totalMinimumWeeklyHours, 480);
+  assert.equal(checked.constraintChecks.defaultReference.fixedWeeklyCapacityHours, 280);
   const weighted = checked.constraintChecks.positiveMinimumsAndWeights;
   assert.ok(weighted.assignmentCount >= 31);
   assert.equal(weighted.weeklyQuotas.length, 5);
@@ -58,7 +63,8 @@ test('bundle verifier checks daily staffing minimums and actual weighted totals 
       assert.ok(week.fullWeekCountCandidates.includes(week.assignmentCount));
     }
   }
-  assert.ok(Object.values(weighted.monthlyHours).every(hours => hours >= 120));
+  assert.equal(weighted.weeklyHours.length, 10);
+  assert.ok(weighted.weeklyHours.every(week => week.minutes >= week.minimumMinutes && week.minutes <= week.maximumMinutes));
   assert.deepEqual(weighted.independentRuleIssues, []);
 });
 
@@ -66,7 +72,7 @@ test('invalid or unknown default-reference responses never count as proven infea
   for (const status of ['MODEL_INVALID', 'UNKNOWN']) {
     await assert.rejects(verifyScheduleFixtures(runner((request, result) => {
       if (request.requestId.endsWith('-reference')) result.status = status;
-    }), 'regression'), /744-hour monthly minimum/);
+    }), 'regression'), /480-hour weekly minimum/);
   }
 });
 

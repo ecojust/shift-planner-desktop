@@ -51,7 +51,7 @@ export function parseRulesImport(text: string): RulesImport {
     if (debug.originalHourDefaults !== undefined) {
       if (!Array.isArray(debug.originalHourDefaults) || debug.originalHourDefaults.length !== document.employees.length) fail('原始工时设置必须与成员一一对应')
       const byId = new Map(document.employees.map(employee => [employee.id, employee]))
-      const exportedHours = document.employees.map(employee => [employee.minHoursPerMonth, employee.minHoursPerWeek])
+      const exportedHours = document.employees.map(employee => employee.minHoursPerWeek)
       const seen = new Set<string>()
       for (const value of debug.originalHourDefaults) {
         const original = object(value, '原始工时设置')
@@ -59,11 +59,8 @@ export function parseRulesImport(text: string): RulesImport {
         if (seen.has(original.employeeId)) fail('原始工时设置存在重复成员')
         seen.add(original.employeeId)
         const employee = byId.get(original.employeeId)!
-        // A missing legacy minimum means zero, not today's null (follow the
-        // monthly reference). Make it explicit so backup normalization cannot
-        // change that meaning when the imported document is saved later.
-        if (original.minHoursPerMonth === undefined) employee.minHoursPerMonth = 0
-        else employee.minHoursPerMonth = original.minHoursPerMonth === null ? null : hours(original.minHoursPerMonth, 744, '原始每月最低工时')
+        // Monthly minima in older exports are retired. Only restore weekly
+        // settings, including an explicit zero for a missing legacy minimum.
         if (original.minHoursPerWeek === undefined) employee.minHoursPerWeek = 0
         else employee.minHoursPerWeek = hours(original.minHoursPerWeek, 168, '原始每周最低工时')
       }
@@ -72,7 +69,7 @@ export function parseRulesImport(text: string): RulesImport {
       const resolved = resolveHoursState(restored)
       for (let index = 0; index < resolved.employees.length; index++) {
         const employee = resolved.employees[index]!, expected = exportedHours[index]!
-        if (employee.minHoursPerMonth !== expected[0] || employee.minHoursPerWeek !== expected[1]) fail('原始工时设置与导出的排班设置不一致')
+        if (employee.minHoursPerWeek !== expected) fail('原始工时设置与导出的排班设置不一致')
       }
       document = restored
     }

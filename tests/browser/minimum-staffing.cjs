@@ -9,7 +9,7 @@ const DAY = 86400000, MINUTE = 60000
 function fixture(required = 1) {
   return {
     version: 1, teamName: `每日最低人数验证 · ${required} 人`, month: '2026-10', calendar: {},
-    employees: Array.from({ length: 12 }, (_, index) => ({ id: `coverage-${index + 1}`, name: `成员${String(index + 1).padStart(2, '0')}`, role: '值班员', group: '测试组', color: '#d7e8f8', minHoursPerMonth: 144, minHoursPerWeek: 40, maxHoursPerWeek: 56, eligibleShiftIds: ['early', 'late', 'night'], unavailableDates: [] })),
+    employees: Array.from({ length: 12 }, (_, index) => ({ id: `coverage-${index + 1}`, name: `成员${String(index + 1).padStart(2, '0')}`, role: '值班员', group: '测试组', color: '#d7e8f8', minHoursPerWeek: 40, maxHoursPerWeek: 56, eligibleShiftIds: ['early', 'late', 'night'], unavailableDates: [] })),
     shifts: [
       { id: 'early', name: '早班', shortName: '早', start: '08:00', end: '16:00', color: '#dbeee6', required, normalAllowance: 0 },
       { id: 'late', name: '晚班', shortName: '晚', start: '14:00', end: '22:00', color: '#fff0d2', required, normalAllowance: 0 },
@@ -62,7 +62,6 @@ function audit(state) {
       previous = day
     }
     const monthMinutes = overlapMinutes(intervals, monthStart, monthEnd)
-    assert.ok(monthMinutes >= employee.minHoursPerMonth * 60, `${employee.id}: monthly ${monthMinutes / 60} < ${employee.minHoursPerMonth}`)
     const weeklyHours = [...weeks].map(([monday, days]) => {
       const whole = overlapMinutes(intervals, monday, monday + 7 * DAY)
       const inMonth = overlapMinutes(intervals, Math.max(monday, monthStart), Math.min(monday + 7 * DAY, monthEnd))
@@ -106,7 +105,7 @@ async function main() {
     if (compact) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
   }
   async function importFixture(document) {
-    await page.locator('input[type=file]').setInputFiles({ name: 'minimum-staffing.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.locator('input[type=file]:not([aria-label="导入规则文件"])').setInputFiles({ name: 'minimum-staffing.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     await persisted(value => value.teamName === document.teamName && JSON.stringify(value.assignments) === JSON.stringify(document.assignments))
   }
@@ -125,8 +124,8 @@ async function main() {
     await page.goto(url, { waitUntil: 'networkidle' })
     await importFixture(fixture())
     await navigate('班次设置')
-    const shiftCard = page.locator('.sp-settings-shift-card').filter({ has: page.getByRole('heading', { name: '早班', exact: true }) })
-    assert.match(await shiftCard.innerText(), /每日最少\s*1\s*人/)
+    const shiftCard = page.locator('.sp-settings-shift-card').filter({ has: page.getByRole('button', { name: '编辑早班', exact: true }) })
+    assert.match(await shiftCard.innerText(), /每日最少\s*≥\s*1\s*人/)
     await shiftCard.getByRole('button', { name: '编辑早班', exact: true }).click()
     assert.equal(await page.getByLabel('每日最少人数', { exact: true }).inputValue(), '1')
     await page.getByLabel('每日最少人数', { exact: true }).fill('2')
@@ -140,7 +139,7 @@ async function main() {
     await page.screenshot({ path: path.join(output, '01-shift-minimum-settings.png') })
 
     const generated = await generate()
-    record('12-members-month144-week40-to56-cover-each-shift-with-extra-staff', audit(generated))
+    record('12-members-week40-to56-cover-each-shift-with-extra-staff', audit(generated))
     assert.doesNotMatch(await page.locator('body').innerText(), /超编|overstaffed/)
     assert.match(await page.locator('.sp-check-status').innerText(), /排班检查通过/)
     await page.getByRole('button', { name: '月视图', exact: true }).click()
@@ -149,7 +148,8 @@ async function main() {
     record('surplus-staff-is-accepted-and-calendar-displays-result')
 
     await navigate('成员管理')
-    assert.equal(await page.getByLabel('成员01每月最低工时', { exact: true }).inputValue(), '144')
+    assert.equal(await page.getByLabel('成员01每月最低工时', { exact: true }).count(), 0)
+    assert.ok((await state()).employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
     assert.equal(await page.getByLabel('成员01每周最低工时', { exact: true }).inputValue(), '40')
     assert.equal(await page.getByLabel('成员01每周最高工时', { exact: true }).inputValue(), '56')
     await page.setViewportSize({ width: 390, height: 844 })
@@ -168,7 +168,7 @@ async function main() {
     // shifts cannot all be covered. A candidate must not replace the old table.
     const impossible = fixture()
     impossible.teamName = '不足最低人数时保留原排班'
-    impossible.employees = impossible.employees.slice(0, 2).map(employee => ({ ...employee, minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 168 }))
+    impossible.employees = impossible.employees.slice(0, 2).map(employee => ({ ...employee, minHoursPerWeek: 0, maxHoursPerWeek: 168 }))
     impossible.rules = { minRestHours: 0, maxConsecutiveDays: 31 }
     impossible.assignments = [{ employeeId: 'coverage-1', date: '2026-10-01', shiftId: 'early', locked: true }]
     await importFixture(impossible)

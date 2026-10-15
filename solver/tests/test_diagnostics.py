@@ -68,11 +68,18 @@ class DiagnosticsTest(unittest.TestCase):
         self.assertIn('仅 10 小时', items[0]['message'])
         self.assertIn('至少休息 11 小时', items[0]['message'])
 
-    def test_month_minimum_cannot_exceed_weekly_caps(self):
-        s = state(employees=[employee('甲', cap=8, minimum_month=48)], shifts=[shift(required=0)])
-        items = self.assert_failure(solve(request(s)), 'monthly-min-hours')
-        self.assertIn('不超过 40 小时', items[0]['message'])
-        self.assertIn('相差 8 小时', items[0]['message'])
+    def test_week_minimum_reports_available_hours_after_leave(self):
+        s = state(employees=[employee('甲', cap=40, minimum_week=24,
+                                      leave=[f'2026-10-{day:02d}' for day in range(5, 11)])],
+                  shifts=[shift(required=0)])
+        items = self.assert_failure(solve(request(s)), 'weekly-min-hours')
+        self.assertEqual(items[0]['date'], '2026-10-05')
+        self.assertEqual(items[0]['employeeId'], '甲')
+        self.assertIn('本月实际最低要求为 24 小时', items[0]['message'])
+        self.assertIn('本月最多不超过 8 小时', items[0]['message'])
+        self.assertIn('至少相差 16 小时', items[0]['message'])
+        s['employees'][0]['unavailableDates'] = []
+        self.assertIn(solve(request(s))['status'], ('OPTIMAL', 'FEASIBLE'))
 
     def test_weekly_fixed_capacity_reports_real_hours(self):
         s = state(employees=[employee(x, cap=40, minimum_week=24) for x in ['甲', '乙', '丙']], shifts=[shift(mode='fixed')])

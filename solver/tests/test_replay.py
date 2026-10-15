@@ -82,6 +82,38 @@ class ReplayTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, '8 MiB'):
                         entry.read_request()
 
+    def test_legacy_month_minimum_values_do_not_constrain_file_replay(self):
+        for legacy_minimum in (None, 744):
+            with self.subTest(minHoursPerMonth=legacy_minimum), tempfile.TemporaryDirectory() as directory:
+                request = {
+                    'protocolVersion': 1, 'requestId': 'legacy-file-replay',
+                    'state': {
+                        'version': 1, 'month': '2026-10', 'teamName': '旧规则文件',
+                        'monthlyReferenceHours': {'2026-10': 744},
+                        'employees': [{'id': 'a', 'name': '甲', 'minHoursPerMonth': legacy_minimum,
+                                       'minHoursPerWeek': 0, 'maxHoursPerWeek': 168,
+                                       'eligibleShiftIds': ['early'], 'unavailableDates': []}],
+                        'shifts': [{'id': 'early', 'name': '早班', 'start': '08:00', 'end': '16:00',
+                                    'required': 0, 'staffingMode': 'minimum'}],
+                        'rules': {'minRestHours': 0, 'maxConsecutiveDays': 31}, 'assignments': [],
+                    },
+                    'options': {'timeLimitSeconds': 3, 'allowPartial': False, 'seed': 1010},
+                    'debug': {'format': 'shiftflow-solver-debug', 'formatVersion': 1,
+                              'originalHourDefaults': [{'employeeId': 'a', 'minHoursPerMonth': legacy_minimum,
+                                                        'minHoursPerWeek': 0}]},
+                }
+                exported = json.dumps(request, ensure_ascii=False)
+                path = Path(directory) / '旧排班规则.json'
+                path.write_text(exported, encoding='utf-8')
+                output = subprocess.run([sys.executable, str(ENTRY), '--input', str(path)],
+                                        cwd=ROOT, capture_output=True, text=True, timeout=20, check=True)
+                result = json.loads(output.stdout)
+                self.assertEqual(result['status'], 'OPTIMAL', result)
+                self.assertEqual(result['requestId'], 'legacy-file-replay')
+                self.assertEqual(result['assignments'], [])
+                self.assertEqual(output.stderr, '')
+                self.assertEqual(path.read_text(encoding='utf-8'), exported)
+
     @unittest.skipUnless(shutil.which('node'), 'Node is needed for the TypeScript export integration')
     def test_browser_generated_json_replays_unchanged_through_the_real_engine(self):
         state = {
@@ -105,8 +137,9 @@ process.stdout.write(solverDebugJSON(request, { source: 'attempt', originalState
         exported = subprocess.run([shutil.which('node'), '--input-type=module', '-e', script, json.dumps(state)],
                                   cwd=ROOT, capture_output=True, text=True, timeout=20, check=True).stdout
         parsed = json.loads(exported)
-        self.assertEqual(parsed['state']['employees'][0]['minHoursPerMonth'], 24)
-        self.assertIsNone(parsed['debug']['originalHourDefaults'][0]['minHoursPerMonth'])
+        self.assertNotIn('monthlyReferenceHours', parsed['state'])
+        self.assertNotIn('minHoursPerMonth', parsed['state']['employees'][0])
+        self.assertEqual(parsed['debug']['originalHourDefaults'], [{'employeeId': 'a', 'minHoursPerWeek': 0}])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / '排班规则.json'
             path.write_text(exported, encoding='utf-8')
@@ -120,8 +153,7 @@ process.stdout.write(solverDebugJSON(request, { source: 'attempt', originalState
         for assignment in state['assignments']:
             self.assertIn(assignment, result['assignments'])
         shifts_in_month = [item for item in result['assignments'] if item['date'].startswith('2026-10') and item['shiftId'] != 'off']
-        self.assertGreaterEqual(len(shifts_in_month) * 8, 24)
-        self.assertFalse(any(item['date'] in ['2026-10-02', '2026-10-03'] for item in shifts_in_month))
+        self.assertEqual(shifts_in_month, [], 'legacy monthly defaults must not add work to a zero-minimum roster')
 
 
 if __name__ == '__main__':

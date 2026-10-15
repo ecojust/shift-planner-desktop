@@ -181,13 +181,10 @@ async function main() {
     }
 
     baseline = await reset('成员管理', avatar)
-    trigger = page.getByRole('button', { name: '恢复自动', exact: true })
-    await canceled(trigger, baseline, /2026.*10|10 月/)
-    record('monthly-reference-reset-requires-confirmation-and-cancel-keeps-manual-hours')
-    await opened(trigger, /2026.*10|10 月/); await accepted()
-    expected = clone(baseline); delete expected.monthlyReferenceHours['2026-10']
-    await persisted(expected)
-    record('monthly-reference-confirm-removes-only-the-selected-month-override')
+    assert.equal(await page.getByRole('button', { name: '恢复自动', exact: true }).count(), 0)
+    assert.equal(Object.hasOwn(baseline, 'monthlyReferenceHours'), false)
+    assert.ok(baseline.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+    record('retired-monthly-reference-reset-control-is-absent-and-legacy-monthly-fields-are-stripped-on-import')
 
     baseline = await reset('排班日历', avatar)
     await page.getByRole('button', { name: '月视图', exact: true }).click()

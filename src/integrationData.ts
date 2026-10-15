@@ -46,7 +46,7 @@ export class IntegrationError extends Error {
 }
 
 const fieldPermissions: Readonly<Record<string, IntegrationPermission>> = Object.freeze({
-  employees: 'members', shifts: 'shifts', rules: 'rules', monthlyReferenceHours: 'rules', calendar: 'rules', assignments: 'assignments',
+  employees: 'members', shifts: 'shifts', rules: 'rules', calendar: 'rules', assignments: 'assignments',
 })
 const permissionNames: Record<IntegrationPermission, string> = { members: '成员', shifts: '班次', rules: '排班规则', assignments: '排班结果' }
 
@@ -64,7 +64,7 @@ function equalData(left: unknown, right: unknown): boolean {
 
 /** Stable entity paths distinguish actual configuration edits from list reordering. */
 function changedScheduleConfiguration(previous: PlannerDocument, next: PlannerDocument): boolean {
-  const roots = new Set(['employees', 'shifts', 'rules', 'calendar', 'monthlyReferenceHours'])
+  const roots = new Set(['employees', 'shifts', 'rules'])
   const before = configurationFields(previous), after = configurationFields(next)
   return [...new Set([...Object.keys(before), ...Object.keys(after)])]
     .some(path => roots.has(path.split('.')[0]!) && !equalData(before[path], after[path]))
@@ -191,6 +191,8 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
       // Provenance comes from the trusted current document, never from callers.
       const candidate = { ...(args.state as Record<string, unknown>) }
       delete candidate.provenance
+      // Older clients may echo retired limits; they do not reactivate them.
+      delete candidate.monthlyReferenceHours
       const currentDocument = current.state as unknown as Record<string, unknown>
       next = parseBackup(JSON.stringify(candidate))
       // Reject unsupported top-level fields even if the backup parser would discard them.

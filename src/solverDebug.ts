@@ -20,22 +20,28 @@ function stringify(value: unknown, space?: number): string {
   }, space)
 }
 
-/** Take a detached snapshot before resolving defaults. Vue reactive state is
- * deliberately copied through JSON; structuredClone cannot clone its proxies. */
+/** Take a detached snapshot of current constraints and weekly defaults. Vue
+ * reactive state is copied through JSON; structuredClone cannot clone proxies. */
 export function createSolverRequest(state: PlannerState, options: SolverRequest['options'], requestId: string): SolverRequest {
   // Profile images have no scheduling meaning. Keep them out of worker/IPC and
   // debug requests; they remain intact in the live document and full backups.
-  const employees = state.employees.map(({ avatar: _avatar, ...employee }) => employee)
-  const snapshot = JSON.parse(stringify({ state: { ...state, employees }, options })) as { state: PlannerState; options: SolverRequest['options'] }
-  return { protocolVersion: 1, requestId, state: resolveHoursState(snapshot.state), options: snapshot.options }
+  const current = resolveHoursState(state)
+  const employees = current.employees.map(({ avatar: _avatar, ...employee }) => employee)
+  const snapshot = JSON.parse(stringify({ state: { ...current, employees }, options })) as { state: PlannerState; options: SolverRequest['options'] }
+  return { protocolVersion: 1, requestId, state: snapshot.state, options: snapshot.options }
 }
 
 /** The root is the actual solver protocol, so it works with both --input and
  * stdin. Extra metadata is ignored by the solver and never rewrites the request. */
 export function solverDebugJSON(request: SolverRequest, metadata: SolverDebugMetadata = {}): string {
   const { originalState, buildVersion, exportedAt, source, runtime } = metadata
+  // A cached request can predate removal of monthly constraints. Strip only
+  // retired settings; its weekly values, month and solver options stay exact.
+  const { monthlyReferenceHours: _retiredReference, ...current } = request.state
+  const state = { ...current, employees: current.employees.map(({ minHoursPerMonth: _retiredMinimum, ...employee }) => employee) }
   const payload = {
     ...request,
+    state,
     debug: {
       format: 'shiftflow-solver-debug',
       formatVersion: 1,
@@ -45,7 +51,6 @@ export function solverDebugJSON(request: SolverRequest, metadata: SolverDebugMet
       ...(runtime ? { runtime } : {}),
       ...(originalState ? { originalHourDefaults: originalState.employees.map(employee => ({
         employeeId: employee.id,
-        minHoursPerMonth: employee.minHoursPerMonth,
         minHoursPerWeek: employee.minHoursPerWeek,
       })) } : {}),
     },

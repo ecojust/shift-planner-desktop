@@ -14,7 +14,7 @@ const record = (name, detail) => { checks.push({ name, ok: true, detail }); cons
 function fixture() {
   return {
     version: 1, teamName: '共享月份验证', month: '2026-10', calendar: {}, monthlyReferenceHours: { '2026-11': 160, '2026-12': 168 },
-    employees: ['月份测试甲', '月份测试乙'].map((name, index) => ({ id: `month-${index + 1}`, name, role: '值班员', group: '测试组', color: '#d7e8f8', minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: ['day', 'night'], unavailableDates: [] })),
+    employees: ['月份测试甲', '月份测试乙'].map((name, index) => ({ id: `month-${index + 1}`, name, role: '值班员', group: '测试组', color: '#d7e8f8', minHoursPerMonth: 744, minHoursPerWeek: 0, maxHoursPerWeek: 40, eligibleShiftIds: ['day', 'night'], unavailableDates: [] })),
     shifts: [
       { id: 'day', name: '日班', shortName: '日', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, staffingMode: 'minimum', normalAllowance: 20 },
       { id: 'night', name: '夜班', shortName: '夜', start: '22:00', end: '06:00', color: '#e6dff5', required: 0, staffingMode: 'minimum', normalAllowance: 50 },
@@ -63,9 +63,15 @@ async function main() {
     assert.equal(await readGlobalMonth(page), value)
     assert.equal(await month().isVisible(), true)
   }
-  const reference = () => page.getByLabel('手动月参考工时', { exact: true })
-  const personalMonth = () => page.getByLabel('月份测试甲每月最低工时', { exact: true })
-  async function saveReference(value) { await reference().fill(String(value)); await reference().blur(); await persisted(document => document.monthlyReferenceHours[document.month] === value) }
+  const weeklyMinimum = () => page.getByLabel('月份测试甲每周最低工时', { exact: true })
+  async function saveWeeklyMinimum(value) { await weeklyMinimum().fill(String(value)); await weeklyMinimum().blur(); await persisted(document => document.employees[0].minHoursPerWeek === value) }
+  async function noMonthlyControls() {
+    assert.equal(await page.getByLabel('手动月参考工时', { exact: true }).count(), 0)
+    assert.equal(await page.getByLabel('月份测试甲每月最低工时', { exact: true }).count(), 0)
+    const current = await state()
+    assert.equal(Object.hasOwn(current, 'monthlyReferenceHours'), false)
+    assert.ok(current.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
+  }
   try {
     await page.goto(url, { waitUntil: 'networkidle' })
     const original = fixture()
@@ -172,62 +178,51 @@ async function main() {
     assert.match(await page.locator('.sp-month-label').innerText(), /2026\s*年\s*11\s*月/)
     await navigate('成员管理')
     await uniqueMonth('2026-11')
-    assert.equal(await reference().inputValue(), '160')
-    assert.equal(await personalMonth().inputValue(), '160')
+    await noMonthlyControls()
+    assert.equal(await weeklyMinimum().inputValue(), '0', 'A legacy 744-hour monthly minimum must not create a weekly minimum')
     await setMonth('2026-10')
-    assert.equal(await reference().inputValue(), '144')
-    await saveReference(168)
+    await saveWeeklyMinimum(12)
     await assertCurrentMonthStatus(page, 'invalid')
     await openMonthPicker(page, '2026-10')
     for (const value of ['2026-10', '2026-11', '2026-12']) await assertMonthChoiceStatus(picker(), value, 'invalid')
     await assertMonthChoiceStatus(picker(), '2026-09', 'empty')
     await page.keyboard.press('Escape')
-    assert.equal(await personalMonth().inputValue(), '168')
-    record('calendar-month-updates-member-reference-and-following-month-hours')
+    record('legacy-monthly-minima-are-removed-and-only-a-real-weekly-change-invalidates-populated-months')
 
-    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).fill('12')
-    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).blur()
-    await persisted(document => document.employees[0].minHoursPerWeek === 12)
     assert.equal(await page.getByRole('button', { name: '保存月份测试甲设置', exact: true }).count(), 0)
-    // Immediately move months while a valid reference edit is being saved.
-    // It belongs to the month in which it was entered, never the next month.
-    await reference().fill('123')
+    // Weekly limits are global per person. Changing the viewed month while a
+    // valid edit is pending must keep and save that edit without month defaults.
+    await weeklyMinimum().fill('14')
     await setMonth('2026-12')
-    await persisted(document => document.monthlyReferenceHours['2026-10'] === 123)
-    assert.equal(await reference().inputValue(), '168')
-    assert.equal(await personalMonth().inputValue(), '168')
-    assert.equal((await state()).monthlyReferenceHours['2026-10'], 123)
-    assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
-    assert.equal(await page.getByLabel('月份测试甲每周最低工时', { exact: true }).inputValue(), '12')
+    await persisted(document => document.employees[0].minHoursPerWeek === 14)
+    assert.equal(await weeklyMinimum().inputValue(), '14')
     await navigate('排班规则')
     await navigate('成员管理')
-    assert.equal(await page.getByLabel('月份测试甲每周最低工时', { exact: true }).inputValue(), '12')
-    assert.equal((await state()).employees[0].minHoursPerWeek, 12, 'Valid member hours automatically persist before navigation')
-    record('member-hours-auto-save-and-reference-edit-remains-in-its-original-month')
+    assert.equal(await weeklyMinimum().inputValue(), '14')
+    await noMonthlyControls()
+    record('weekly-member-hours-auto-save-and-remain-identical-across-months-and-pages')
 
-    // A one-hour weekly range and blank reference are invalid drafts. Neither
-    // may replace the last valid settings, including when changing months.
-    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).fill('39')
-    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).blur()
-    await reference().fill('')
-    await reference().blur()
+    // A one-hour weekly range and blank upper bound remain invalid drafts.
+    // Neither may overwrite the last valid limits when the viewed month changes.
+    await weeklyMinimum().fill('39')
+    await weeklyMinimum().blur()
+    const otherMaximum = page.getByLabel('月份测试乙每周最高工时', { exact: true })
+    await otherMaximum.fill('')
+    await otherMaximum.blur()
     await page.waitForTimeout(750)
-    assert.equal((await state()).employees[0].minHoursPerWeek, 12)
-    assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
+    assert.equal((await state()).employees[0].minHoursPerWeek, 14)
+    assert.equal((await state()).employees[1].maxHoursPerWeek, 40)
     await setMonth('2026-10')
-    assert.equal(await reference().inputValue(), '123')
-    assert.equal(await personalMonth().inputValue(), '123')
-    assert.equal((await state()).employees[0].minHoursPerWeek, 12)
-    assert.equal((await state()).monthlyReferenceHours['2026-12'], 168)
-    await saveReference(168)
-    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).fill('12')
-    await page.getByLabel('月份测试甲每周最低工时', { exact: true }).blur()
+    assert.equal((await state()).employees[0].minHoursPerWeek, 14)
+    assert.equal((await state()).employees[1].maxHoursPerWeek, 40)
+    await saveWeeklyMinimum(12)
+    await otherMaximum.fill('40')
+    await otherMaximum.blur()
     await setMonth('2026-12')
-    await saveReference(160)
+    assert.equal(await weeklyMinimum().inputValue(), '12')
     await setMonth('2026-10')
-    assert.equal(await reference().inputValue(), '168')
-    assert.equal((await state()).monthlyReferenceHours['2026-12'], 160)
-    record('invalid-auto-save-drafts-do-not-overwrite-member-hours-or-other-month-references')
+    await noMonthlyControls()
+    record('invalid-weekly-auto-save-drafts-do-not-overwrite-valid-limits-or-create-monthly-fields')
 
     await navigate('排班规则')
     await page.getByRole('tab', { name: '团队规则', exact: true }).click()
@@ -266,10 +261,10 @@ async function main() {
     await uniqueMonth('2026-11')
     await assertCurrentMonthStatus(page, 'invalid')
     await navigate('成员管理')
-    assert.equal(await reference().inputValue(), '160')
-    assert.deepEqual((await state()).monthlyReferenceHours, { '2026-10': 168, '2026-11': 160, '2026-12': 160 })
+    assert.equal(await weeklyMinimum().inputValue(), '12')
+    await noMonthlyControls()
     assert.deepEqual((await state()).assignments, original.assignments)
-    record('reload-retains-shared-month-overrides-and-cross-month-assignments')
+    record('reload-retains-shared-month-weekly-limits-and-cross-month-assignments-without-monthly-minima')
     await page.screenshot({ path: path.join(output, '01-shared-month-desktop.png') })
 
     const saved = await state()
@@ -351,7 +346,8 @@ async function main() {
       record(`width-${width}-header-controls-and-picker-fit-without-overlap-after-scroll`, { ...size, geometry, sticky, panel })
     }
     await setMonth('2026-10')
-    assert.equal(await personalMonth().inputValue(), '168')
+    assert.equal(await weeklyMinimum().inputValue(), '12')
+    await noMonthlyControls()
     await navigate('排班日历')
     await uniqueMonth('2026-10')
     assert.equal(Number((await allowanceTotal().innerText()).replace(/[¥￥,\s]/g, '')), 20)

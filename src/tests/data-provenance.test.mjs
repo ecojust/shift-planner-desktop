@@ -10,10 +10,10 @@ const thirdTime = '2026-10-15T12:02:00.000Z'
 function fixture() {
   return {
     version: 1, teamName: '测试团队', month: '2026-10',
-    employees: ['e1', 'e2'].map(id => ({ id, name: id, role: '店员', group: '', color: '#123456', minHoursPerMonth: null, minHoursPerWeek: 0, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: [] })),
+    employees: ['e1', 'e2'].map(id => ({ id, name: id, role: '店员', group: '', color: '#123456', minHoursPerWeek: 0, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: [] })),
     shifts: [{ id: 'day', name: '白班', shortName: '白', start: '09:00', end: '17:00', color: '#123456', required: 1, normalAllowance: 20 }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5, weekdayWeights: { days: [6, 7], percent: 40 }, separationGroups: [{ id: 'sg1', name: '互斥组', employeeIds: ['e1', 'e2'], shiftIds: [] }], nonConsecutiveShifts: [{ id: 'nc1', shiftId: 'day' }], weeklyShiftLimits: [{ id: 'wl1', shiftId: 'day', maxPerWeek: 3 }] },
-    calendar: { '2026-10-01': 'statutory' }, monthlyReferenceHours: { '2026-10': 160 },
+    calendar: { '2026-10-01': 'statutory' },
     payroll: createPayrollConfig().payroll, assignments: [],
   }
 }
@@ -72,11 +72,80 @@ test('configuration fields use stable entity IDs and atomic value arrays', () =>
   assert.equal(fields['rules.nonConsecutiveShifts.nc1.shiftId'], 'day')
   assert.equal(fields['rules.weeklyShiftLimits.wl1.maxPerWeek'], 3)
   assert.equal(fields['calendar.2026-10-01'], 'statutory')
-  assert.equal(fields['monthlyReferenceHours.2026-10'], 160)
+  assert.equal(fields['monthlyReferenceHours.2026-10'], undefined)
   assert.equal(fields['payroll.employeeSalaries.e1'], 7200)
   assert.equal(fields['payroll.dateShiftMultipliers.2026-10-01.day'], 2)
   assert.ok(!Object.keys(fields).some(path => /(^|\.)(id|version|month|assignments|provenance)(\.|$)/.test(path)))
   assert.ok(!Object.keys(fields).some(path => /\.0(\.|$)/.test(path)))
+})
+
+test('retired monthly values never stamp configuration, invalidate schedules or change weekly limits', () => {
+  for (const source of ['manual', 'mcp', 'http']) {
+    const before = scheduledFixture()
+    before.employees[0].minHoursPerWeek = 24
+    before.employees[0].minHoursPerMonth = null
+    before.monthlyReferenceHours = { '2026-10': 160 }
+    const original = structuredClone(before)
+    const next = changed(before, value => {
+      value.employees[0].minHoursPerMonth = { retired: 'invalid old value' }
+      value.monthlyReferenceHours = ['retired', 1000000]
+    }, source, secondTime)
+    assert.deepEqual(configurationFields(next), configurationFields(before))
+    assert.equal(next.provenance, undefined)
+    assert.equal(next.employees[0].minHoursPerWeek, 24)
+    assert.equal(next.employees[1].minHoursPerWeek, 0)
+    assert.deepEqual(next.assignments, before.assignments)
+    assert.deepEqual(before, original)
+  }
+})
+
+test('old monthly provenance is discarded without validating its retired stamps or changing other history', () => {
+  const legacy = scheduledFixture()
+  legacy.employees[0].minHoursPerMonth = 'no longer a rule'
+  legacy.monthlyReferenceHours = { '2026-99': null }
+  legacy.provenance = {
+    fields: {
+      'employees.e1.name': stamp('manual', firstTime),
+      'employees.e2.minHoursPerWeek': stamp('http', secondTime),
+      'calendar.2028-02-29': stamp('mcp', firstTime),
+      'employees.e1.minHoursPerMonth': { source: 'retired', at: null, extra: true },
+      'employees.e2.minHoursPerMonth.legacy': [],
+      monthlyReferenceHours: null,
+      'monthlyReferenceHours.2026-99': 'retired stamp',
+    },
+    pendingExternalChange: { source: 'mcp', at: firstTime, categories: ['工时设置', '成员'] },
+    scheduleUpdates: { '2026-10': stamp('http', secondTime) },
+    invalidatedSchedules: { '2026-10': stamp('manual', thirdTime), '2026-11': stamp('mcp', secondTime) },
+  }
+  const original = structuredClone(legacy)
+  const expected = structuredClone(legacy.provenance)
+  for (const path of Object.keys(expected.fields)) if (path.includes('minHoursPerMonth') || path.startsWith('monthlyReferenceHours')) delete expected.fields[path]
+  const restored = parseBackup(JSON.stringify(legacy))
+  assert.deepEqual(JSON.parse(JSON.stringify(restored.provenance)), expected)
+  assert.deepEqual(parseBackup(backupJSON(legacy)), restored)
+  assert.deepEqual(JSON.parse(JSON.stringify(withChangeProvenance(legacy, structuredClone(legacy), 'manual', thirdTime).provenance)), expected)
+  assert.deepEqual(restored.assignments, legacy.assignments)
+  assert.equal(restored.employees[0].minHoursPerWeek, 0)
+  assert.equal(Object.hasOwn(restored.employees[0], 'minHoursPerMonth'), false)
+  assert.equal(Object.hasOwn(restored, 'monthlyReferenceHours'), false)
+  assert.deepEqual(legacy, original)
+  for (const path of ['employees.e1.minHoursPerMonthExtra', 'monthlyReferenceHoursExtra.2026-10']) {
+    const invalid = structuredClone(legacy)
+    invalid.provenance.fields[path] = stamp('manual', firstTime)
+    assert.throws(() => parseBackup(JSON.stringify(invalid)), /配置修改来源字段路径无效/)
+  }
+})
+
+test('card summaries exclude retired monthly history even before backup normalization', () => {
+  const provenance = { fields: {
+    'employees.e1.name': stamp('manual', firstTime),
+    'employees.e1.minHoursPerMonth': stamp('http', thirdTime),
+    monthlyReferenceHours: stamp('mcp', thirdTime),
+    'monthlyReferenceHours.2026-10': stamp('mcp', thirdTime),
+  } }
+  assert.deepEqual(latestConfigurationChange(provenance, ['employees.e1']), stamp('manual', firstTime))
+  assert.equal(latestConfigurationChange(provenance, ['employees.e1.minHoursPerMonth']), undefined)
+  assert.equal(latestConfigurationChange(provenance, ['monthlyReferenceHours']), undefined)
 })
 
 test('each edited field records its own source while parent summaries show the latest edit', () => {
@@ -159,7 +228,7 @@ test('restore-default edits retain exact field sources across backup, save and r
     delete next.calendar
     delete next.monthlyReferenceHours
   }, 'http', firstTime)
-  for (const path of ['employees.e1.avatar', 'shifts.day.staffingMode', 'shifts.day.normalAllowance', 'rules.weekdayWeights', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits', 'calendar.2026-10-01', 'monthlyReferenceHours.2026-10']) {
+  for (const path of ['employees.e1.avatar', 'shifts.day.staffingMode', 'shifts.day.normalAllowance', 'rules.weekdayWeights', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits', 'calendar.2026-10-01']) {
     assert.deepEqual(reset.provenance.fields[path], stamp('http', firstTime), path)
   }
   assert.ok(!Object.keys(reset.provenance.fields).some(path => path.startsWith('rules.weekdayWeights.') || path.startsWith('rules.separationGroups.') || path.startsWith('rules.nonConsecutiveShifts.') || path.startsWith('rules.weeklyShiftLimits.')))
@@ -199,15 +268,15 @@ test('reset markers are removed when their employee or shift entity is deleted',
   assert.doesNotThrow(() => backupJSON(removed))
 })
 
-test('persisted reset markers permit only known options, real dates, months and existing entities', () => {
-  for (const path of ['calendar.2026-02-30', 'calendar.0000-01-01', 'calendar.2026-2-01', 'monthlyReferenceHours.2026-13', 'monthlyReferenceHours.0000-01', 'employees.missing.avatar', 'shifts.missing.staffingMode', 'shifts.missing.normalAllowance', 'rules.weekdayWeights.days', 'rules.weekdayWeights.percent', 'rules.separationGroups.missing', 'rules.nonConsecutiveShifts.missing.shiftId', 'rules.weeklyShiftLimits.missing.maxPerWeek']) {
+test('persisted reset markers permit only known options, real dates and existing entities', () => {
+  for (const path of ['calendar.2026-02-30', 'calendar.0000-01-01', 'calendar.2026-2-01', 'employees.missing.avatar', 'shifts.missing.staffingMode', 'shifts.missing.normalAllowance', 'rules.weekdayWeights.days', 'rules.weekdayWeights.percent', 'rules.separationGroups.missing', 'rules.nonConsecutiveShifts.missing.shiftId', 'rules.weeklyShiftLimits.missing.maxPerWeek']) {
     const state = fixture()
     delete state.rules.weekdayWeights
     state.provenance = { fields: { [path]: stamp('mcp', firstTime) } }
     assert.throws(() => parseBackup(JSON.stringify(state)), /配置修改来源字段路径无效/, path)
   }
   const state = fixture()
-  state.provenance = { fields: { 'calendar.2028-02-29': stamp('mcp', firstTime), 'monthlyReferenceHours.2028-02': stamp('manual', secondTime) } }
+  state.provenance = { fields: { 'calendar.2028-02-29': stamp('mcp', firstTime) } }
   assert.deepEqual(parseBackup(backupJSON(state)).provenance.fields, Object.assign(Object.create(null), state.provenance.fields))
 })
 
@@ -402,8 +471,7 @@ test('each scheduling configuration category invalidates every populated month w
     next => { next.employees[0].name = '修改成员' },
     next => { next.shifts[0].start = '08:00' },
     next => { next.rules.minRestHours = 12 },
-    next => { next.calendar['2027-01-01'] = 'workday' },
-    next => { next.monthlyReferenceHours['2027-01'] = 176 },
+    next => { next.employees[0].minHoursPerWeek = 24 },
   ]
   for (const source of ['manual', 'mcp', 'http']) {
     for (const update of updates) {
@@ -413,17 +481,45 @@ test('each scheduling configuration category invalidates every populated month w
       assert.deepEqual(result.provenance.invalidatedSchedules['2026-10'], stamp(source, secondTime))
       assert.deepEqual(result.provenance.invalidatedSchedules['2026-11'], stamp(source, secondTime), 'off-only months also contain a saved schedule')
       assert.equal(result.provenance.invalidatedSchedules['2026-12'], undefined, 'viewed empty month is not marked')
-      assert.equal(result.provenance.invalidatedSchedules['2027-01'], undefined, 'calendar/reference entry alone is not a schedule')
+      assert.equal(result.provenance.invalidatedSchedules['2027-01'], undefined, 'an unpopulated month has no schedule to invalidate')
       assert.equal(result.provenance.scheduleUpdates, undefined, 'configuration edits do not change external generation history')
       assert.equal(before.provenance, undefined)
     }
   }
 })
 
-test('team names, payroll, navigation, reordering and pure assignment changes never create invalidations', () => {
+test('calendar changes retain their source without invalidating current schedules or clearing earlier invalidations', () => {
+  for (const source of ['manual', 'mcp', 'http']) for (const alreadyInvalid of [false, true]) {
+    const before = scheduledFixture()
+    before.provenance = {
+      fields: { 'employees.e1.name': stamp('manual', firstTime) },
+      scheduleUpdates: { '2026-10': stamp('http', firstTime) },
+      ...(alreadyInvalid ? { invalidatedSchedules: { '2026-10': stamp('mcp', firstTime) } } : {}),
+    }
+    const original = structuredClone(before)
+    const result = changed(before, next => { next.calendar['2026-10-01'] = 'workday' }, source, secondTime)
+    assert.deepEqual(result.provenance.fields['calendar.2026-10-01'], stamp(source, secondTime))
+    assert.deepEqual(result.provenance.fields.calendar, stamp(source, secondTime))
+    assert.deepEqual(result.provenance.fields['employees.e1.name'], before.provenance.fields['employees.e1.name'])
+    assert.deepEqual(JSON.parse(JSON.stringify(result.provenance.invalidatedSchedules ?? null)), before.provenance.invalidatedSchedules ?? null)
+    assert.equal(result.provenance.invalidatedSchedules?.['2026-11'], undefined, 'an existing off-only month remains current')
+    assert.deepEqual(result.provenance.scheduleUpdates, before.provenance.scheduleUpdates)
+    assert.deepEqual(result.assignments, before.assignments)
+    if (source === 'manual') assert.equal(result.provenance.pendingExternalChange, undefined)
+    else assert.deepEqual(result.provenance.pendingExternalChange, { source, at: secondTime, categories: ['日期设置'] })
+    const reset = changed(result, next => { delete next.calendar['2026-10-01'] }, source, thirdTime)
+    assert.deepEqual(reset.provenance.fields['calendar.2026-10-01'], stamp(source, thirdTime))
+    assert.deepEqual(reset.provenance.invalidatedSchedules, result.provenance.invalidatedSchedules)
+    assert.deepEqual(JSON.parse(JSON.stringify(parseBackup(backupJSON(reset)).provenance)), JSON.parse(JSON.stringify(reset.provenance)))
+    assert.deepEqual(before, original)
+  }
+})
+
+test('team names, calendar, payroll, navigation, reordering and pure assignment changes never create invalidations', () => {
   const updates = [
     next => { next.teamName = '新团队名称' },
     next => { next.payroll.monthlySalary = 8000 },
+    next => { next.calendar['2027-01-01'] = 'workday' },
     next => { next.month = '2026-12' },
     next => { next.employees.reverse(); next.assignments.reverse() },
     next => { next.assignments[0].locked = true },

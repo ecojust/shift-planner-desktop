@@ -1,5 +1,7 @@
 # 桌面构建与求解验证记录
 
+当前版本已取消月最低和月参考工时，工时约束仅使用每周最低与最高；旧备份及规则文件中的月字段会停用。以下按日期记录的月最低和自动月参考测试属于当时版本的行为，不再适用于当前规则。当前行为见 [工时说明](HOURS.md)。
+
 ## 2026-10-14：1.3.7 三平台正式发布
 
 [构建任务 38589310310](https://github.com/ecojust/shift-schedule-expert/actions/runs/38589310310) 全部成功，Windows x64、Intel Mac、Apple Silicon Mac 安装包已公开为 [1.3.7 正式版](https://github.com/ecojust/shift-schedule-expert/releases/tag/desktop-v1.3.7-38589310310)，并确认 GitHub 最新正式版入口指向本次发布。三平台统一构建号 `2026.1014.2326`（北京时间），源提交 `9c13c61f42c3285038fb76ffcab5910c21d43c8c`。

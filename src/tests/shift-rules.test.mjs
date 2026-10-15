@@ -167,11 +167,11 @@ test('browser zero caps produce coverage shortages without relaxing the cap', ()
   assert.ok(!result.issues.some(issue => issue.severity === 'error'))
 })
 
-test('conflicting locked shift rules or unreachable monthly minimums preserve the full original schedule', () => {
+test('conflicting locked shift rules or unreachable weekly minimums preserve the full original schedule', () => {
   const cases = [
     fixture({ nonConsecutiveShifts: [noAdjacent('day')] }, { assignments: [assignment('2026-10-01', 'day', 'a', true), assignment('2026-10-02', 'day', 'a', true), assignment('2026-10-12')] }),
     fixture({ weeklyShiftLimits: [weekly('day', 1)] }, { assignments: [assignment('2026-10-05', 'day', 'a', true), assignment('2026-10-06', 'day', 'a', true), assignment('2026-10-12')] }),
-    fixture({ weeklyShiftLimits: [weekly('day', 0), weekly('night', 0)] }, { employees: [employee('a', { minHoursPerMonth: 8 })], assignments: [assignment('2026-10-12')] }),
+    fixture({ weeklyShiftLimits: [weekly('day', 0), weekly('night', 0)] }, { employees: [employee('a', { minHoursPerWeek: 8 })], assignments: [assignment('2026-10-12')] }),
   ]
   for (const state of cases) {
     const before = structuredClone(state)

@@ -10,7 +10,7 @@ import EmployeeAvatar from './EmployeeAvatar.vue'
 import { isAvatarData } from './avatarData.ts'
 import ShiftRulesPanel from './ShiftRulesPanel.vue'
 import SourceBadge from './SourceBadge.vue'
-import { hoursToMinutes, monthlyHoursReference } from './hours.ts'
+import { hoursToMinutes } from './hours.ts'
 import { weightedDayRange, weightedHistoryFits, weightedWeeks, weekdayWeightCapacity, weekdayWeightRuleError } from './weekday-weights.ts'
 import type { WeightedWeek } from './weekday-weights.ts'
 import { openingWeekNotice } from './solverGuidance.ts'
@@ -18,7 +18,7 @@ import { openingWeekNotice } from './solverGuidance.ts'
 const props = defineProps<{ state: PlannerState; section: 'team' | 'shifts' | 'rules'; payroll: PayrollSettings }>()
 const emit = defineEmits<{ change: [options?: { silent?: boolean }] }>()
 // Keep these form limits aligned with storage.ts so every saved form can be backed up.
-const limits = { employees: 200, shifts: 24, separationGroups: 200, monthlyReferences: 1200, leaveDates: 3660, employeeText: 80, shiftName: 60, shortName: 8, groupName: 80, required: 200, minRestHours: 48, allowance: 100000000 }
+const limits = { employees: 200, shifts: 24, separationGroups: 200, leaveDates: 3660, employeeText: 80, shiftName: 60, shortName: 8, groupName: 80, required: 200, minRestHours: 48, allowance: 100000000 }
 const feedback = ref('')
 const error = ref('')
 const editor = ref<'employee' | 'shift' | 'separation' | null>(null)
@@ -27,9 +27,7 @@ let editorTrigger: HTMLElement | null = null
 type DeleteType = 'employee' | 'shift' | 'separation'
 type DeleteTarget = Employee | Shift | NonNullable<Rules['separationGroups']>[number]
 type DeleteRequest = { type: DeleteType; id: string; name: string; state: PlannerState; month: string; section: typeof props.section; target: DeleteTarget; snapshot: string }
-type ReferenceResetRequest = { state: PlannerState; month: string; section: typeof props.section; hours: number; automaticHours: number }
 const pendingDelete = shallowRef<DeleteRequest | null>(null)
-const pendingReferenceReset = shallowRef<ReferenceResetRequest | null>(null)
 const deleteTitle = computed(() => pendingDelete.value ? `删除${pendingDelete.value.type === 'employee' ? '成员' : pendingDelete.value.type === 'shift' ? '班次' : '互斥规则'}「${pendingDelete.value.name}」？` : '')
 const deleteDescription = computed(() => pendingDelete.value?.type === 'employee'
   ? '将删除该成员的资料、所有月份的关联排班（含锁定安排），并清理相关互斥规则。此操作无法撤销。'
@@ -38,25 +36,18 @@ const deleteDescription = computed(() => pendingDelete.value?.type === 'employee
     : '删除后将不再限制这组人员同日同班，现有排班保持不变。此操作无法撤销。')
 const leaveEmployeeId = ref('')
 const leaveEmployee = computed(() => props.state.employees.find(employee => employee.id === leaveEmployeeId.value))
-const employeeDraft = reactive<Employee>({ id: '', name: '', role: '', group: '', color: '#d7e8f8', avatar: null, minHoursPerMonth: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: [], unavailableDates: [] })
-const monthReference = computed(() => monthlyHoursReference(props.state))
+const employeeDraft = reactive<Employee>({ id: '', name: '', role: '', group: '', color: '#d7e8f8', avatar: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: [], unavailableDates: [] })
 const openingWeekInfo = computed(() => openingWeekNotice(props.state))
-const referenceDraft = ref<number | string>(monthReference.value.hours)
-const referenceError = ref('')
-const referenceSaved = ref(false)
-let referenceEdited = false
-type HoursGroup = 'month' | 'week' | 'eligibility'
-type HoursDraft = { followReference: boolean; month: number | string; weekMin: number | string; weekMax: number | string; eligibleShiftIds: string[]; sources: Record<HoursGroup, string>; errors: Record<HoursGroup, string>; saved: boolean }
+type HoursGroup = 'week' | 'eligibility'
+type HoursDraft = { weekMin: number | string; weekMax: number | string; eligibleShiftIds: string[]; sources: Record<HoursGroup, string>; errors: Record<HoursGroup, string>; saved: boolean }
 type HoursTask = { timer: ReturnType<typeof setTimeout>; state: PlannerState; month: string; employeeId: string; group: HoursGroup; draft: HoursDraft }
-type ReferenceTask = { timer: ReturnType<typeof setTimeout>; state: PlannerState; month: string; value: number }
 const hoursDrafts = reactive<Record<string, HoursDraft>>(Object.create(null))
 const hoursTasks = new Map<string, HoursTask>()
-let referenceTask: ReferenceTask | null = null
 let disposed = false
 const autosaveDelay = 500
-const hoursGroups: HoursGroup[] = ['month', 'week', 'eligibility']
+const hoursGroups: HoursGroup[] = ['week', 'eligibility']
 function sourceFor(employee: Employee, group: HoursGroup) {
-  return JSON.stringify(group === 'month' ? employee.minHoursPerMonth ?? null : group === 'week' ? [employee.minHoursPerWeek ?? 0, employee.maxHoursPerWeek] : [...employee.eligibleShiftIds].sort())
+  return JSON.stringify(group === 'week' ? [employee.minHoursPerWeek ?? 0, employee.maxHoursPerWeek] : [...employee.eligibleShiftIds].sort())
 }
 function cancelHoursTask(id: string, group: HoursGroup) {
   const key = `${id}:${group}`, task = hoursTasks.get(key)
@@ -64,17 +55,15 @@ function cancelHoursTask(id: string, group: HoursGroup) {
   hoursTasks.delete(key)
 }
 function cancelHoursTasks() { for (const task of hoursTasks.values()) clearTimeout(task.timer); hoursTasks.clear() }
-function cancelReferenceTask() { if (referenceTask) clearTimeout(referenceTask.timer); referenceTask = null }
 function resetHoursGroup(employee: Employee, group: HoursGroup) {
   const draft = hoursDrafts[employee.id]!
   cancelHoursTask(employee.id, group)
-  if (group === 'month') { draft.followReference = employee.minHoursPerMonth == null; draft.month = employee.minHoursPerMonth ?? monthReference.value.hours }
-  else if (group === 'week') { draft.weekMin = employee.minHoursPerWeek ?? 0; draft.weekMax = employee.maxHoursPerWeek }
+  if (group === 'week') { draft.weekMin = employee.minHoursPerWeek ?? 0; draft.weekMax = employee.maxHoursPerWeek }
   else draft.eligibleShiftIds = [...employee.eligibleShiftIds]
   draft.sources[group] = sourceFor(employee, group); draft.errors[group] = ''
 }
 function resetEmployeeHours(employee: Employee) {
-  hoursDrafts[employee.id] = { followReference: true, month: 0, weekMin: 0, weekMax: 0, eligibleShiftIds: [], sources: { month: '', week: '', eligibility: '' }, errors: { month: '', week: '', eligibility: '' }, saved: false }
+  hoursDrafts[employee.id] = { weekMin: 0, weekMax: 0, eligibleShiftIds: [], sources: { week: '', eligibility: '' }, errors: { week: '', eligibility: '' }, saved: false }
   for (const group of hoursGroups) resetHoursGroup(employee, group)
 }
 watch(() => props.state.employees.map(employee => [employee.id, ...hoursGroups.map(group => sourceFor(employee, group))]), () => {
@@ -90,15 +79,13 @@ watch(() => props.state.employees.map(employee => [employee.id, ...hoursGroups.m
 }, { immediate: true, flush: 'sync' })
 watch(() => props.state, () => {
   // Importing a different document cancels all old writes, including matching IDs.
-  cancelHoursTasks(); cancelReferenceTask()
+  cancelHoursTasks()
   for (const id of Object.keys(hoursDrafts)) delete hoursDrafts[id]
   for (const employee of props.state.employees) resetEmployeeHours(employee)
-  referenceDraft.value = monthReference.value.hours; referenceError.value = ''; referenceSaved.value = false; referenceEdited = false
 }, { flush: 'sync' })
 function equalHours(value: number | string, reference: number) { return String(value).trim() !== '' && Number.isFinite(Number(value)) && Number(value) === reference }
 function groupDirty(employee: Employee, group: HoursGroup) {
   const draft = hoursDrafts[employee.id]!
-  if (group === 'month') return draft.followReference !== (employee.minHoursPerMonth == null) || (!draft.followReference && !equalHours(draft.month, employee.minHoursPerMonth ?? monthReference.value.hours))
   if (group === 'week') return !equalHours(draft.weekMin, employee.minHoursPerWeek ?? 0) || !equalHours(draft.weekMax, employee.maxHoursPerWeek)
   return JSON.stringify([...draft.eligibleShiftIds].sort()) !== JSON.stringify([...employee.eligibleShiftIds].sort())
 }
@@ -109,7 +96,7 @@ function validateHoursGroup(employee: Employee, group: HoursGroup) {
   draft.errors[group] = ''
   if (!groupDirty(employee, group)) return true
   if (group === 'eligibility') return true
-  const fields: [number | string, number, string][] = group === 'week' ? [[draft.weekMin, 168, '每周最低工时'], [draft.weekMax, 168, '每周最高工时']] : draft.followReference ? [] : [[draft.month, 744, '每月最低工时']]
+  const fields: [number | string, number, string][] = [[draft.weekMin, 168, '每周最低工时'], [draft.weekMax, 168, '每周最高工时']]
   for (const [value, max, label] of fields) {
     if (String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > max) { draft.errors[group] = `${label}需为 0–${max} 小时的有效数值，当前修改未保存。`; return false }
   }
@@ -124,7 +111,7 @@ function commitHoursGroup(id: string, group: HoursGroup, expectedState = props.s
   const current = props.state.employees.find(employee => employee.id === id), draft = hoursDrafts[id]
   if (!current || !draft || !validateHoursGroup(current, group) || !groupDirty(current, group)) return
   // Only this field group is merged; another group's unfinished input is preserved.
-  const patch = group === 'month' ? { minHoursPerMonth: draft.followReference ? null : Number(draft.month) } : group === 'week' ? { minHoursPerWeek: Number(draft.weekMin), maxHoursPerWeek: Number(draft.weekMax) } : { eligibleShiftIds: [...new Set(draft.eligibleShiftIds)].filter(shiftId => props.state.shifts.some(shift => shift.id === shiftId)) }
+  const patch = group === 'week' ? { minHoursPerWeek: Number(draft.weekMin), maxHoursPerWeek: Number(draft.weekMax) } : { eligibleShiftIds: [...new Set(draft.eligibleShiftIds)].filter(shiftId => props.state.shifts.some(shift => shift.id === shiftId)) }
   props.state.employees.splice(props.state.employees.indexOf(current), 1, { ...current, ...patch })
   hoursDrafts[id]!.saved = true
   emit('change', { silent: true })
@@ -138,43 +125,33 @@ function scheduleHours(employee: Employee, group: HoursGroup, immediate = false)
   task.timer = setTimeout(() => commitHoursGroup(task.employeeId, task.group, task.state, task.month, task.draft), autosaveDelay)
   hoursTasks.set(`${employee.id}:${group}`, task)
 }
-function inputHours(employee: Employee, field: 'month' | 'weekMin' | 'weekMax', event: Event) {
+function inputHours(employee: Employee, field: 'weekMin' | 'weekMax', event: Event) {
   hoursDrafts[employee.id]![field] = (event.target as HTMLInputElement).value
-  scheduleHours(employee, field === 'month' ? 'month' : 'week')
+  scheduleHours(employee, 'week')
 }
 function toggleEmployeeShift(employee: Employee, shiftId: string) {
   const draft = hoursDrafts[employee.id]!
   draft.eligibleShiftIds = draft.eligibleShiftIds.includes(shiftId) ? draft.eligibleShiftIds.filter(id => id !== shiftId) : [...draft.eligibleShiftIds, shiftId]
   scheduleHours(employee, 'eligibility', true)
 }
-function setHoursFollow(employee: Employee, event: Event) {
-  const draft = hoursDrafts[employee.id]!, checked = (event.target as HTMLInputElement).checked
-  if (draft.followReference && !checked) draft.month = monthReference.value.hours
-  draft.followReference = checked
-  scheduleHours(employee, 'month', true)
-}
 function saveEmployeeHours(employee: Employee) { for (const group of hoursGroups) commitHoursGroup(employee.id, group) }
 function flushHoursTasks(transitionFrom?: string) {
   for (const task of [...hoursTasks.values()]) commitHoursGroup(task.employeeId, task.group, task.state, task.month, task.draft, transitionFrom !== undefined && task.month === transitionFrom)
   cancelHoursTasks()
 }
-function flushMemberAutosave() { flushHoursTasks(); flushReferenceTask() }
+function flushMemberAutosave() { flushHoursTasks() }
 watch(() => props.section, (section, previous) => { if (previous === 'team' && section !== 'team') flushMemberAutosave() }, { flush: 'sync' })
-watch([() => props.state.month, () => monthReference.value.hours, () => monthReference.value.custom], ([month], previous) => {
-  if (previous && month !== previous[0]) {
-    // Commit valid edits against their original document and draft, before
-    // resetting month-dependent displays. Delayed callbacks retain strict guards.
-    flushReferenceTask(); flushHoursTasks(previous[0])
-    for (const employee of props.state.employees) resetEmployeeHours(employee)
-    referenceSaved.value = false
-    referenceEdited = false
-  }
-  referenceDraft.value = monthReference.value.hours; referenceError.value = ''
+watch(() => props.state.month, (month, previous) => {
+  if (month === previous) return
+  // Weekly limits belong to the member. Flush valid drafts before changing
+  // the viewed month, without deriving or resetting either bound.
+  flushHoursTasks(previous)
+  for (const employee of props.state.employees) resetEmployeeHours(employee)
 }, { flush: 'sync' })
 onMounted(() => window.addEventListener('pagehide', flushMemberAutosave, true))
 onBeforeUnmount(() => {
   flushMemberAutosave(); disposed = true
-  cancelHoursTasks(); cancelReferenceTask()
+  cancelHoursTasks()
   window.removeEventListener('pagehide', flushMemberAutosave, true)
 })
 function openLeave(employee: Employee) { leaveEmployeeId.value = employee.id; error.value = ''; feedback.value = '' }
@@ -267,10 +244,6 @@ watch(() => {
   const target = item ? deleteTarget(item.type, item.id) : undefined
   return [props.state, props.state.month, props.section, target, JSON.stringify(target)]
 }, () => { if (pendingDelete.value && !validDeleteRequest(pendingDelete.value)) pendingDelete.value = null }, { flush: 'sync' })
-watch(() => {
-  const item = pendingReferenceReset.value
-  return [props.state, props.state.month, props.section, item && props.state.monthlyReferenceHours?.[item.month], monthReference.value.suggestedHours]
-}, () => { if (pendingReferenceReset.value && !validReferenceReset(pendingReferenceReset.value)) pendingReferenceReset.value = null }, { flush: 'sync' })
 function notice(message: string) { feedback.value = message; error.value = ''; emit('change') }
 function validText(value: string, max: number, label: string, allowEmpty = false) {
   if ((!allowEmpty && !value.trim()) || value.trim().length > max || /[\u0000-\u001f\u007f]/.test(value)) {
@@ -281,64 +254,6 @@ function validText(value: string, max: number, label: string, allowEmpty = false
 function validDate(value: string) {
   const parsed = Date.parse(`${value}T00:00:00Z`)
   return /^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$/.test(value) && Number(value.slice(0, 4)) >= 1 && Number.isFinite(parsed) && new Date(parsed).toISOString().slice(0, 10) === value
-}
-function validHours(value: unknown, max: number, label: string) {
-  if ((typeof value !== 'number' && typeof value !== 'string') || String(value).trim() === '' || !Number.isFinite(Number(value)) || Number(value) < 0 || Number(value) > max) {
-    error.value = `${label}需要填写 0–${max} 小时之间的有效数值。`; return false
-  }
-  return true
-}
-function flushReferenceTask() {
-  const task = referenceTask
-  cancelReferenceTask()
-  if (!task || disposed || props.state !== task.state) return
-  const overrides = props.state.monthlyReferenceHours ?? {}
-  if (!Object.hasOwn(overrides, task.month) && Object.keys(overrides).length >= limits.monthlyReferences) {
-    referenceError.value = `最多保存 ${limits.monthlyReferences} 个月的手动参考值，请先将不再使用的月份恢复自动计算。当前修改未保存。`; return
-  }
-  if (overrides[task.month] !== task.value) {
-    props.state.monthlyReferenceHours = { ...overrides, [task.month]: task.value }
-    emit('change', { silent: true })
-  }
-  if (props.state.month === task.month) { referenceSaved.value = true; referenceEdited = false }
-}
-function scheduleReference(immediate = false) {
-  if (!referenceEdited) return
-  cancelReferenceTask(); referenceError.value = ''
-  const value = Number(referenceDraft.value)
-  if (String(referenceDraft.value).trim() === '' || !Number.isFinite(value) || value < 0 || value > 744) {
-    referenceError.value = '本月参考工时需为 0–744 小时的有效数值，当前修改未保存。'; return
-  }
-  const task: ReferenceTask = { timer: 0 as unknown as ReturnType<typeof setTimeout>, state: props.state, month: props.state.month, value }
-  referenceTask = task
-  if (immediate) flushReferenceTask()
-  else task.timer = setTimeout(() => { if (referenceTask === task) flushReferenceTask() }, autosaveDelay)
-}
-function inputReference(event: Event) {
-  referenceEdited = true; referenceSaved.value = false
-  referenceDraft.value = (event.target as HTMLInputElement).value
-  scheduleReference()
-}
-function requestReferenceReset() {
-  const hours = props.state.monthlyReferenceHours?.[props.state.month]
-  if (hours === undefined) return
-  pendingDelete.value = null
-  pendingReferenceReset.value = { state: props.state, month: props.state.month, section: props.section, hours, automaticHours: monthReference.value.suggestedHours }
-}
-function validReferenceReset(item: ReferenceResetRequest) {
-  return props.state === item.state && props.state.month === item.month && props.section === item.section
-    && props.state.monthlyReferenceHours?.[item.month] === item.hours && monthReference.value.suggestedHours === item.automaticHours
-}
-function resetReferenceHours() {
-  const item = pendingReferenceReset.value
-  pendingReferenceReset.value = null
-  if (!item || !validReferenceReset(item)) return
-  cancelReferenceTask(); referenceError.value = ''; referenceSaved.value = true; referenceEdited = false
-  const overrides = { ...props.state.monthlyReferenceHours }
-  delete overrides[item.month]
-  props.state.monthlyReferenceHours = overrides
-  referenceDraft.value = monthReference.value.hours
-  notice(`${item.month} 已恢复按月工作日 × 8 小时计算参考工时。`)
 }
 function openEditor(kind: 'employee' | 'shift' | 'separation', event?: Event) {
   editorTrigger = event?.currentTarget instanceof HTMLElement ? event.currentTarget : document.activeElement instanceof HTMLElement ? document.activeElement : null
@@ -359,7 +274,7 @@ function closeEditor() {
 }
 function openEmployee(employee?: Employee, event?: Event) {
   if (!employee && props.state.employees.length >= limits.employees) { error.value = `最多支持 ${limits.employees} 位员工，请先删除不再使用的人员。`; return }
-  Object.assign(employeeDraft, employee ? { ...employee, avatar: employee.avatar ?? null, minHoursPerMonth: employee.minHoursPerMonth ?? null, minHoursPerWeek: employee.minHoursPerWeek ?? 0, eligibleShiftIds: [...employee.eligibleShiftIds], unavailableDates: [...employee.unavailableDates] } : { id: '', name: '', role: '', group: '', color: '#d7e8f8', avatar: null, minHoursPerMonth: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: props.state.shifts.map(shift => shift.id), unavailableDates: [] })
+  Object.assign(employeeDraft, employee ? { ...employee, avatar: employee.avatar ?? null, minHoursPerWeek: employee.minHoursPerWeek ?? 0, eligibleShiftIds: [...employee.eligibleShiftIds], unavailableDates: [...employee.unavailableDates] } : { id: '', name: '', role: '', group: '', color: '#d7e8f8', avatar: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: props.state.shifts.map(shift => shift.id), unavailableDates: [] })
   openEditor('employee', event); error.value = ''; feedback.value = ''; pendingDelete.value = null
 }
 function settingsId(prefix: string) { return `${prefix}-${Array.from(crypto.getRandomValues(new Uint8Array(16)), value => value.toString(16).padStart(2, '0')).join('')}` }
@@ -373,7 +288,7 @@ function saveEmployee(profile: { name: string; role: string; group: string; avat
   if (employeeDraft.id && existing < 0) { error.value = '该成员已不存在，请关闭编辑后重新添加。'; return }
   // Basic-profile forms deliberately merge the latest hours, eligibility and leave. Saving
   // an older open profile must never undo card edits or a leave-dialog save.
-  const current = existing >= 0 ? props.state.employees[existing]! : { id: settingsId('employee'), avatar: null, minHoursPerMonth: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, unavailableDates: [], eligibleShiftIds: props.state.shifts.map(shift => shift.id) }
+  const current = existing >= 0 ? props.state.employees[existing]! : { id: settingsId('employee'), avatar: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, unavailableDates: [], eligibleShiftIds: props.state.shifts.map(shift => shift.id) }
   const employee: Employee = { ...current, ...(profile.avatarChanged ? { avatar: profile.avatar } : {}), name: employeeDraft.name.trim(), role: employeeDraft.role.trim(), group: employeeDraft.group.trim(), color: employeeDraft.color, eligibleShiftIds: [...current.eligibleShiftIds], unavailableDates: [...current.unavailableDates] }
   if (existing >= 0) props.state.employees.splice(existing, 1, employee)
   else props.state.employees.push(employee)
@@ -419,7 +334,6 @@ function requestDelete(type: DeleteType, id: string, name: string) {
   if (type === 'shift' && props.state.shifts.length <= 1) { error.value = '至少需要保留一个班次。'; return }
   const target = deleteTarget(type, id)
   if (!target) return
-  pendingReferenceReset.value = null
   pendingDelete.value = { type, id, name, state: props.state, month: props.state.month, section: props.section, target, snapshot: JSON.stringify(target) }
   error.value = ''; feedback.value = ''; editor.value = null
 }
@@ -535,27 +449,10 @@ const weekdayRulesPending = computed(() => {
     <p v-if="feedback" class="sp-settings-message" role="status">✓ {{ feedback }}</p>
     <p v-if="error && editor !== 'shift'" class="sp-settings-message sp-settings-error" role="alert">{{ error }}</p>
     <ConfirmDialog v-if="pendingDelete" :title="deleteTitle" :description="deleteDescription" @confirm="confirmDelete" @cancel="pendingDelete = null" />
-    <ConfirmDialog v-if="pendingReferenceReset" :title="`恢复 ${pendingReferenceReset.month} 的自动参考工时？`" :description="`本月的手动参考值 ${pendingReferenceReset.hours} 小时将恢复为自动计算（当前 ${pendingReferenceReset.automaticHours} 小时）。跟随月参考值的成员最低月工时会随之更新，已有排班保持不变。`" confirm-label="确认恢复" @confirm="resetReferenceHours" @cancel="pendingReferenceReset = null" />
 
     <template v-if="section === 'team'">
-      <header class="sp-settings-heading"><div><p>设置人员的班次资格、月 / 周工时与请假。</p></div><button class="sp-settings-button sp-settings-primary" :disabled="state.employees.length >= limits.employees" @click="openEmployee(undefined, $event)"><span aria-hidden="true">＋</span> 添加员工</button></header>
-      <section class="sp-settings-config-card sp-settings-month-reference" aria-labelledby="sp-reference-heading">
-        <div class="sp-settings-reference-body">
-          <div class="sp-settings-reference-summary">
-            <h3 id="sp-reference-heading" class="sp-settings-card-title">月参考工时 <small aria-label="月参考工时当前月份">{{ state.month }}</small><SourceBadge :state="state" :path="`monthlyReferenceHours.${state.month}`" :pending="!equalHours(referenceDraft, monthReference.hours)" /></h3>
-            <div><strong>{{ monthReference.hours }}</strong><span>小时 / 月</span><span class="sp-settings-label">{{ monthReference.custom ? '手动设置' : '自动计算' }}</span></div>
-            <p>{{ monthReference.workdays }} 个工作日 × 8 小时 = {{ monthReference.suggestedHours }} 小时</p>
-          </div>
-          <form class="sp-settings-reference-form" novalidate @submit.prevent="scheduleReference(true)">
-            <label class="sp-settings-field">本月参考工时<span class="sp-settings-input-unit"><input :value="referenceDraft" type="number" min="0" max="744" step="any" aria-label="手动月参考工时" :aria-invalid="!!referenceError" @input="inputReference" @blur="scheduleReference(true)" /><span>小时</span></span></label>
-            <div class="sp-settings-actions"><button type="button" class="sp-settings-button" :disabled="!monthReference.custom" @click="requestReferenceReset">恢复自动</button></div>
-          </form>
-        </div>
-        <p v-if="referenceError" class="sp-settings-inline-error" role="alert">{{ referenceError }}</p>
-        <p v-else class="sp-settings-auto-status" role="status">{{ referenceSaved ? '月参考工时已自动保存' : '输入后自动保存，仅影响当前月份' }}</p>
-        <p v-if="!monthReference.verified" class="sp-settings-calendar-warning" role="status">日历待核对，当前建议值为估算，可手动设置。</p>
-        <details class="sp-settings-help-details sp-settings-reference-details"><summary>参考工时说明</summary><p>月参考值按本月工作日 × 8 小时计算，包含法定节假日、调休补班及手动日历标记。未单独设置的成员，月最低工时跟随参考值；月份在顶部切换。</p><p>月最低和周最低都是必须满足的条件，设为 0 可关闭对应最低限制。周工时按周一至周日计算，周最高计入已知跨月排班。排班精确到分钟，最低向上、最高向下取整。</p><p v-if="openingWeekInfo" class="sp-settings-boundary-note"><strong>{{ openingWeekInfo.title }}</strong><span v-if="openingWeekInfo.range"> · {{ openingWeekInfo.range }}</span><br />{{ openingWeekInfo.hours }}</p><p>月初有当前成员的上月排班记录（含休息）时，承接同一自然周；上月未排的格子按休息处理，历史安排保持不变。无上月记录及月末部分周，周最低仍取「按本月天数折算值」与「整周最低减去已知月外工时的剩余缺口」中较小的非负值。</p></details>
-      </section>
+      <header class="sp-settings-heading"><div><p>设置人员的班次资格、每周最低 / 最高工时与请假。</p></div><button class="sp-settings-button sp-settings-primary" :disabled="state.employees.length >= limits.employees" @click="openEmployee(undefined, $event)"><span aria-hidden="true">＋</span> 添加员工</button></header>
+      <details class="sp-settings-help-details sp-settings-weekly-help"><summary>每周工时说明</summary><p>每周最低与最高工时按成员分别设置，周最低设为 0 表示不设最低限制。周工时按周一至周日计算，周最高计入已知跨月排班。排班精确到分钟，最低向上、最高向下取整。</p><p v-if="openingWeekInfo" class="sp-settings-boundary-note"><strong>{{ openingWeekInfo.title }}</strong><span v-if="openingWeekInfo.range"> · {{ openingWeekInfo.range }}</span><br />{{ openingWeekInfo.hours }}</p><p>月初有当前成员的上月排班记录（含休息）时，承接同一自然周；上月未排的格子按休息处理，历史安排保持不变。无上月记录及月末部分周，周最低仍取「按本月天数折算值」与「整周最低减去已知月外工时的剩余缺口」中较小的非负值。</p></details>
       <div class="sp-settings-toolbar"><label class="sp-settings-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input v-model="employeeSearch" type="search" placeholder="搜索姓名、岗位或分组" aria-label="搜索员工" /></label><span>{{ state.employees.length }} / {{ limits.employees }} 位团队成员</span></div>
       <p v-if="state.employees.length >= limits.employees" class="sp-settings-hint">已达到 {{ limits.employees }} 人上限，可以编辑现有人员，或删除不再使用的人员后新增。</p>
       <p class="sp-settings-inline-guide">工时与可上班次自动保存；每周最高与最低至少相差 8 小时。无效输入会保留原设置。</p>
@@ -564,10 +461,6 @@ const weekdayRulesPending = computed(() => {
           <div class="sp-settings-person"><EmployeeAvatar class="sp-settings-avatar" :name="employee.name" :color="employee.color" :avatar="employee.avatar" /><div class="sp-settings-person-info"><h3 class="sp-settings-card-title">{{ employee.name }}<SourceBadge :state="state" :path="`employees.${employee.id}`" :pending="hoursDirty(employee)" /></h3><p>{{ employee.role || '未设岗位' }}<span v-if="employee.group"> · {{ employee.group }}</span></p></div><button class="sp-settings-edit" :aria-label="`编辑${employee.name}`" @click="openEmployee(employee, $event)">编辑</button></div>
           <form class="sp-settings-inline-hours" :aria-label="`${employee.name}工时与班次设置`" novalidate @submit.prevent="saveEmployeeHours(employee)">
             <fieldset class="sp-settings-inline-shifts"><legend>可上班次 </legend><div class="sp-settings-inline-shift-options"><button v-for="shift in state.shifts" :key="shift.id" type="button" :class="{ selected: hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id) }" :style="{ '--shift-color': shift.color }" :aria-label="`${employee.name}可上${shift.name}`" :aria-pressed="hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id)" @click="toggleEmployeeShift(employee, shift.id)"><span aria-hidden="true">{{ hoursDrafts[employee.id]!.eligibleShiftIds.includes(shift.id) ? '✓' : '＋' }}</span>{{ shift.name }}</button></div><p v-if="!hoursDrafts[employee.id]!.eligibleShiftIds.length" class="sp-settings-inline-hint">未选择班次，不参与自动排班。</p></fieldset>
-            <div class="sp-settings-inline-month">
-              <label class="sp-settings-checkbox sp-settings-inline-reference"><input :checked="hoursDrafts[employee.id]!.followReference" type="checkbox" :aria-label="`${employee.name}月最低工时跟随月参考值`" @change="setHoursFollow(employee, $event)" /><span>月最低跟随参考值</span></label>
-              <label class="sp-settings-field">每月最低工时<span class="sp-settings-input-unit"><input :value="hoursDrafts[employee.id]!.followReference ? monthReference.hours : hoursDrafts[employee.id]!.month" type="number" min="0" max="744" step="any" :disabled="hoursDrafts[employee.id]!.followReference" :aria-label="`${employee.name}每月最低工时`" @input="inputHours(employee, 'month', $event)" @blur="scheduleHours(employee, 'month', true)" /><span>小时</span></span></label>
-            </div>
             <div class="sp-settings-inline-week">
               <label class="sp-settings-field">每周最低工时<span class="sp-settings-input-unit"><input :value="hoursDrafts[employee.id]!.weekMin" type="number" min="0" max="168" step="any" :aria-label="`${employee.name}每周最低工时`" :aria-invalid="!!hoursDrafts[employee.id]!.errors.week" @input="inputHours(employee, 'weekMin', $event)" @blur="scheduleHours(employee, 'week', true)" /><span>小时</span></span></label>
               <label class="sp-settings-field">每周最高工时<span class="sp-settings-input-unit"><input :value="hoursDrafts[employee.id]!.weekMax" type="number" min="0" max="168" step="any" :aria-label="`${employee.name}每周最高工时`" :aria-invalid="!!hoursDrafts[employee.id]!.errors.week" @input="inputHours(employee, 'weekMax', $event)" @blur="scheduleHours(employee, 'week', true)" /><span>小时</span></span></label>
@@ -605,7 +498,7 @@ const weekdayRulesPending = computed(() => {
         <button id="sp-rule-tab-team" type="button" role="tab" :aria-selected="ruleCategory === 'team'" aria-controls="sp-rule-panel-team" :tabindex="ruleCategory === 'team' ? 0 : -1" @click="selectRuleCategory('team')">团队规则</button>
       </div>
       <section id="sp-rule-panel-personal" v-show="ruleCategory === 'personal'" class="sp-settings-rule-panel" role="tabpanel" aria-labelledby="sp-rule-tab-personal" tabindex="-1">
-      <p class="sp-settings-rule-category-note">按每位成员分别检查。月 / 周工时、可上班次和请假，在「成员管理」中设置。</p>
+      <p class="sp-settings-rule-category-note">按每位成员分别检查。每周工时、可上班次和请假，在「成员管理」中设置。</p>
       <form class="sp-settings-config-card" aria-label="个人休息与连续工作规则" @submit.prevent="savePersonalRules">
         <div class="sp-settings-rule"><div><span class="sp-settings-rule-number">01</span><h3>班间充分休息</h3><p>上个班结束到下个班开始，至少保留这段休息时间。</p></div><label class="sp-settings-input-unit"><input v-model.number="rulesDraft.minRestHours" type="number" min="0" :max="limits.minRestHours" step="any" required aria-label="班间最短休息小时数" /><span>小时</span></label></div>
         <div class="sp-settings-rule"><div><span class="sp-settings-rule-number">02</span><h3>控制连续工作</h3><p>达到连续工作上限后，应安排休息或请假日。</p></div><label class="sp-settings-input-unit"><input v-model.number="rulesDraft.maxConsecutiveDays" type="number" min="1" max="31" step="1" required aria-label="最大连续工作天数" /><span>天</span></label></div>
@@ -692,10 +585,9 @@ const weekdayRulesPending = computed(() => {
 .sp-settings-editor-status { display: flex; justify-content: flex-end; margin-bottom: 12px; }
 .sp-settings-editor-status:empty { display: none; }
 .sp-settings-card-feedback { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; min-width: 0; }
-.sp-settings-form-footer .sp-settings-card-feedback p { margin: 0; }
-.sp-settings-reference-heading{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap}.sp-settings-reference-heading>div{flex:1;min-width:180px}.sp-settings-reference-heading p{font-size:12px;line-height:1.7;color:#758a93;margin-top:7px}.sp-settings-reference-heading>.sp-settings-field{width:190px;max-width:100%}.sp-settings-reference-body{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin-top:20px;flex-wrap:wrap}.sp-settings-reference-summary{flex:1;min-width:220px}.sp-settings-reference-summary>div{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}.sp-settings-reference-summary strong{font-size:32px;font-variant-numeric:tabular-nums;font-weight:650;color:#245b4e;line-height:1.3}.sp-settings-reference-summary>div>span:not(.sp-settings-label){font-size:12px;color:#7a8f97}.sp-settings-reference-summary p{font-size:12px;color:#71878e;line-height:1.8;margin-top:8px}.sp-settings-reference-summary p+p{font-size:11px;margin-top:1px}.sp-settings-reference-form{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap;max-width:100%}.sp-settings-reference-form>.sp-settings-field{width:180px;max-width:100%;flex:1}.sp-settings-reference-form>.sp-settings-actions{flex-wrap:wrap}.sp-settings-calendar-warning{margin-top:16px!important;background:#fff8e9;border:1px solid #eedcb3;border-radius:8px;color:#957542;font-size:12px;line-height:1.7;padding:10px 12px}.sp-settings-month-reference>.sp-settings-hint{padding-top:12px;margin-top:16px!important;border-top:1px solid #edf1f2;color:#7b9096}.sp-settings-month-minimum>.sp-settings-hint{margin-top:0!important;font-weight:400}.sp-settings-month-minimum>.sp-settings-checkbox{font-weight:400;align-items:flex-start;min-height:24px}.sp-settings-month-minimum .sp-settings-checkbox input{width:16px;height:16px;min-height:16px;padding:0;margin-top:2px}.sp-settings-employee-hours{display:grid;gap:9px;margin:0 0 16px;font-size:12px}.sp-settings-employee-hours>div{display:flex;justify-content:space-between;align-items:baseline;gap:6px;flex-wrap:wrap}.sp-settings-employee-hours dt{color:#83979f}.sp-settings-employee-hours dd{margin:0;color:#4d6973;text-align:right;font-variant-numeric:tabular-nums}.sp-settings-employee-hours small{color:#859b95;font-size:10px;white-space:nowrap;margin-left:4px}
-@media(max-width:720px){.sp-settings-reference-body{gap:18px}.sp-settings-reference-summary{min-width:0;flex-basis:100%}.sp-settings-reference-form{width:100%}.sp-settings-reference-form>.sp-settings-field{min-width:120px}.sp-settings-reference-heading>.sp-settings-field{width:100%}.sp-settings-reference-summary strong{font-size:29px}}
-@media(max-width:520px){.sp-settings-employee-form-grid{grid-template-columns:1fr!important}.sp-settings-reference-form>.sp-settings-field{flex-basis:100%}.sp-settings-reference-form>.sp-settings-actions{width:100%}.sp-settings-reference-form>.sp-settings-actions>.sp-settings-button{flex:1}}
+.sp-settings-form-footer .sp-settings-card-feedback p { margin: 0; }.sp-settings-employee-hours{display:grid;gap:9px;margin:0 0 16px;font-size:12px}.sp-settings-employee-hours>div{display:flex;justify-content:space-between;align-items:baseline;gap:6px;flex-wrap:wrap}.sp-settings-employee-hours dt{color:#83979f}.sp-settings-employee-hours dd{margin:0;color:#4d6973;text-align:right;font-variant-numeric:tabular-nums}.sp-settings-employee-hours small{color:#859b95;font-size:10px;white-space:nowrap;margin-left:4px}
+
+@media(max-width:520px){.sp-settings-employee-form-grid{grid-template-columns:1fr!important}}
 .sp-settings-shift-top h3{overflow-wrap:anywhere}.sp-settings-shift-mark{min-width:44px;min-height:44px;height:auto!important;max-width:96px;width:auto!important;padding:8px;overflow-wrap:anywhere;font-size:15px!important;text-align:center}
 .sp-settings{color:#263c45;font-size:14px;max-width:1440px;margin:0 auto}.sp-settings *{box-sizing:border-box}.sp-settings button,.sp-settings input{font:inherit}.sp-settings button{cursor:pointer;transition:background .15s,box-shadow .15s}.sp-settings button:disabled{cursor:not-allowed;opacity:.38}.sp-settings input:focus-visible,.sp-settings button:focus-visible{outline:3px solid #99ddd4;outline-offset:3px}.sp-settings h2,.sp-settings h3,.sp-settings p{margin:0}.sp-settings h2{font-size:19px;font-weight:650;line-height:1.4;letter-spacing:-.5px}.sp-settings h3{font-size:15px;font-weight:650}.sp-settings-heading{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:18px}.sp-settings-heading p{color:#829099;line-height:1.7;margin-top:0;font-size:13px}.sp-settings-button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:40px;white-space:nowrap;padding:9px 16px;border:1px solid #dce5e8;border-radius:9px;background:#fff;color:#4e626b;font-weight:600!important;font-size:13px!important}.sp-settings-button:hover{background:#f1f6f5}.sp-settings-primary{background:#245b4e;border-color:#245b4e;color:#fff;box-shadow:0 3px 8px #245b4e14}.sp-settings-primary:hover{background:#1d4a3f}.sp-settings-actions{display:flex;gap:9px}.sp-settings-message{padding:13px 16px!important;margin-bottom:18px!important;border:1px solid #bee5d8;border-radius:10px;background:#ecf9f3;color:#247863;line-height:1.6}.sp-settings-error{background:#fff1ef;color:#ba5145;border-color:#f3cec5}.sp-settings-danger{background:#b95047;color:#fff;border-color:#b95047}.sp-settings-danger:hover{background:#a53f37}.sp-settings-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}.sp-settings-toolbar>span{font-size:12px;color:#8a979c}.sp-settings-search{display:flex;align-items:center;gap:9px;background:#fff;border:1px solid #e0e7eb;border-radius:9px;padding:9px 12px;max-width:350px;flex:1}.sp-settings-search svg{width:17px;fill:none;stroke:#93a3aa;stroke-width:1.7;flex-shrink:0}.sp-settings-search input{border:0;background:none;width:100%;min-width:0;font-size:13px;color:#344d55}.sp-settings-search input:focus-visible{outline:none}.sp-settings-search:focus-within{border-color:#245b4e;box-shadow:0 0 0 3px #245b4e10}.sp-settings-editor,.sp-settings-config-card{padding:24px;border:1px solid #e1e9eb;border-radius:14px;background:#fff;margin-bottom:20px}.sp-settings-editor{border-color:#96d5cc;box-shadow:0 3px 16px #174d4010}.sp-settings-card-heading{display:flex;align-items:center;justify-content:space-between;gap:15px;margin-bottom:22px}.sp-settings-card-heading p{font-size:12px;color:#83939b;margin-top:7px}.sp-settings-icon-button{border:0;background:#f1f5f5;border-radius:8px;width:32px;height:32px;color:#698089;font-size:22px!important}.sp-settings-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.sp-settings-field{display:flex;flex-direction:column;gap:9px;font-size:12px;font-weight:600;color:#657982;min-width:0}.sp-settings-field input{padding:10px 12px;border:1px solid #dfe7e9;border-radius:8px;width:100%;min-width:0;background:#fcfdfd;color:#304d56;min-height:40px;font-weight:400}.sp-settings-field input:focus{border-color:#47b5a8;outline:none;box-shadow:0 0 0 3px #245b4e10}.sp-settings-input-unit{display:flex;align-items:center;gap:8px;border:1px solid #dfe7e9;border-radius:8px;min-height:40px;background:#fcfdfd;padding-right:12px;min-width:0}.sp-settings-input-unit input{border:0;background:none;width:100%;min-width:0;padding:10px 12px;color:#304d56}.sp-settings-input-unit input:focus-visible{outline:none;box-shadow:none}.sp-settings-input-unit:focus-within{border-color:#47b5a8;box-shadow:0 0 0 3px #245b4e10}.sp-settings-input-unit>span{font-size:12px;color:#93a1a7;white-space:nowrap;font-weight:400}.sp-settings-fieldset{border:0;padding:0;margin:25px 0 0;min-width:0}.sp-settings-fieldset legend{font-size:12px;color:#657982;font-weight:600;margin-bottom:12px}.sp-settings-choice-row{display:flex;gap:12px;flex-wrap:wrap}.sp-settings-checkbox{display:flex;gap:8px;align-items:center;color:#49646a;line-height:1.5;font-size:13px}.sp-settings-checkbox input{accent-color:#245b4e;width:16px;height:16px;flex-shrink:0;margin:0}.sp-settings-checkbox small{color:#99a5a9;font-size:11px}.sp-settings-dot{width:9px;height:9px;display:inline-block;border-radius:50%;box-shadow:0 0 0 1px #364b4215}.sp-settings-hint{font-size:12px;color:#94a2a8;line-height:1.7;margin-top:10px!important}.sp-settings-leave-row{display:flex;gap:12px;align-items:flex-end}.sp-settings-leave-row>.sp-settings-field{flex:1}.sp-settings-leave-dates{display:flex;flex-wrap:wrap;gap:6px;max-height:160px;overflow:auto;margin-top:14px}.sp-settings-leave-dates button{background:#f0f7f5;border:1px solid #dceae4;padding:5px 8px;border-radius:5px;color:#5b7a70;font-size:11px}.sp-settings-leave-dates span{margin-left:4px}.sp-settings-leave-summary{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;color:#8a9a9f}.sp-settings-leave-summary small{font-size:11px}.sp-settings-link{border:0;background:none;color:#245b4e;padding:4px;font-size:12px!important}.sp-settings-form-footer{display:flex;align-items:center;justify-content:space-between;gap:18px;padding-top:21px;margin-top:22px;border-top:1px solid #edf1f2}.sp-settings-form-footer p{font-size:12px;color:#8b9ca2;line-height:1.7}.sp-settings-employee-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:17px}.sp-settings-employee-card,.sp-settings-shift-card{background:#fff;border:1px solid #e3e9ec;border-radius:14px;padding:20px;min-width:0;box-shadow:0 2px 3px #1a3a4002}.sp-settings-person,.sp-settings-shift-top{display:flex;align-items:center;gap:12px}.sp-settings-person>div,.sp-settings-shift-top>div{min-width:0}.sp-settings-person h3{overflow-wrap:anywhere}.sp-settings-person p,.sp-settings-shift-top p{font-size:11px;color:#94a1a8;margin-top:5px;line-height:1.6}.sp-settings-edit{margin-left:auto;background:none;border:0;color:#63958d;font-size:12px!important;padding:6px 0 6px 8px;flex-shrink:0}.sp-settings-edit:hover{color:#245b4e}.sp-settings-badges{display:flex;flex-wrap:wrap;gap:6px;margin:19px 0 18px;min-height:23px}.sp-settings-badges>span{font-size:11px;padding:5px 10px;border-radius:5px;color:#4c6669;background:#eff3f4;line-height:1}.sp-settings-card-bottom{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid #f0f3f4;padding-top:14px;font-size:11px;color:#87979e;line-height:1.5}.sp-settings-remove{background:none;border:0;color:#b4bec2;padding:4px 0 4px 8px;font-size:11px!important}.sp-settings-remove:hover:not(:disabled){color:#c36959}.sp-settings-empty{padding:60px 20px;text-align:center;color:#648077;background:#fff;border:1px dashed #d9e3e5;border-radius:14px}.sp-settings-empty p{font-size:13px;margin-top:12px;color:#91a1a7}.sp-settings-colors{display:flex;align-items:center;gap:8px;min-height:40px;flex-wrap:wrap}.sp-settings-colors>button{width:27px;height:27px;border-radius:50%;border:2px solid transparent;color:#446960;padding:0;flex-shrink:0}.sp-settings-colors>button.active{box-shadow:0 0 0 2px #fff,0 0 0 3px #245b4e}.sp-settings-custom-color input{width:30px;height:30px;min-height:0;padding:2px;cursor:pointer;border-radius:50%}.sp-settings-soft-note{background:#edf6f3;border:1px solid #dcece6;border-radius:10px;padding:14px 17px;font-size:12px;color:#5d7c72;line-height:1.8;margin-top:20px!important}.sp-settings-soft-note p{margin-top:6px}.sp-settings-shift-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.sp-settings-shift-mark{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:650;flex-shrink:0}.sp-settings-shift-time{font-size:28px;color:#314b54;font-weight:600;margin:24px 0;letter-spacing:-.7px;white-space:nowrap}.sp-settings-shift-time>span{font-size:20px;color:#b6c3c7;margin:0 8px}.sp-settings-shift-time>small{font-size:10px;color:#8a9a9f;font-weight:400;vertical-align:top;letter-spacing:0;margin-left:5px}.sp-settings-footnote{font-size:12px;color:#8e9da4;margin-top:22px!important;line-height:1.8}.sp-settings-rule{display:flex;align-items:center;justify-content:space-between;gap:28px;padding:25px 0;border-bottom:1px solid #edf1f2}.sp-settings-rule:first-child{padding-top:2px}.sp-settings-rule:nth-child(3){border-bottom:0}.sp-settings-rule>div{position:relative;padding-left:42px;flex:1}.sp-settings-rule-number{position:absolute;left:0;top:0;background:#eaf5f1;color:#68998c;border-radius:8px;padding:7px;font-size:11px}.sp-settings-rule h3{padding-top:5px}.sp-settings-rule p{font-size:12px;color:#8b9aa1;line-height:1.8;margin-top:8px}.sp-settings-rule>.sp-settings-input-unit{width:120px;flex-shrink:0}.sp-settings-switch{display:flex;align-items:center;gap:9px;position:relative;cursor:pointer;flex-shrink:0}.sp-settings-switch input{position:absolute;left:0;top:0;opacity:0;width:40px;height:23px}.sp-settings-switch>span{pointer-events:none;width:40px;height:23px;background:#d4dee1;border-radius:20px;position:relative;transition:background .2s}.sp-settings-switch>span:after{content:'';position:absolute;width:17px;height:17px;top:3px;left:3px;border-radius:50%;background:white;box-shadow:0 1px 3px #133e4229;transition:transform .2s}.sp-settings-switch input:checked+span{background:#245b4e}.sp-settings-switch input:checked+span:after{transform:translateX(17px)}.sp-settings-switch input:focus-visible+span{outline:3px solid #99ddd4;outline-offset:3px}.sp-settings-switch small{font-size:11px;color:#8b9da3}.sp-settings-explanation{display:flex;align-items:flex-start;gap:17px;padding:22px 24px;background:#eef4f7;border:1px solid #dfe9ee;border-radius:14px;color:#668293}.sp-settings-explanation svg{width:26px;height:26px;stroke:#7a9ba7;fill:none;stroke-width:1.5;flex-shrink:0}.sp-settings-explanation h3{font-size:13px}.sp-settings-explanation p{font-size:12px;line-height:1.9;margin-top:8px}.sp-settings-label{font-size:10px;color:#8e9fa6;background:#f2f6f6;padding:5px 8px;border-radius:5px;white-space:nowrap}.sp-settings-full-field{grid-column:1/-1}.sp-settings input[type=number]{appearance:textfield}.sp-settings input[type=number]::-webkit-inner-spin-button{opacity:.4}
 .sp-settings-separation>.sp-settings-card-heading{align-items:flex-start}.sp-settings-separation>.sp-settings-card-heading p{line-height:1.8}.sp-settings-separation-editor{padding:20px;border:1px solid #c9e3dc;background:#f8fcfa;border-radius:12px;margin-bottom:18px}.sp-settings-selection-count{margin-left:12px;font-weight:400;color:#245b4e}.sp-settings-member-options{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;max-height:285px;overflow:auto;padding:2px}.sp-settings-member-option{padding:10px 12px;background:#fff;border:1px solid #e0e8e6;border-radius:8px;min-width:0;align-items:flex-start;cursor:pointer}.sp-settings-member-option.selected{border-color:#89caba;background:#edf8f3}.sp-settings-member-option input{margin-top:2px}.sp-settings-member-option>span{overflow-wrap:anywhere}.sp-settings-member-option small{display:block!important;margin-top:3px;line-height:1.5}.sp-settings-specific-shifts{padding:15px 0 0}.sp-settings-separation-list{display:grid;gap:12px}.sp-settings-separation-group{border:1px solid #e2eae7;border-radius:10px;padding:16px 18px;background:#fcfefd;min-width:0}.sp-settings-separation-title{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.sp-settings-separation-title h3{overflow-wrap:anywhere}.sp-settings-separation-title>.sp-settings-actions{margin-left:auto}.sp-settings-separation-names{font-size:13px;color:#50756c;margin-top:12px!important;line-height:1.8;overflow-wrap:anywhere}.sp-settings-separation-scope{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:11px;color:#8b9b98;margin-top:9px!important;line-height:1.7}.sp-settings-separation-scope>span{color:#68a493}
@@ -711,15 +603,14 @@ const weekdayRulesPending = computed(() => {
 @media(prefers-reduced-motion:reduce){.sp-settings button,.sp-settings-switch>span,.sp-settings-switch>span:after{transition:none}}
 .sp-settings-shift-allowance{margin:-8px 0 20px!important;font-size:12px;color:#81908f;line-height:1.8}.sp-settings-shift-allowance strong{color:#966c23;margin-left:8px;font-weight:600}.sp-settings-shift-allowance>span{font-size:11px}
 
-.sp-settings-inline-guide{font-size:12px;color:#788d88;line-height:1.85;margin:0 0 18px!important}.sp-settings-inline-hours{margin-top:20px}.sp-settings-inline-shifts{border:0;padding:0;margin:0 0 18px;min-width:0}.sp-settings-inline-shifts legend{font-size:11px;font-weight:600;color:#6b8278;margin-bottom:10px}.sp-settings-inline-shift-options{display:flex;flex-wrap:wrap;gap:6px}.sp-settings-inline-shift-options>button{display:inline-flex;align-items:center;gap:5px;border:1px solid #dce7e1;border-radius:6px;background:#f8fbf9;color:#809389;font-size:11px;padding:7px 9px;min-height:34px;max-width:100%;overflow-wrap:anywhere;text-align:left}.sp-settings-inline-shift-options>button.selected{background:var(--shift-color);border-color:#a8c5b8;color:#3f6c58}.sp-settings-inline-shift-options>button>span{font-size:12px;flex-shrink:0}.sp-settings-inline-hint{font-size:10px;line-height:1.8;color:#8a9a91;margin-top:8px!important}.sp-settings-inline-month{padding-top:15px;border-top:1px solid #edf1ee}.sp-settings-inline-reference{font-size:11px;line-height:1.6;margin-bottom:13px}.sp-settings-inline-reference input{width:15px;height:15px}.sp-settings-inline-hours .sp-settings-field{font-size:11px;gap:7px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:38px;padding-right:9px}.sp-settings-inline-hours .sp-settings-input-unit input{padding:9px 10px;font-size:13px}.sp-settings-inline-hours input:disabled{color:#8f9f98;background:#f0f5f2;cursor:default}.sp-settings-inline-hours .sp-settings-input-unit>span{font-size:10px}.sp-settings-inline-week{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.sp-settings-inline-error{font-size:11px;line-height:1.75;color:#ab5745;background:#fff3ee;border:1px solid #f2d9cc;border-radius:6px;padding:9px 10px;margin-top:12px!important}.sp-settings-inline-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:14px;padding-top:12px;border-top:1px dashed #dce6df}.sp-settings-inline-actions>span{font-size:10px;color:#967549}.sp-settings-inline-actions>div{display:flex;gap:6px;margin-left:auto}.sp-settings-inline-actions .sp-settings-button{padding:7px 10px;font-size:11px!important;min-height:34px}.sp-settings-member-bottom{margin-top:18px}.sp-settings-leave-trigger{display:inline-flex;align-items:center;gap:7px;border:0;padding:5px 0;background:none;color:#5c8a74;font-size:11px!important;min-height:30px;text-align:left}.sp-settings-leave-trigger svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.6;fill:none;flex-shrink:0}.sp-settings-leave-trigger:hover{color:#245b4e}
+.sp-settings-weekly-help{margin:0 0 16px!important;padding:0 0 12px;border-top:0;border-bottom:1px solid #e7ede8}.sp-settings-inline-guide{font-size:12px;color:#788d88;line-height:1.85;margin:0 0 18px!important}.sp-settings-inline-hours{margin-top:20px}.sp-settings-inline-shifts{border:0;padding:0;margin:0 0 18px;min-width:0}.sp-settings-inline-shifts legend{font-size:11px;font-weight:600;color:#6b8278;margin-bottom:10px}.sp-settings-inline-shift-options{display:flex;flex-wrap:wrap;gap:6px}.sp-settings-inline-shift-options>button{display:inline-flex;align-items:center;gap:5px;border:1px solid #dce7e1;border-radius:6px;background:#f8fbf9;color:#809389;font-size:11px;padding:7px 9px;min-height:34px;max-width:100%;overflow-wrap:anywhere;text-align:left}.sp-settings-inline-shift-options>button.selected{background:var(--shift-color);border-color:#a8c5b8;color:#3f6c58}.sp-settings-inline-shift-options>button>span{font-size:12px;flex-shrink:0}.sp-settings-inline-hint{font-size:10px;line-height:1.8;color:#8a9a91;margin-top:8px!important}.sp-settings-inline-hours .sp-settings-field{font-size:11px;gap:7px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:38px;padding-right:9px}.sp-settings-inline-hours .sp-settings-input-unit input{padding:9px 10px;font-size:13px}.sp-settings-inline-hours input:disabled{color:#8f9f98;background:#f0f5f2;cursor:default}.sp-settings-inline-hours .sp-settings-input-unit>span{font-size:10px}.sp-settings-inline-week{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:13px}.sp-settings-inline-error{font-size:11px;line-height:1.75;color:#ab5745;background:#fff3ee;border:1px solid #f2d9cc;border-radius:6px;padding:9px 10px;margin-top:12px!important}.sp-settings-inline-actions{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-top:14px;padding-top:12px;border-top:1px dashed #dce6df}.sp-settings-inline-actions>span{font-size:10px;color:#967549}.sp-settings-inline-actions>div{display:flex;gap:6px;margin-left:auto}.sp-settings-inline-actions .sp-settings-button{padding:7px 10px;font-size:11px!important;min-height:34px}.sp-settings-member-bottom{margin-top:18px}.sp-settings-leave-trigger{display:inline-flex;align-items:center;gap:7px;border:0;padding:5px 0;background:none;color:#5c8a74;font-size:11px!important;min-height:30px;text-align:left}.sp-settings-leave-trigger svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.6;fill:none;flex-shrink:0}.sp-settings-leave-trigger:hover{color:#245b4e}
 @media(max-width:720px){.sp-settings-inline-hours .sp-settings-input-unit input{font-size:16px}.sp-settings-inline-hours{margin-top:18px}.sp-settings-inline-shift-options>button{min-height:38px;padding:8px 10px}.sp-settings-inline-actions .sp-settings-button{min-height:38px}.sp-settings-leave-trigger{min-height:36px;font-size:12px!important}.sp-settings-inline-guide{font-size:11px}.sp-settings-inline-week{gap:12px}}
 .sp-settings-weight-example-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap}.sp-settings-weight-example-heading>div{flex:1;min-width:180px}.sp-settings-weight-example-heading>.sp-settings-field{width:185px;flex-shrink:0}.sp-settings-weight-example-heading>.sp-settings-field input{font-variant-numeric:tabular-nums}@media(max-width:720px){.sp-settings-weight-example-heading{gap:13px}.sp-settings-weight-example-heading>.sp-settings-field{width:100%}}
 .sp-settings-staffing-mode{grid-column:1/-1;border:0;padding:0;margin:0;min-width:0}.sp-settings-staffing-mode legend{font-size:12px;color:#657982;font-weight:600;margin-bottom:10px}.sp-settings-staffing-options{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.sp-settings-staffing-options>label{display:flex;align-items:flex-start;gap:10px;padding:13px 14px;border:1px solid #dfe8e4;border-radius:9px;background:#fbfdfc;color:#728a80;cursor:pointer;min-width:0}.sp-settings-staffing-options>label.selected{border-color:#83b5a2;background:#edf6f1;color:#2c654e}.sp-settings-staffing-options input{accent-color:#245b4e;width:16px;height:16px;flex-shrink:0;margin:1px 0 0}.sp-settings-staffing-options strong{display:block;font-size:12px;font-weight:600;line-height:1.5}.sp-settings-staffing-options small{display:block;margin-top:5px;font-size:11px;line-height:1.7;color:#83998f}.sp-settings-staffing-options>label:focus-within{outline:3px solid #99ddd4;outline-offset:2px}@media(max-width:720px){.sp-settings-staffing-options{gap:8px}.sp-settings-staffing-options>label{padding:12px 9px;gap:7px}.sp-settings-staffing-options strong{font-size:11px}.sp-settings-staffing-options small{font-size:10px}.sp-settings-staffing-mode legend{font-size:11px}}
-.sp-settings-current-month{display:flex;flex-direction:column;gap:5px;flex-shrink:0;padding:9px 12px;border-radius:7px;background:#f1f7f3;color:#56776b;line-height:1.5;margin:0!important}.sp-settings-current-month strong{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}.sp-settings-current-month>span{font-size:10px;color:#8ba095}@media(max-width:720px){.sp-settings-current-month{flex-basis:100%;flex-direction:row;justify-content:space-between;align-items:center;padding:9px 10px}}
-.sp-settings-month-reference{padding:18px 20px}.sp-settings-month-reference>.sp-settings-reference-body{margin-top:0;align-items:center;gap:20px}.sp-settings-reference-summary h3{font-size:13px;font-weight:600;margin-bottom:7px}.sp-settings-reference-summary h3 small{font-size:11px;font-weight:400;color:#95a49e;margin-left:9px}.sp-settings-month-reference .sp-settings-reference-summary strong{font-size:28px}.sp-settings-month-reference .sp-settings-reference-summary p{font-size:11px;margin-top:5px}.sp-settings-month-reference .sp-settings-reference-form>.sp-settings-field{width:155px}.sp-settings-month-reference .sp-settings-reference-form{gap:10px}.sp-settings-month-reference .sp-settings-calendar-warning{font-size:11px;padding:8px 10px;margin-top:12px!important}.sp-settings-help-details{font-size:11px;line-height:1.85;color:#809389;margin-top:14px;padding-top:12px;border-top:1px solid #e7ede8}.sp-settings-help-details>summary{cursor:pointer;color:#587d6c;font-size:12px;line-height:1.6;padding:4px 0;min-height:27px;width:fit-content;max-width:100%}.sp-settings-help-details>summary:focus-visible{outline:3px solid #99ddd4;outline-offset:3px;border-radius:3px}.sp-settings-help-details>p{margin-top:10px!important;font-size:11px;line-height:1.9}.sp-settings-help-details>.sp-settings-soft-note{margin-top:10px!important;padding:12px 14px;background:#f8fbf9;border-color:#e5eee8}.sp-settings-reference-details{margin-top:13px;padding-top:9px}.sp-settings-calculation-details{margin-top:16px}.sp-settings-calculation-details>.sp-settings-weight-formula{margin-top:13px}.sp-settings-bottom-help{padding:0;border:0;margin-top:15px}.sp-settings-bottom-help .sp-settings-footnote{margin-top:8px!important}@media(max-width:720px){.sp-settings-month-reference{padding:15px}.sp-settings-month-reference>.sp-settings-reference-body{gap:13px}.sp-settings-month-reference .sp-settings-reference-summary{flex-basis:100%}.sp-settings-reference-form>.sp-settings-field{flex-basis:100%!important}.sp-settings-reference-form>.sp-settings-actions{width:100%}.sp-settings-reference-form>.sp-settings-actions>.sp-settings-button{flex:1}.sp-settings-reference-details{margin-top:12px}.sp-settings-help-details>summary{min-height:32px}.sp-settings-help-details>.sp-settings-soft-note{padding:11px}}
+.sp-settings-current-month{display:flex;flex-direction:column;gap:5px;flex-shrink:0;padding:9px 12px;border-radius:7px;background:#f1f7f3;color:#56776b;line-height:1.5;margin:0!important}.sp-settings-current-month strong{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums}.sp-settings-current-month>span{font-size:10px;color:#8ba095}@media(max-width:720px){.sp-settings-current-month{flex-basis:100%;flex-direction:row;justify-content:space-between;align-items:center;padding:9px 10px}}.sp-settings-help-details{font-size:11px;line-height:1.85;color:#809389;margin-top:14px;padding-top:12px;border-top:1px solid #e7ede8}.sp-settings-help-details>summary{cursor:pointer;color:#587d6c;font-size:12px;line-height:1.6;padding:4px 0;min-height:27px;width:fit-content;max-width:100%}.sp-settings-help-details>summary:focus-visible{outline:3px solid #99ddd4;outline-offset:3px;border-radius:3px}.sp-settings-help-details>p{margin-top:10px!important;font-size:11px;line-height:1.9}.sp-settings-help-details>.sp-settings-soft-note{margin-top:10px!important;padding:12px 14px;background:#f8fbf9;border-color:#e5eee8}.sp-settings-calculation-details{margin-top:16px}.sp-settings-calculation-details>.sp-settings-weight-formula{margin-top:13px}.sp-settings-bottom-help{padding:0;border:0;margin-top:15px}.sp-settings-bottom-help .sp-settings-footnote{margin-top:8px!important}@media(max-width:720px){.sp-settings-help-details>summary{min-height:32px}.sp-settings-help-details>.sp-settings-soft-note{padding:11px}}
 .sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:110px}@media(max-width:720px){.sp-settings-editor,.sp-settings-separation-editor{scroll-margin-top:150px}}
 .sp-settings-rule-tabs{display:flex;gap:4px;padding:4px;background:#eaf0ec;border:1px solid #e0e8e2;border-radius:10px;width:fit-content;max-width:100%;margin-bottom:16px}.sp-settings-rule-tabs>button{border:1px solid transparent;border-radius:7px;min-height:42px;padding:10px 25px;background:transparent;color:#72897d;font-size:13px!important;font-weight:600;cursor:pointer}.sp-settings-rule-tabs>button[aria-selected=true]{background:#fff;color:#285e4f;border-color:#dce6df}.sp-settings-rule-tabs>button:hover{color:#285e4f}.sp-settings-rule-tabs>button:focus-visible{outline:3px solid #99ddd4;outline-offset:2px}.sp-settings-rule-category-note{font-size:12px;line-height:1.8;color:#7e9387;margin:0 0 18px!important}.sp-settings-rule-panel{min-width:0;scroll-margin-top:110px}.sp-settings-rule-panel:focus-visible{outline:3px solid #99ddd4;outline-offset:5px;border-radius:8px}@media(max-width:720px){.sp-settings-rule-tabs{width:100%}.sp-settings-rule-tabs>button{flex:1;min-height:44px;padding:10px 12px}.sp-settings-rule-category-note{font-size:11px;margin-bottom:15px!important}.sp-settings-rule-panel{scroll-margin-top:150px}}
 .sp-settings-staffing-summary{display:flex;flex-direction:column;align-items:flex-start;gap:6px;min-width:0}.sp-settings-staffing-badge{display:inline-flex;align-items:center;gap:4px;padding:7px 9px;border:1px solid #c8e2d2;border-radius:6px;background:#edf7f0;color:#28644c;font-size:12px;font-weight:600;line-height:1.5;max-width:100%;flex-wrap:wrap}.sp-settings-staffing-badge.is-fixed{background:#edf4fc;border-color:#cdddf0;color:#3c6191}.sp-settings-staffing-badge strong{font-size:13px;font-variant-numeric:tabular-nums}.sp-settings-staffing-summary>small{font-size:10px;line-height:1.6;color:#81958a}.sp-settings-shift-card>.sp-settings-card-bottom>.sp-settings-remove{flex-shrink:0;min-height:36px}@media(max-width:720px){.sp-settings-staffing-badge{font-size:12px;padding:7px 9px}.sp-settings-shift-card>.sp-settings-card-bottom>.sp-settings-remove{min-height:44px}}
-.sp-settings-auto-status{font-size:11px;color:#6d8b78;line-height:1.6;margin:8px 0 0!important;min-height:18px}.sp-settings-config-card,.sp-settings-editor{padding:18px;margin-bottom:16px}.sp-settings-employee-card,.sp-settings-shift-card{padding:16px}.sp-settings-employee-grid,.sp-settings-shift-grid{gap:14px}.sp-settings-card-heading{margin-bottom:16px}.sp-settings-form-grid{gap:15px}.sp-settings-inline-hours{margin-top:14px}.sp-settings-inline-shifts{margin-bottom:13px}.sp-settings-inline-shifts legend{margin-bottom:8px}.sp-settings-inline-month{padding-top:12px}.sp-settings-inline-week{margin-top:11px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:40px}.sp-settings-inline-shift-options>button{min-height:40px}.sp-settings-member-bottom{margin-top:12px}.sp-settings-person{gap:10px}.sp-settings-person .sp-settings-edit,.sp-settings-shift-top .sp-settings-edit{min-height:40px;min-width:40px}.sp-settings-member-bottom .sp-settings-remove,.sp-settings-leave-trigger{min-height:40px}.sp-settings-rule{padding:18px 0;gap:20px}.sp-settings-form-footer{padding-top:16px;margin-top:16px}.sp-settings-separation-editor{padding:16px;margin-bottom:14px}.sp-settings-separation-group{padding:14px}.sp-settings-shift-time{margin:20px 0}.sp-settings-shift-allowance{margin-bottom:16px!important}.sp-settings-month-reference{padding:16px 18px}.sp-settings-inline-error{margin-top:9px!important}@media(max-width:720px){.sp-settings-config-card,.sp-settings-editor{padding:15px;margin-bottom:14px}.sp-settings-employee-card,.sp-settings-shift-card{padding:15px}.sp-settings-employee-grid,.sp-settings-shift-grid{gap:12px}.sp-settings-inline-hours{margin-top:12px}.sp-settings-inline-shift-options>button,.sp-settings-person .sp-settings-edit,.sp-settings-shift-top .sp-settings-edit,.sp-settings-member-bottom .sp-settings-remove,.sp-settings-leave-trigger{min-height:44px}.sp-settings-inline-hours .sp-settings-input-unit,.sp-settings-inline-hours .sp-settings-input-unit input{min-height:44px}.sp-settings-button{min-height:44px}.sp-settings-rule{padding:16px 0;gap:14px}.sp-settings-form-footer{padding-top:14px;margin-top:14px}.sp-settings-month-reference{padding:15px}.sp-settings-rule-tabs{margin-bottom:13px}}
+.sp-settings-auto-status{font-size:11px;color:#6d8b78;line-height:1.6;margin:8px 0 0!important;min-height:18px}.sp-settings-config-card,.sp-settings-editor{padding:18px;margin-bottom:16px}.sp-settings-employee-card,.sp-settings-shift-card{padding:16px}.sp-settings-employee-grid,.sp-settings-shift-grid{gap:14px}.sp-settings-card-heading{margin-bottom:16px}.sp-settings-form-grid{gap:15px}.sp-settings-inline-hours{margin-top:14px}.sp-settings-inline-shifts{margin-bottom:13px}.sp-settings-inline-shifts legend{margin-bottom:8px}.sp-settings-inline-week{margin-top:11px}.sp-settings-inline-hours .sp-settings-input-unit{min-height:40px}.sp-settings-inline-shift-options>button{min-height:40px}.sp-settings-member-bottom{margin-top:12px}.sp-settings-person{gap:10px}.sp-settings-person .sp-settings-edit,.sp-settings-shift-top .sp-settings-edit{min-height:40px;min-width:40px}.sp-settings-member-bottom .sp-settings-remove,.sp-settings-leave-trigger{min-height:40px}.sp-settings-rule{padding:18px 0;gap:20px}.sp-settings-form-footer{padding-top:16px;margin-top:16px}.sp-settings-separation-editor{padding:16px;margin-bottom:14px}.sp-settings-separation-group{padding:14px}.sp-settings-shift-time{margin:20px 0}.sp-settings-shift-allowance{margin-bottom:16px!important}.sp-settings-inline-error{margin-top:9px!important}@media(max-width:720px){.sp-settings-config-card,.sp-settings-editor{padding:15px;margin-bottom:14px}.sp-settings-employee-card,.sp-settings-shift-card{padding:15px}.sp-settings-employee-grid,.sp-settings-shift-grid{gap:12px}.sp-settings-inline-hours{margin-top:12px}.sp-settings-inline-shift-options>button,.sp-settings-person .sp-settings-edit,.sp-settings-shift-top .sp-settings-edit,.sp-settings-member-bottom .sp-settings-remove,.sp-settings-leave-trigger{min-height:44px}.sp-settings-inline-hours .sp-settings-input-unit,.sp-settings-inline-hours .sp-settings-input-unit input{min-height:44px}.sp-settings-button{min-height:44px}.sp-settings-rule{padding:16px 0;gap:14px}.sp-settings-form-footer{padding-top:14px;margin-top:14px}.sp-settings-rule-tabs{margin-bottom:13px}}
 
 </style>

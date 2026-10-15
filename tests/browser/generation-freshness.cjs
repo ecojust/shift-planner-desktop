@@ -10,7 +10,7 @@ const url = process.env.GENERATION_FRESHNESS_TEST_URL || 'http://127.0.0.1:5190/
 const out = path.resolve(__dirname, '../../test-results/generation-freshness')
 const fixture = {
   version: 1, teamName: '排班结果时效验收', month: '2026-10',
-  employees: ['甲', '乙'].map((name, index) => ({ id: `qa-${index + 1}`, name: `测试成员${name}`, role: '服务员', group: '测试', color: '#d7e8f8', minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: [] })),
+  employees: ['甲', '乙'].map((name, index) => ({ id: `qa-${index + 1}`, name: `测试成员${name}`, role: '服务员', group: '测试', color: '#d7e8f8', minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: [] })),
   shifts: [{ id: 'day', name: '日班', shortName: '日', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, staffingMode: 'fixed', normalAllowance: 0 }],
   rules: { minRestHours: 11, maxConsecutiveDays: 5 },
   assignments: [{ employeeId: 'qa-1', date: '2026-10-01', shiftId: 'day', locked: true }, { employeeId: 'qa-2', date: '2026-09-30', shiftId: 'off', locked: false }],
@@ -261,12 +261,20 @@ async function main() {
     await monthStatus(editing.page, 'scheduled')
     await editing.page.getByRole('button', { name: '设置 2026-10-01 日期类型', exact: true }).click()
     const dateDialog = editing.page.getByRole('dialog', { name: '2026-10-01 · 日期类型', exact: true })
-    await dateDialog.getByRole('button', { name: /休息日 不计入月参考工时/ }).click()
+    await dateDialog.getByRole('button', { name: /休息日 在日历中标记为休息日/ }).click()
     await dateDialog.getByRole('button', { name: '确认日期类型', exact: true }).click()
     await dateDialog.waitFor({ state: 'detached' })
     await editing.page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).calendar['2026-10-01'] === 'restday')
+    await monthStatus(editing.page, 'scheduled')
+    assert.deepEqual((await stored(editing.page)).provenance.invalidatedSchedules ?? {}, {})
+    assert.equal((await stored(editing.page)).provenance.fields['calendar.2026-10-01'].source, 'manual')
+    await undoAndPersist(editing.page, fixture.assignments)
+    await monthStatus(editing.page, 'scheduled')
+    record('a calendar display marker records its source without invalidating an existing schedule or its undo history')
+    await changeRule(editing.page, 10)
     await monthStatus(editing.page, 'invalid')
     let configurationInvalidated = clone((await stored(editing.page)).provenance.invalidatedSchedules)
+    await restFirstCell(editing.page)
     await undoAndPersist(editing.page, fixture.assignments)
     await monthStatus(editing.page, 'invalid')
     const undoInvalidated = (await stored(editing.page)).provenance.invalidatedSchedules
@@ -302,7 +310,7 @@ async function main() {
     assert.equal(await editing.page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
     await screenshot(editing.page, 'persistent-invalid-schedule-320')
     await editing.page.keyboard.press('Escape')
-    record('single-cell replacement and undo cannot erase later calendar configuration invalidity; deleting and undoing restores the prior month status')
+    record('single-cell replacement and undo cannot erase saved rule invalidity; deleting and undoing restores the prior month status')
     await editing.page.close()
 
     const inflightState = clone(fixture)

@@ -1,9 +1,4 @@
-import type { Employee, PlannerState } from './domain.ts'
-import { dayInfo } from './calendar.ts'
-import type { DayKind } from './calendar.ts'
-
-type HoursState = Pick<PlannerState, 'month' | 'monthlyReferenceHours'> & { calendar?: Record<string, DayKind> }
-const DAY = 86_400_000
+import type { PlannerState } from './domain.ts'
 const MINUTE = 60_000
 
 /** Match Python Decimal(str(hours)) instead of rounding binary float noise. */
@@ -27,33 +22,14 @@ export function monthInterval(month: string): [number, number] {
   return [start, end.getTime()]
 }
 
-/** Calendar workdays, including compensatory workdays and user overrides. */
-export function monthlyHoursReference(state: HoursState) {
-  const [start, end] = monthInterval(state.month)
-  let workdays = 0, verified = true
-  for (let cursor = start; cursor < end; cursor += DAY) {
-    const info = dayInfo(new Date(cursor).toISOString().slice(0, 10), state.calendar ?? {})
-    if (info.kind === 'workday') workdays++
-    verified &&= info.verified
-  }
-  const suggestedHours = workdays * 8
-  const custom = !!state.monthlyReferenceHours && Object.hasOwn(state.monthlyReferenceHours, state.month)
-  return { hours: custom ? state.monthlyReferenceHours![state.month]! : suggestedHours, suggestedHours, workdays, verified, custom }
-}
-
-export function minimumMonthHours(state: HoursState, employee: Employee): number {
-  return employee.minHoursPerMonth === null ? monthlyHoursReference(state).hours : employee.minHoursPerMonth ?? 0
-}
-
-/** Resolve calendar-dependent defaults once for both solver input and readback.
- * Stored nulls remain intact so changing month/calendar still updates defaults. */
+/** Discard retired monthly constraints and resolve only missing weekly minimums.
+ * Explicit weekly zero remains disabled; legacy monthly values never set it. */
 export function resolveHoursState<T extends PlannerState>(state: T): T {
-  const reference = monthlyHoursReference(state).hours
-  return { ...state, employees: state.employees.map(employee => ({
+  const { monthlyReferenceHours: _retiredReference, ...current } = state
+  return { ...current, employees: state.employees.map(({ minHoursPerMonth: _retiredMinimum, ...employee }) => ({
     ...employee,
-    minHoursPerMonth: employee.minHoursPerMonth === null ? reference : employee.minHoursPerMonth ?? 0,
     minHoursPerWeek: employee.minHoursPerWeek ?? 0,
-  })) }
+  })) } as T
 }
 
 /** Actual time inside the month, including previous-month overnight tails.

@@ -13,9 +13,9 @@ const clone = value => JSON.parse(JSON.stringify(value))
 const ids = ['order-a', 'order-b', 'order-c', 'order-d', 'order-e']
 const names = ['排序甲', '排序乙', '排序丙', '排序丁', '排序戊']
 const fixture = {
-  version: 1, teamName: '人员顺序验收', month: '2026-10', calendar: { '2026-10-03': 'workday' }, monthlyReferenceHours: { '2026-10': 160 },
+  version: 1, teamName: '人员顺序验收', month: '2026-10', calendar: { '2026-10-03': 'workday' },
   payroll: { monthlySalary: 6000, monthlyWorkdays: 21.75, hoursPerDay: 8, statutoryMultiplier: 3, restdayMultiplier: 2, ordinaryMultiplier: 1.5, restdayCompensated: false, employeeSalaries: {}, dateShiftMultipliers: {} },
-  employees: ids.map((id, i) => ({ id, name: names[i], role: i % 2 ? '后勤' : '值班员', group: i % 2 ? '乙组' : '甲组', color: '#d7e8f8', minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: i === 4 ? ['2026-10-05'] : [] })),
+  employees: ids.map((id, i) => ({ id, name: names[i], role: i % 2 ? '后勤' : '值班员', group: i % 2 ? '乙组' : '甲组', color: '#d7e8f8', minHoursPerWeek: 0, maxHoursPerWeek: 56, eligibleShiftIds: ['day'], unavailableDates: i === 4 ? ['2026-10-05'] : [] })),
   shifts: [{ id: 'day', name: '日班', shortName: '日', start: '08:00', end: '16:00', color: '#dbeee6', required: 1, staffingMode: 'minimum', normalAllowance: 20 }],
   rules: { minRestHours: 11, maxConsecutiveDays: 7 },
   assignments: [

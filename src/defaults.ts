@@ -29,9 +29,6 @@ export function makeDefaultState(month?: string): PlannerState {
     assignments: [],
   }
   state.assignments = generateSchedule(state).assignments
-  // Retain the illustrative roster; new minimums may reveal genuine deficits.
-  // The initial demo covers daily minimums; generating later may add staff to
-  // satisfy the reference-linked minimum hours.
-  state.employees = state.employees.map(employee => ({ ...employee, minHoursPerMonth: null, minHoursPerWeek: 0 }))
+  state.employees = state.employees.map(employee => ({ ...employee, minHoursPerWeek: 0 }))
   return state
 }

@@ -99,11 +99,12 @@ export function parseBackup(text: string): PlannerDocument {
     if (eligibleShiftIds.some(value => !shiftIds.has(value))) fail('员工引用了不存在的班次')
     const unavailableDates = list(e.unavailableDates, 3660, '请假日期').map(value => dateValue(value, '请假日期'))
     unique(unavailableDates, '请假日期')
-    const minHoursPerMonth = e.minHoursPerMonth === undefined || e.minHoursPerMonth === null ? null : number(e.minHoursPerMonth, 0, 744, '每月最低工时')
+    // Former monthly minimums are retired, including their automatic/null form.
+    // Ignore their values completely rather than converting them into weekly limits.
     const minHoursPerWeek = e.minHoursPerWeek === undefined ? 0 : number(e.minHoursPerWeek, 0, 168, '每周最低工时')
     const maxHoursPerWeek = number(e.maxHoursPerWeek, 0, 168, '每周最高工时')
     if (minHoursPerWeek > maxHoursPerWeek || hoursToMinutes(minHoursPerWeek, 'ceil') > hoursToMinutes(maxHoursPerWeek, 'floor')) fail('每周最低工时不能超过最高工时（按分钟核算）')
-    return { id: id(e.id, '员工 ID'), name: string(e.name, 80, '姓名'), role: string(e.role, 80, '岗位', true), group: string(e.group, 80, '分组', true), color: color(e.color, '员工颜色'), ...(e.avatar === undefined ? {} : { avatar: e.avatar as string | null }), minHoursPerMonth, minHoursPerWeek, maxHoursPerWeek, eligibleShiftIds, unavailableDates }
+    return { id: id(e.id, '员工 ID'), name: string(e.name, 80, '姓名'), role: string(e.role, 80, '岗位', true), group: string(e.group, 80, '分组', true), color: color(e.color, '员工颜色'), ...(e.avatar === undefined ? {} : { avatar: e.avatar as string | null }), minHoursPerWeek, maxHoursPerWeek, eligibleShiftIds, unavailableDates }
   })
   unique(employees.map(e => e.id), '员工 ID')
   const employeeIds = new Set(employees.map(e => e.id))
@@ -133,13 +134,8 @@ export function parseBackup(text: string): PlannerDocument {
     const weights = r.weekdayWeights as { days: number[]; percent: number }
     state.rules.weekdayWeights = { days: [...weights.days], percent: weights.percent }
   }
-  if (root.monthlyReferenceHours !== undefined) {
-    const raw = object(root.monthlyReferenceHours, '月参考工时')
-    if (Object.keys(raw).length > 1200) fail('月参考工时最多保存 1200 个月')
-    const references: Record<string, number> = Object.create(null)
-    for (const [month, hours] of Object.entries(raw)) references[monthValue(month)] = number(hours, 0, 744, '月参考工时')
-    state.monthlyReferenceHours = references
-  }
+  // Legacy monthlyReferenceHours is intentionally neither validated nor copied:
+  // existing workspaces load with only their explicitly saved weekly limits.
   if (r.separationGroups !== undefined) {
     const groups = list(r.separationGroups, 200, '互斥组').map((entry, index) => {
       const group = object(entry, `互斥组 ${index + 1}`)

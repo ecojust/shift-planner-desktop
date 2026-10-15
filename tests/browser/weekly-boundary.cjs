@@ -21,7 +21,7 @@ const dayShift = { id: 'day', name: '日班', shortName: '日', start: '08:00', 
 function fixture({ teamName = '跨月周最低验证', historyDays = 5, firstDayLeave = true } = {}) {
   return {
     version: 1, teamName, month: '2026-11', calendar: {},
-    employees: [{ id: 'boundary-1', name: employeeName, role: '值班员', group: '边界组', color: '#d7e8f8', minHoursPerMonth: 0, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: firstDayLeave ? ['2026-11-01'] : [] }],
+    employees: [{ id: 'boundary-1', name: employeeName, role: '值班员', group: '边界组', color: '#d7e8f8', minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: ['day'], unavailableDates: firstDayLeave ? ['2026-11-01'] : [] }],
     shifts: [{ ...dayShift }], rules: { minRestHours: 0, maxConsecutiveDays: 31 },
     // Unlocked out-of-month history is equally authoritative and must survive.
     assignments: Array.from({ length: historyDays }, (_, index) => ({ employeeId: 'boundary-1', date: `2026-10-${26 + index}`, shiftId: 'day', locked: index % 2 === 0 })),
@@ -85,7 +85,6 @@ function audit(original, generated) {
       previousDay = day
     }
     const monthMinutes = minutesWithin(work, monthStart, monthEnd)
-    assert.ok(monthMinutes >= Math.ceil(employee.minHoursPerMonth * 60), 'Monthly minimum is separately satisfied')
     const weekly = [...weeks].map(([monday, days]) => {
       const weekEnd = monday + 7 * DAY, inStart = Math.max(monday, monthStart), inEnd = Math.min(weekEnd, monthEnd)
       const fullMinimum = Math.ceil(employee.minHoursPerWeek * 60)
@@ -212,7 +211,8 @@ async function main() {
     assert.equal(currentExport.debug.source, 'current')
     assert.equal(currentExport.debug.runtime, 'browser')
     assert.deepEqual(outsideAssignments(currentExport.state), completeHistory.assignments)
-    assert.deepEqual(currentExport.state.employees.map(employee => [employee.minHoursPerMonth, employee.minHoursPerWeek, employee.maxHoursPerWeek]), [[0, 40, 48]])
+    assert.deepEqual(currentExport.state.employees.map(employee => [employee.minHoursPerWeek, employee.maxHoursPerWeek]), [[40, 48]])
+    assert.ok(currentExport.state.employees.every(employee => !Object.hasOwn(employee, 'minHoursPerMonth')))
     record('current-debug-download-preserves-all-month-outside-history-and-hour-limits')
 
     await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: '成员管理' }).click()
