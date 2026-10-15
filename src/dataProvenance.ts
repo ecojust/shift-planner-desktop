@@ -10,6 +10,22 @@ export interface DataProvenance {
   scheduleUpdates?: Record<string, { source: 'mcp' | 'http'; at: string }>
 }
 
+/** Summarize a card's own paths and descendants without including sibling cards. */
+export function latestConfigurationChange(provenance: DataProvenance | undefined, paths: readonly string[]): ChangeStamp | undefined {
+  if (!provenance || !paths.length) return undefined
+  const scopes = paths.filter(Boolean)
+  let latest: ChangeStamp | undefined
+  // Prefer an existing card summary when timestamps tie with its field records.
+  for (const path of scopes) {
+    const stamp = provenance.fields[path]
+    if (stamp && (!latest || stamp.at > latest.at)) latest = stamp
+  }
+  for (const [path, stamp] of Object.entries(provenance.fields)) {
+    if ((!latest || stamp.at > latest.at) && scopes.some(scope => path.startsWith(`${scope}.`))) latest = stamp
+  }
+  return latest
+}
+
 export const MAX_PROVENANCE_FIELDS = 100000
 export const MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 const categories = ['团队', '成员', '班次', '排班规则', '日期设置', '工时设置', '津贴'] as const

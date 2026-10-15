@@ -7,17 +7,20 @@ let closeActiveBadge: (() => void) | undefined
 import { computed, nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 import type { PlannerState } from './domain.ts'
 import { formatChangeTime } from './changeTime'
+import { latestConfigurationChange } from './dataProvenance'
 
-const props = defineProps<{ state: PlannerState; path: string; pending?: boolean }>()
-const entry = computed(() => props.state.provenance?.fields[props.path])
+const props = defineProps<{ state: PlannerState; path?: string; paths?: string[]; pending?: boolean }>()
+const scopes = computed(() => props.paths ?? (props.path ? [props.path] : []))
+const entry = computed(() => latestConfigurationChange(props.state.provenance, scopes.value))
+const hasStatus = computed(() => !!props.pending || !!entry.value)
 const labels = { manual: '手动修改', mcp: 'MCP', http: 'HTTP' } as const
-const source = computed(() => props.pending ? 'pending' : entry.value?.source ?? 'unknown')
-const label = computed(() => props.pending ? '未保存' : entry.value ? labels[entry.value.source] : '未记录')
+const source = computed(() => props.pending ? 'pending' : entry.value?.source)
+const label = computed(() => props.pending ? '未保存' : entry.value ? labels[entry.value.source] : '')
 const changedAt = computed(() => entry.value ? formatChangeTime(entry.value.at) : '时间未记录')
 const description = computed(() => {
   const pending = props.pending ? '当前修改尚未保存。' : ''
-  if (!entry.value) return `${pending}此项数据尚无来源与修改时间记录；下次修改保存后开始记录。`
-  return `${pending}${props.pending ? '上次保存来源' : '数据来源'}：${labels[entry.value.source]}；${props.pending ? '上次修改时间' : '修改时间'}（本机时间）：${changedAt.value}`
+  if (!entry.value) return `${pending}保存后记录修改来源与时间。`
+  return `${pending}${props.pending ? '上次保存来源' : '最近修改来源'}：${labels[entry.value.source]}；${props.pending ? '上次修改时间' : '最近修改时间'}（本机时间）：${changedAt.value}`
 })
 const tooltipId = useId()
 const trigger = ref<HTMLElement | null>(null)
@@ -97,19 +100,20 @@ watch(visible, opened => {
   }
 }, { flush: 'sync' })
 watch(description, () => { if (visible.value) void positionTooltip() })
+watch(hasStatus, shown => { if (!shown) close() })
 onBeforeUnmount(close)
 </script>
 
 <template>
-  <span ref="trigger" class="sp-source-badge" :class="`is-${source}`" :data-source="source" :data-source-path="path" role="note" tabindex="0" :aria-label="description" :aria-describedby="visible ? tooltipId : undefined" @mouseenter="overTrigger = true; open()" @mouseleave="overTrigger = false; leave()" @focus="open" @blur="leave" @click.stop.prevent="toggle" @keydown.enter.stop.prevent="toggle" @keydown.space.stop.prevent="toggle" @keydown.tab="close">{{ label }}</span>
+  <span v-if="hasStatus" ref="trigger" class="sp-source-badge" :class="`is-${source}`" :data-source="source" :data-source-path="scopes[0]" role="note" tabindex="0" :aria-label="description" :aria-describedby="visible ? tooltipId : undefined" @mouseenter="overTrigger = true; open()" @mouseleave="overTrigger = false; leave()" @focus="open" @blur="leave" @click.stop.prevent="toggle" @keydown.enter.stop.prevent="toggle" @keydown.space.stop.prevent="toggle" @keydown.tab="close">{{ label }}</span>
   <Teleport to="body">
-    <div v-if="visible" :id="tooltipId" ref="tooltip" class="sp-source-tooltip" role="tooltip" :style="{ ...position, visibility: positioned ? 'visible' : 'hidden' }" @mouseenter="overTooltip = true; open()" @mouseleave="overTooltip = false; leave()">
+    <div v-if="visible && hasStatus" :id="tooltipId" ref="tooltip" class="sp-source-tooltip" role="tooltip" :style="{ ...position, visibility: positioned ? 'visible' : 'hidden' }" @mouseenter="overTooltip = true; open()" @mouseleave="overTooltip = false; leave()">
       <strong v-if="pending">当前修改尚未保存</strong>
       <template v-if="entry">
-        <p class="sp-source-tooltip-origin">{{ pending ? '上次保存来源' : '数据来源' }}：<strong>{{ labels[entry.source] }}</strong></p>
-        <p class="sp-source-tooltip-date">{{ pending ? '上次修改时间' : '修改时间' }}（本机时间）<time v-if="changedAt !== '时间未记录'" :datetime="entry.at">{{ changedAt }}</time><span v-else>时间未记录</span></p>
+        <p class="sp-source-tooltip-origin">{{ pending ? '上次保存来源' : '最近修改来源' }}：<strong>{{ labels[entry.source] }}</strong></p>
+        <p class="sp-source-tooltip-date">{{ pending ? '上次修改时间' : '最近修改时间' }}（本机时间）<time v-if="changedAt !== '时间未记录'" :datetime="entry.at">{{ changedAt }}</time><span v-else>时间未记录</span></p>
       </template>
-      <template v-else><p>来源与修改时间未记录。</p><p class="sp-source-tooltip-hint">下次修改保存后开始记录。</p></template>
+      <p v-else class="sp-source-tooltip-hint">保存后记录修改来源与时间。</p>
     </div>
   </Teleport>
 </template>
@@ -119,7 +123,6 @@ onBeforeUnmount(close)
 .sp-source-badge.sp-source-badge:focus-visible { outline: 2px solid #276a56; outline-offset: 2px; }
 .sp-source-badge.sp-source-badge.is-mcp { border-color: #d9e2f2; background: #eff4fc; color: #516c99; }
 .sp-source-badge.sp-source-badge.is-http { border-color: #e2ddef; background: #f5f1fb; color: #7b6293; }
-.sp-source-badge.sp-source-badge.is-unknown { border-color: #e6e9e6; background: #f8f9f7; color: #7e8d82; }
 .sp-source-badge.sp-source-badge.is-pending { border-color: #ecdfc6; background: #fff8eb; color: #97743a; }
 .sp-source-tooltip { position: fixed; z-index: 1400; box-sizing: border-box; width: min(270px, calc(100vw - 24px)); max-height: calc(100dvh - 24px); overflow: auto; overscroll-behavior: contain; padding: 12px 14px; border: 1px solid #dce5df; border-radius: 8px; background: #fff; color: #486052; box-shadow: 0 6px 24px #173d2826; font: 400 12px/1.7 "Inter", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif; text-align: left; letter-spacing: normal; overflow-wrap: anywhere; }
 .sp-source-tooltip p { margin: 0; }

@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { configurationFields, withChangeProvenance, parseDataProvenance, MAX_PROVENANCE_BYTES } from '../dataProvenance.ts'
+import { configurationFields, latestConfigurationChange, withChangeProvenance, parseDataProvenance, MAX_PROVENANCE_BYTES } from '../dataProvenance.ts'
 import { backupJSON, parseBackup, loadSaved, saveLocal, STORAGE_KEY } from '../storage.ts'
 import { createPayrollConfig } from '../payroll.ts'
 
@@ -23,6 +23,41 @@ function changed(state, update, source, at) {
   return withChangeProvenance(state, next, source, at)
 }
 const stamp = (source, at) => ({ source, at })
+
+test('card summaries show the newest saved change even when older backups only contain field stamps', () => {
+  const provenance = { fields: {
+    'employees.e1.name': stamp('manual', firstTime),
+    'employees.e1.role': stamp('http', thirdTime),
+    'employees.e1.group': stamp('mcp', secondTime),
+    'employees.e1': stamp('manual', firstTime),
+  } }
+  assert.deepEqual(latestConfigurationChange(provenance, ['employees.e1']), stamp('http', thirdTime))
+  delete provenance.fields['employees.e1']
+  assert.deepEqual(latestConfigurationChange(provenance, ['employees.e1']), stamp('http', thirdTime))
+})
+
+test('card summaries remain empty for untracked cards and exclude sibling IDs and unrelated rule sections', () => {
+  const provenance = { fields: {
+    'employees.e10.name': stamp('mcp', thirdTime),
+    employees: stamp('mcp', thirdTime),
+    'rules.minRestHours': stamp('manual', firstTime),
+    'rules.maxConsecutiveDays': stamp('http', secondTime),
+    'rules.weekdayWeights.percent': stamp('mcp', thirdTime),
+  } }
+  assert.equal(latestConfigurationChange(undefined, ['employees.e1']), undefined)
+  assert.equal(latestConfigurationChange(provenance, ['employees.e1']), undefined)
+  assert.equal(latestConfigurationChange(provenance, []), undefined)
+  assert.equal(latestConfigurationChange(provenance, ['']), undefined)
+  assert.deepEqual(latestConfigurationChange(provenance, ['rules.minRestHours', 'rules.maxConsecutiveDays']), stamp('http', secondTime))
+})
+
+test('card summaries retain restore-default and removed-rule history without changing stored field records', () => {
+  const tracked = changed(fixture(), next => { delete next.rules.weekdayWeights; delete next.rules.weeklyShiftLimits }, 'http', secondTime)
+  const before = structuredClone(tracked.provenance)
+  assert.deepEqual(latestConfigurationChange(tracked.provenance, ['rules.weekdayWeights']), stamp('http', secondTime))
+  assert.deepEqual(latestConfigurationChange(tracked.provenance, ['rules.weeklyShiftLimits']), stamp('http', secondTime))
+  assert.deepEqual(JSON.parse(JSON.stringify(tracked.provenance)), JSON.parse(JSON.stringify(before)))
+})
 
 test('configuration fields use stable entity IDs and atomic value arrays', () => {
   const state = fixture()

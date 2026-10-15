@@ -24,7 +24,7 @@ async function screenshot(page, name) {
   await page.screenshot({ path: file, fullPage: !name.startsWith('settings-'), animations: 'disabled' })
   report.screenshots.push(file)
 }
-async function preparePage(desktop, options = {}) {
+async function preparePage(desktop, options = {}, initial = fixture) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: 'zh-CN', ...options })
   activePage = page
   page.on('pageerror', error => report.errors.push(error.stack || String(error)))
@@ -82,7 +82,7 @@ async function preparePage(desktop, options = {}) {
       if (!handler) throw new Error('Expected an active integration-request listener')
       handler({ event: 'integration-request', id: listener.id, payload })
     }
-  }, { fixture, desktop })
+  }, { fixture: initial, desktop })
   await page.goto(url, { waitUntil: 'networkidle' })
   await page.getByRole('heading', { name: '排班日历', exact: true }).waitFor()
   return page
@@ -114,12 +114,15 @@ async function closeSettings(page) {
   await dialog.waitFor({ state: 'detached' })
 }
 async function section(page, name) {
+  const menu = page.getByRole('button', { name: '打开导航', exact: true })
+  if (await menu.isVisible() && !await page.locator('.sp-sidebar').evaluate(node => node.classList.contains('is-open'))) await menu.click()
   await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: new RegExp(name) }).click()
   await page.getByRole('heading', { name, exact: true }).waitFor()
 }
 async function badge(page, field, source, label) {
-  const locator = page.locator(`[data-source-path="${field}"]`).first()
+  const locator = page.locator(`[data-source-path="${field}"]`)
   await locator.waitFor()
+  assert.equal(await locator.count(), 1, `${field} must have one card badge`)
   assert.equal(await locator.getAttribute('data-source'), source, field)
   assert.equal(await locator.innerText(), label, field)
   assert.ok(await locator.getAttribute('aria-label'), 'source badge needs an accessible description')
@@ -154,7 +157,7 @@ async function sourceTooltip(page, locator, stamp, { focus = false, pending = fa
     if (pending) assert.match(text, /上次|最近保存|已保存/)
   } else {
     assert.equal(await tooltip.locator('time').count(), 0)
-    assert.match(text, /未记录|无来源记录|尚无/)
+    assert.match(text, /保存后记录修改来源与时间/)
   }
   const viewport = page.viewportSize(), bounds = await tooltip.boundingBox()
   assert.ok(bounds && bounds.x >= 0 && bounds.y >= 0 && bounds.x + bounds.width <= viewport.width + 1 && bounds.y + bounds.height <= viewport.height + 1, JSON.stringify({ viewport, bounds }))
@@ -209,6 +212,136 @@ async function settingsTrigger(page, size) {
     return [...node.parentElement.children].filter(sibling => sibling !== node && sibling.getClientRects().length)
       .every(sibling => sibling.getBoundingClientRect().right <= rect.left + 1)
   }), true, 'settings gear must be to the right of every other topbar action')
+}
+async function checkAggregatedCards() {
+  const seed = clone(fixture)
+  seed.employees.push({ ...clone(seed.employees[1]), id: 'qa-10', name: '独立来源成员' })
+  seed.shifts.push({ ...clone(seed.shifts[0]), id: 'day-2', name: '独立来源班次', start: '16:00', end: '00:00', required: 0 })
+  seed.rules.weekdayWeights = { days: [1, 6], percent: 40 }
+  seed.rules.separationGroups = [
+    { id: 'g1', name: '第一互斥组', employeeIds: ['qa-1', 'qa-2'], shiftIds: ['day'] },
+    { id: 'g10', name: '独立互斥组', employeeIds: ['qa-2', 'qa-10'], shiftIds: [] },
+  ]
+  const old = { source: 'mcp', at: '2026-10-10T08:00:00.000Z' }
+  const manual = { source: 'manual', at: '2026-10-11T09:00:00.000Z' }
+  const latest = { source: 'http', at: '2026-10-12T10:00:00.000Z' }
+  const unrelated = { source: 'mcp', at: '2026-10-14T11:00:00.000Z' }
+  // Deliberately omit aggregate parent records and keep insertion order out of time order.
+  seed.provenance = { fields: {
+    'employees.qa-1.role': latest, 'employees.qa-1.name': old, 'employees.qa-1.group': manual,
+    'employees.qa-10.name': unrelated,
+    'shifts.day.required': latest, 'shifts.day.name': old, 'shifts.day.color': manual,
+    'shifts.day-2.name': unrelated,
+    'rules.minRestHours': old, 'rules.maxConsecutiveDays': manual,
+    'rules.weekdayWeights.percent': latest,
+    'rules.separationGroups.g1.employeeIds': latest, 'rules.separationGroups.g1.name': old,
+    'rules.separationGroups.g10.name': unrelated,
+  } }
+  const page = await preparePage(false, {}, seed)
+  await section(page, '成员管理')
+  assert.equal(await page.locator('.sp-settings-employee-card').count(), 3)
+  for (const [id, count] of [['qa-1', 1], ['qa-2', 0], ['qa-10', 1]]) {
+    assert.equal(await page.locator(`#member-${id} .sp-source-badge`).count(), count, id)
+  }
+  await badge(page, 'employees.qa-1', 'http', 'HTTP')
+  await badge(page, 'employees.qa-10', 'mcp', 'MCP')
+  const memberBadge = page.locator('[data-source-path="employees.qa-1"]')
+  await sourceTooltip(page, memberBadge, latest)
+  await screenshot(page, 'aggregated-member-cards')
+  await dismissSourceTooltip(page, memberBadge)
+  assert.equal(await page.locator('[data-source-path="employees.qa-1.name"]').count(), 0)
+  record('member cards aggregate the latest field source into one badge, hide untracked members and do not mix qa-1 with qa-10')
+  await page.getByRole('button', { name: '添加员工', exact: true }).click()
+  const newMember = page.getByRole('dialog', { name: '添加员工', exact: true })
+  assert.equal(await newMember.locator('.sp-source-badge').count(), 0)
+  await newMember.getByRole('textbox', { name: '员工姓名', exact: true }).fill(seed.employees[0].name)
+  assert.equal(await newMember.locator('.sp-source-badge').count(), 1)
+  assert.equal(await newMember.locator('.sp-source-badge').getAttribute('data-source'), 'pending')
+  await newMember.getByRole('button', { name: '保存人员', exact: true }).click()
+  await newMember.getByRole('alert').waitFor()
+  assert.match(await newMember.getByRole('alert').innerText(), /同名/)
+  assert.equal(await newMember.locator('.sp-source-badge').count(), 1)
+  assert.equal(await newMember.locator('.sp-source-badge').getAttribute('data-source'), 'pending')
+  await newMember.getByRole('button', { name: '取消', exact: true }).click()
+  await newMember.waitFor({ state: 'detached' })
+  assert.equal(await page.locator('.sp-settings-employee-card').count(), 3)
+  assert.equal(await page.locator('[data-source="pending"]').count(), 0)
+  record('a new member has no initial badge and retains one pending badge after a duplicate-name save failure without adding a card')
+
+  await section(page, '班次设置')
+  assert.equal(await page.locator('.sp-settings-shift-card').count(), 2)
+  for (const card of await page.locator('.sp-settings-shift-card').all()) assert.equal(await card.locator('.sp-source-badge').count(), 1)
+  await badge(page, 'shifts.day', 'http', 'HTTP')
+  await badge(page, 'shifts.day-2', 'mcp', 'MCP')
+  const shiftBadge = page.locator('[data-source-path="shifts.day"]')
+  await sourceTooltip(page, shiftBadge, latest)
+  await screenshot(page, 'aggregated-shift-cards')
+  await dismissSourceTooltip(page, shiftBadge)
+  record('each shift card has one latest-source badge and a newer neighboring shift does not leak into it')
+  await page.getByRole('button', { name: '新建班次', exact: true }).click()
+  const newShift = page.getByRole('dialog', { name: '新建班次', exact: true })
+  assert.equal(await newShift.locator('.sp-source-badge').count(), 0)
+  const shiftName = newShift.getByRole('textbox', { name: '班次名称', exact: true })
+  await shiftName.fill('尚未保存的新班次')
+  assert.equal(await newShift.locator('.sp-source-badge').count(), 1)
+  assert.equal(await newShift.locator('.sp-source-badge').getAttribute('data-source'), 'pending')
+  await shiftName.fill('')
+  assert.equal(await newShift.locator('.sp-source-badge').count(), 0)
+  await newShift.getByRole('button', { name: '取消', exact: true }).click()
+  await newShift.waitFor({ state: 'detached' })
+
+  await section(page, '排班规则')
+  const basicCard = page.locator('form[aria-label="个人休息与连续工作规则"]')
+  assert.equal(await basicCard.locator('.sp-source-badge').count(), 1)
+  const basicBadge = basicCard.locator('[data-source-path="rules.minRestHours"]')
+  assert.equal(await basicBadge.getAttribute('data-source'), 'manual')
+  await sourceTooltip(page, basicBadge, manual)
+  await screenshot(page, 'aggregated-personal-rule-card')
+  await dismissSourceTooltip(page, basicBadge)
+  assert.equal(await page.locator('[data-source-path="rules.nonConsecutiveShifts"]').count(), 0)
+  assert.equal(await page.locator('[data-source-path="rules.weeklyShiftLimits"]').count(), 0)
+  await page.getByRole('tab', { name: '团队规则', exact: true }).click()
+  const weightCard = page.locator('form[aria-label="团队上班权重规则"]')
+  assert.equal(await weightCard.locator('.sp-source-badge').count(), 1)
+  await sourceTooltip(page, weightCard.locator('[data-source-path="rules.weekdayWeights"]'), latest)
+  await dismissSourceTooltip(page, weightCard.locator('[data-source-path="rules.weekdayWeights"]'))
+  assert.equal(await page.locator('.sp-settings-separation-group').count(), 2)
+  for (const card of await page.locator('.sp-settings-separation-group').all()) assert.equal(await card.locator('.sp-source-badge').count(), 1)
+  await badge(page, 'rules.separationGroups.g1', 'http', 'HTTP')
+  await badge(page, 'rules.separationGroups.g10', 'mcp', 'MCP')
+  const separationBadge = page.locator('[data-source-path="rules.separationGroups.g1"]')
+  await sourceTooltip(page, separationBadge, latest)
+  await screenshot(page, 'aggregated-team-rule-cards')
+  await dismissSourceTooltip(page, separationBadge)
+  record('rule cards aggregate only their own fields and separation-group IDs without copying a newer sibling source')
+  await page.getByRole('button', { name: /添加互斥组/ }).click()
+  const newGroup = page.locator('.sp-settings-separation-editor')
+  assert.equal(await newGroup.locator('.sp-source-badge').count(), 0)
+  await newGroup.getByRole('textbox', { name: '规则名称', exact: true }).fill('尚未保存的新互斥组')
+  assert.equal(await newGroup.locator('.sp-source-badge').count(), 1)
+  assert.equal(await newGroup.locator('.sp-source-badge').getAttribute('data-source'), 'pending')
+  await newGroup.getByRole('textbox', { name: '规则名称', exact: true }).fill('')
+  assert.equal(await newGroup.locator('.sp-source-badge').count(), 0)
+  await newGroup.getByRole('button', { name: '取消', exact: true }).click()
+  await newGroup.waitFor({ state: 'detached' })
+  record('new shift and separation drafts show no initial badge, one badge only while changed, and hide it when restored')
+
+  await page.setViewportSize({ width: 320, height: 480 })
+  for (const [sectionName, cardSelector] of [
+    ['成员管理', '.sp-settings-employee-card'],
+    ['班次设置', '.sp-settings-shift-card'],
+    ['排班规则', 'form.sp-settings-config-card:visible, .sp-settings-separation-group:visible, .sp-shift-rule-card:visible'],
+  ]) {
+    await section(page, sectionName)
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, sectionName)
+    for (const card of await page.locator(cardSelector).all()) {
+      assert.ok(await card.locator('.sp-source-badge').count() <= 1, `${sectionName} cards must not repeat badges`)
+      assert.equal(await card.evaluate(node => node.scrollWidth > node.clientWidth), false, sectionName)
+    }
+    await screenshot(page, `aggregated-cards-320-${sectionName}`)
+  }
+  record('aggregated member, shift and rule cards fit 320px screens and retain at most one badge per card')
+  await page.close()
 }
 async function main() {
   await fs.mkdir(out, { recursive: true })
@@ -277,10 +410,10 @@ async function main() {
     record('settings trap keyboard focus, restore focus on Escape and keep MCP running after closing')
 
     await section(page, '成员管理')
-    await badge(page, 'employees.qa-1.name', 'unknown', '未记录')
-    await badge(page, 'employees.qa-1.role', 'unknown', '未记录')
+    assert.equal(await page.locator('.sp-settings-employee-card').count(), 2)
+    assert.equal(await page.locator('.sp-source-badge').count(), 0, 'legacy cards without saved history must have no badge')
     await section(page, '排班日历')
-    record('legacy member fields show unrecorded provenance without inventing a source')
+    record('legacy member cards with no saved history hide provenance badges entirely')
     const initial = await snapshot(page)
     await scheduleTime(page)
     assert.equal(initial.state.employees[0].name, fixture.employees[0].name)
@@ -408,12 +541,15 @@ async function main() {
     assert.equal(httpResult.persisted.provenance.fields['employees.qa-1.group'], undefined)
     assert.match(await page.locator('.sp-context').innerText(), /已通过 HTTP 更新/)
     await section(page, '成员管理')
-    await badge(page, 'employees.qa-1.name', 'mcp', 'MCP')
-    await badge(page, 'employees.qa-1.role', 'http', 'HTTP')
-    await badge(page, 'employees.qa-1.group', 'unknown', '未记录')
+    await badge(page, 'employees.qa-1', 'http', 'HTTP')
+    assert.equal(await page.locator('#member-qa-1 .sp-source-badge').count(), 1)
+    assert.equal(await page.locator('#member-qa-2 .sp-source-badge').count(), 0)
+    const latestMemberBadge = page.locator('[data-source-path="employees.qa-1"]')
+    await sourceTooltip(page, latestMemberBadge, httpResult.persisted.provenance.fields['employees.qa-1.role'])
+    await dismissSourceTooltip(page, latestMemberBadge)
     await screenshot(page, 'field-sources-mcp-http')
     await section(page, '排班日历')
-    record('member fields independently show MCP and HTTP sources while unchanged fields retain their original stamps')
+    record('one member card badge shows the latest HTTP source and exact time while saved field histories remain independent')
 
     const forged = clone(await snapshot(page))
     const oldRoleStamp = clone(forged.state.provenance.fields['employees.qa-1.role'])
@@ -435,15 +571,14 @@ async function main() {
     record('caller-provided metadata and args.source cannot forge field provenance or erase pending external-change notices')
 
     await section(page, '成员管理')
-    await badge(page, 'employees.qa-1.name', 'http', 'HTTP')
+    await badge(page, 'employees.qa-1', 'http', 'HTTP')
     await page.getByRole('button', { name: '编辑HTTP 可信来源成员', exact: true }).click()
     const employeeDialog = page.getByRole('dialog', { name: '编辑成员资料', exact: true })
     await employeeDialog.getByRole('textbox', { name: '员工姓名', exact: true }).fill('手动修改后的成员')
-    assert.equal(await employeeDialog.locator('[data-source-path="employees.qa-1.name"]').getAttribute('data-source'), 'pending')
+    assert.equal(await employeeDialog.locator('[data-source-path="employees.qa-1"]').getAttribute('data-source'), 'pending')
     await employeeDialog.getByRole('button', { name: '保存人员', exact: true }).click()
     await employeeDialog.waitFor({ state: 'detached' })
-    await badge(page, 'employees.qa-1.name', 'manual', '手动修改')
-    await badge(page, 'employees.qa-1.role', 'http', 'HTTP')
+    await badge(page, 'employees.qa-1', 'manual', '手动修改')
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).employees[0].name === '手动修改后的成员')
     const manuallySaved = await stored(page)
     assert.equal(manuallySaved.provenance.fields['employees.qa-1.name'].source, 'manual')
@@ -451,7 +586,7 @@ async function main() {
     assert.deepEqual(manuallySaved.provenance.pendingExternalChange, trusted.persisted.provenance.pendingExternalChange)
     await screenshot(page, 'field-sources-manual-http')
     await section(page, '排班日历')
-    record('saving one member field manually marks only that field as manual and preserves other field sources and the review notice')
+    record('a manual member edit updates the single card badge while preserving other saved field sources and the review notice')
 
     dialog = await openSettings(page)
     await dialog.getByRole('checkbox', { name: '允许修改班次', exact: true }).check()
@@ -474,8 +609,7 @@ async function main() {
     afterReloadShift.state.shifts[0].name = '刷新后权限仍生效'
     assert.ok((await request(page, 'replace_state', afterReloadShift)).response.result)
     await section(page, '成员管理')
-    await badge(page, 'employees.qa-1.name', 'manual', '手动修改')
-    await badge(page, 'employees.qa-1.role', 'http', 'HTTP')
+    await badge(page, 'employees.qa-1', 'manual', '手动修改')
     await section(page, '排班日历')
     record('field provenance, pending configuration review and nondefault permissions survive a full reload')
 
@@ -553,8 +687,7 @@ async function main() {
     await notice.waitFor()
     assert.match(await notice.innerText(), /HTTP/)
     await section(page, '成员管理')
-    await badge(page, 'employees.qa-1.name', 'manual', '手动修改')
-    await badge(page, 'employees.qa-1.role', 'http', 'HTTP')
+    await badge(page, 'employees.qa-1', 'http', 'HTTP')
     await badge(page, referencePath, 'manual', '手动修改')
     await screenshot(page, 'import-preserves-field-sources')
     await section(page, '排班日历')
@@ -655,15 +788,15 @@ async function main() {
 
     const fieldStamps = (await snapshot(page)).state.provenance.fields
     for (const [sectionName, field, focus] of [
-      ['成员管理', 'employees.qa-1.name', false],
+      ['成员管理', 'employees.qa-1', false],
       ['成员管理', referencePath, true],
-      ['班次设置', 'shifts.day.name', false],
+      ['班次设置', 'shifts.day', false],
       ['排班规则', 'rules.minRestHours', false],
     ]) {
       await section(page, sectionName)
       const locator = page.locator(`[data-source-path="${field}"]`).first()
       await sourceTooltip(page, locator, fieldStamps[field], { focus })
-      if (field === 'employees.qa-1.name') await screenshot(page, 'source-tooltip-member')
+      if (field === 'employees.qa-1') await screenshot(page, 'source-tooltip-member')
       await dismissSourceTooltip(page, locator)
     }
     record('member, shift, rule and reference badges expose real hover/focus tooltips with exact saved source and local timestamp')
@@ -671,26 +804,33 @@ async function main() {
     await section(page, '成员管理')
     await page.getByRole('button', { name: `编辑${currentMemberName}`, exact: true }).click()
     const pendingDialog = page.getByRole('dialog', { name: '编辑成员资料', exact: true })
-    await pendingDialog.getByRole('textbox', { name: '员工姓名', exact: true }).fill('尚未保存的新名字')
-    const pendingBadge = pendingDialog.locator('[data-source-path="employees.qa-1.name"]')
-    await sourceTooltip(page, pendingBadge, fieldStamps['employees.qa-1.name'], { pending: true })
+    assert.equal(await pendingDialog.locator('.sp-source-badge').count(), 1)
+    await pendingDialog.getByRole('textbox', { name: '岗位', exact: true }).fill('尚未保存的新岗位')
+    const pendingBadge = pendingDialog.locator('[data-source-path="employees.qa-1"]')
+    await sourceTooltip(page, pendingBadge, fieldStamps['employees.qa-1'], { pending: true })
     await screenshot(page, 'pending-source-tooltip')
     await dismissSourceTooltip(page, pendingBadge)
     await pendingDialog.getByRole('button', { name: '取消', exact: true }).click()
     await pendingDialog.waitFor({ state: 'detached' })
     await page.getByRole('button', { name: '编辑测试成员乙', exact: true }).click()
     const unknownDialog = page.getByRole('dialog', { name: '编辑成员资料', exact: true })
+    assert.equal(await unknownDialog.locator('.sp-source-badge').count(), 0)
     await unknownDialog.getByRole('textbox', { name: '员工姓名', exact: true }).fill('旧数据未保存的修改')
-    const unknownBadge = unknownDialog.locator('[data-source-path="employees.qa-2.name"]')
+    const unknownBadge = unknownDialog.locator('[data-source-path="employees.qa-2"]')
     await sourceTooltip(page, unknownBadge, undefined, { pending: true, focus: true })
     await dismissSourceTooltip(page, unknownBadge)
+    await unknownDialog.getByRole('textbox', { name: '员工姓名', exact: true }).fill('测试成员乙')
+    assert.equal(await unknownDialog.locator('.sp-source-badge').count(), 0, 'restoring the original draft hides an untracked pending badge')
     await unknownDialog.getByRole('button', { name: '取消', exact: true }).click()
     await unknownDialog.waitFor({ state: 'detached' })
-    record('unsaved fields show the last saved source/time while untracked legacy drafts never invent a timestamp')
+    record('each edit dialog has one pending card badge with the last saved time, and untracked drafts hide it again when restored')
 
     await page.setViewportSize({ width: 320, height: 480 })
-    const narrowBadge = page.locator('[data-source-path="employees.qa-1.name"]').first()
-    await sourceTooltip(page, narrowBadge, fieldStamps['employees.qa-1.name'])
+    const narrowBadge = page.locator('[data-source-path="employees.qa-1"]').first()
+    assert.equal(await page.locator('#member-qa-1 .sp-source-badge').count(), 1)
+    assert.equal(await page.locator('#member-qa-2 .sp-source-badge').count(), 0)
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
+    await sourceTooltip(page, narrowBadge, fieldStamps['employees.qa-1'])
     await screenshot(page, 'source-tooltip-320px')
     await dismissSourceTooltip(page, narrowBadge)
     await page.setViewportSize({ width: 1440, height: 960 })
@@ -722,6 +862,7 @@ async function main() {
     }
     record('compact settings at 800x600, short, and 320px viewports scroll internally with a stationary heading and accessible close/copy controls')
     await page.close()
+    await checkAggregatedCards()
 
     const web = await preparePage(false)
     dialog = await openSettings(web)
