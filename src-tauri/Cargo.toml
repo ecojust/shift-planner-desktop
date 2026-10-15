@@ -1,6 +1,6 @@
 [package]
 name = "shift-flow-desktop"
-version = "1.5.0"
+version = "1.5.1"
 description = "Shift Schedule Expert — 本地约束求解排班"
 authors = ["Shift Flow"]
 edition = "2021"

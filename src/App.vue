@@ -273,7 +273,9 @@ function finishGeneration() {
 }
 function feedback(success: boolean, message: string, details: string[] = [], diagnostic = false, issues: Issue[] = []) {
   const visibleMessage = formatUserMessage(message)
-  solverFeedback.value = { success, message: visibleMessage, details: [...new Set(details.map(formatUserMessage))].filter(detail => !visibleMessage.includes(detail)), diagnostic, issues: withSolverGuidance(issues).map(formatUserIssue), attempt: activeAttempt, stale: !!activeAttempt && activeAttempt.revision !== revision }
+  // Both success paths check the input revision before committing assignments.
+  // That commit advances revision itself; it does not make its own result stale.
+  solverFeedback.value = { success, message: visibleMessage, details: [...new Set(details.map(formatUserMessage))].filter(detail => !visibleMessage.includes(detail)), diagnostic, issues: withSolverGuidance(issues).map(formatUserIssue), attempt: activeAttempt, stale: !success && !!activeAttempt && activeAttempt.revision !== revision }
   expandedFeedback.value = false
   // The persistent result card is the sole announcement of solver outcomes.
   notice.value = ''; window.clearTimeout(noticeTimer)
