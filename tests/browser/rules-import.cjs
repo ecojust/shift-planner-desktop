@@ -89,7 +89,10 @@ async function preparePage(desktop, initial = fixture) {
         if (command === 'plugin:event|listen') return ++listenerId
         if (command === 'plugin:event|unlisten') return null
         if (command === 'solver_info') return { engine: 'ortools-cp-sat', protocolVersion: 1, version: 'controlled-import-test', local: true }
-        if (command === 'integration_status') return { enabled: false, url: '', token: '', serviceId: '' }
+        if (command === 'integration_status' || command === 'integration_stop') {
+          if (!['mcp', 'http'].includes(args.service)) throw new Error('Expected an explicit integration service')
+          return { enabled: false, url: '', token: '', serviceId: '' }
+        }
         if (command === 'import_backup') return control.importContents
         if (command === 'save_export') { control.exports.push({ ...args }); return true }
         throw new Error(`Unexpected desktop command: ${command}`)

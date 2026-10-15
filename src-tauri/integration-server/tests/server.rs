@@ -1,7 +1,7 @@
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 use shift_integration_server::{
-    BridgeError, BridgeRequest, BridgeResponse, BridgeSource, Server, ServerOptions,
+    BridgeError, BridgeRequest, BridgeResponse, BridgeSource, Server, ServerOptions, Service,
 };
 use std::{
     sync::Arc,
@@ -16,12 +16,17 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(timeout: Duration) -> Self {
+    async fn new(service: Service, timeout: Duration) -> Self {
+        Self::on_port(service, 0, timeout).await
+    }
+
+    async fn on_port(service: Service, port: u16, timeout: Duration) -> Self {
         let (sender, events) = mpsc::unbounded_channel();
         let server = Server::start(
             Arc::new(move |event| sender.send(event).map_err(|error| error.to_string())),
             ServerOptions {
-                port: 0,
+                service,
+                port,
                 request_timeout: timeout,
             },
         )
@@ -39,6 +44,22 @@ impl Fixture {
         self.client
             .request(method, format!("{}{path}", info.url))
             .bearer_auth(info.token)
+    }
+
+    fn read_request(&self, service: Service) -> RequestBuilder {
+        self.read_request_with_token(service, &self.server.info().token)
+    }
+
+    fn read_request_with_token(&self, service: Service, token: &str) -> RequestBuilder {
+        let url = self.server.info().url;
+        match service {
+            Service::Http => self.client.get(format!("{url}/api/state")),
+            Service::Mcp => self.client.post(format!("{url}/mcp")).json(&json!({
+                "jsonrpc": "2.0", "id": "read", "method": "tools/call",
+                "params": {"name": "get_state"}
+            })),
+        }
+        .bearer_auth(token)
     }
 
     async fn event(&mut self) -> BridgeRequest {
@@ -67,7 +88,7 @@ fn send(request: RequestBuilder) -> JoinHandle<Result<reqwest::Response, reqwest
 
 #[tokio::test]
 async fn http_forwards_current_data_reads_writes_and_validation() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(5)).await;
     for (verb, path, method, args) in [
         (reqwest::Method::GET, "/api/state", "get_state", json!({})),
         (
@@ -115,7 +136,7 @@ async fn http_forwards_current_data_reads_writes_and_validation() {
 
 #[tokio::test]
 async fn http_source_cannot_be_forged_through_body_query_or_headers() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(5)).await;
     for (verb, path, method) in [
         (reqwest::Method::PUT, "/api/state", "replace_state"),
         (reqwest::Method::POST, "/api/assignments", "set_assignment"),
@@ -147,7 +168,7 @@ async fn http_source_cannot_be_forged_through_body_query_or_headers() {
 
 #[tokio::test]
 async fn mcp_source_cannot_be_forged_through_arguments_envelope_query_or_headers() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Mcp, Duration::from_secs(5)).await;
     for method in [
         "get_state",
         "validate_schedule",
@@ -182,9 +203,12 @@ async fn mcp_source_cannot_be_forged_through_arguments_envelope_query_or_headers
 
 #[tokio::test]
 async fn permission_denials_return_http_403_and_mcp_tool_errors() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
     let message = "Setting 未允许修改排班";
-    for source in [BridgeSource::Http, BridgeSource::Mcp] {
+    for (service, source) in [
+        (Service::Http, BridgeSource::Http),
+        (Service::Mcp, BridgeSource::Mcp),
+    ] {
+        let mut fixture = Fixture::new(service, Duration::from_secs(5)).await;
         let args = json!({"revision": "r1", "employeeId": "alice", "date": "2026-10-15", "shiftId": "off"});
         let request = match source {
             BridgeSource::Http => fixture
@@ -226,13 +250,13 @@ async fn permission_denials_return_http_403_and_mcp_tool_errors() {
                 assert!(body.get("error").is_none());
             }
         }
+        fixture.server.stop().await;
     }
-    fixture.server.stop().await;
 }
 
 #[tokio::test]
 async fn authentication_and_dns_rebinding_checks_precede_data_access() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(5)).await;
     let url = format!("{}/api/state", fixture.server.info().url);
     assert_eq!(fixture.client.get(&url).send().await.unwrap().status(), 401);
     assert_eq!(
@@ -303,7 +327,7 @@ async fn authentication_and_dns_rebinding_checks_precede_data_access() {
 
 #[tokio::test]
 async fn mcp_initialization_tools_notifications_and_errors_are_protocol_compatible() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Mcp, Duration::from_secs(5)).await;
     let init = fixture.request(reqwest::Method::POST, "/mcp").json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})).send().await.unwrap().json::<Value>().await.unwrap();
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(init["result"]["capabilities"], json!({"tools": {}}));
@@ -392,7 +416,7 @@ async fn mcp_initialization_tools_notifications_and_errors_are_protocol_compatib
 
 #[tokio::test]
 async fn mcp_tools_return_data_and_business_errors_without_losing_rpc_id() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Mcp, Duration::from_secs(5)).await;
     let pending = send(fixture.request(reqwest::Method::POST, "/mcp").json(&json!({"jsonrpc": "2.0", "id": "read", "method": "tools/call", "params": {"name": "get_state"}})));
     let event = fixture.event().await;
     assert_eq!(event.source, BridgeSource::Mcp);
@@ -444,7 +468,7 @@ async fn mcp_tools_return_data_and_business_errors_without_losing_rpc_id() {
 
 #[tokio::test]
 async fn http_preserves_conflicts_and_rejects_duplicate_responses() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(5)).await;
     let pending = send(
         fixture
             .request(reqwest::Method::PUT, "/api/state")
@@ -481,7 +505,7 @@ async fn http_preserves_conflicts_and_rejects_duplicate_responses() {
 
 #[tokio::test]
 async fn timed_out_requests_are_removed_and_late_responses_rejected() {
-    let mut fixture = Fixture::new(Duration::from_millis(80)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_millis(80)).await;
     let pending = send(fixture.request(reqwest::Method::GET, "/api/state"));
     let event = fixture.event().await;
     assert_eq!(pending.await.unwrap().unwrap().status(), 504);
@@ -504,7 +528,7 @@ async fn timed_out_requests_are_removed_and_late_responses_rejected() {
 
 #[tokio::test]
 async fn shutdown_closes_listener_and_pending_connections_and_rotates_credentials() {
-    let mut fixture = Fixture::new(Duration::from_secs(30)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(30)).await;
     let original = fixture.server.info();
     let pending = send(fixture.request(reqwest::Method::GET, "/api/state"));
     fixture.event().await;
@@ -524,6 +548,7 @@ async fn shutdown_closes_listener_and_pending_connections_and_rotates_credential
     let replacement = Server::start(
         Arc::new(|_| Ok(())),
         ServerOptions {
+            service: Service::Http,
             port,
             request_timeout: Duration::from_secs(1),
         },
@@ -554,6 +579,7 @@ async fn occupied_port_falls_back_to_a_real_free_loopback_port() {
     let server = Server::start(
         Arc::new(|_| Ok(())),
         ServerOptions {
+            service: Service::Http,
             port,
             request_timeout: Duration::from_secs(1),
         },
@@ -567,7 +593,7 @@ async fn occupied_port_falls_back_to_a_real_free_loopback_port() {
 
 #[tokio::test]
 async fn pending_request_limit_rejects_excess_without_emitting_work() {
-    let mut fixture = Fixture::new(Duration::from_secs(10)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(10)).await;
     let mut requests = Vec::new();
     let mut events = Vec::new();
     for _ in 0..64 {
@@ -594,7 +620,7 @@ async fn pending_request_limit_rejects_excess_without_emitting_work() {
 
 #[tokio::test]
 async fn oversized_and_invalid_http_payloads_never_reach_renderer() {
-    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let mut fixture = Fixture::new(Service::Http, Duration::from_secs(5)).await;
     assert_eq!(
         fixture
             .request(reqwest::Method::PUT, "/api/state")
@@ -633,6 +659,7 @@ async fn unavailable_renderer_returns_service_unavailable() {
     let server = Server::start(
         Arc::new(|_| Err("closed".into())),
         ServerOptions {
+            service: Service::Http,
             port: 0,
             request_timeout: Duration::from_secs(1),
         },
@@ -651,4 +678,222 @@ async fn unavailable_renderer_returns_service_unavailable() {
         .unwrap();
     assert_eq!(response.status(), 503);
     server.stop().await;
+}
+
+#[test]
+fn service_selection_has_independent_default_ports_and_lowercase_serialization() {
+    assert_eq!(ServerOptions::default().service, Service::Mcp);
+    for (service, name, port) in [(Service::Mcp, "mcp", 4318), (Service::Http, "http", 4319)] {
+        let options = ServerOptions::for_service(service);
+        assert_eq!(options.service, service);
+        assert_eq!(options.port, port);
+        assert_eq!(serde_json::to_value(service).unwrap(), name);
+        assert_eq!(
+            serde_json::from_value::<Service>(json!(name)).unwrap(),
+            service
+        );
+    }
+    assert!(serde_json::from_value::<Service>(json!("other")).is_err());
+}
+
+#[tokio::test]
+async fn simultaneous_services_have_independent_addresses_credentials_and_pending_requests() {
+    let mut mcp = Fixture::new(Service::Mcp, Duration::from_secs(5)).await;
+    let mut http = Fixture::new(Service::Http, Duration::from_secs(5)).await;
+    let mcp_info = mcp.server.info();
+    let http_info = http.server.info();
+    assert_ne!(mcp_info.url, http_info.url);
+    assert_ne!(mcp_info.token, http_info.token);
+    assert_ne!(mcp_info.service_id, http_info.service_id);
+
+    let mcp_pending = send(mcp.read_request(Service::Mcp));
+    let http_pending = send(http.read_request(Service::Http));
+    let mcp_event = mcp.event().await;
+    let http_event = http.event().await;
+    assert_eq!(mcp_event.source, BridgeSource::Mcp);
+    assert_eq!(http_event.source, BridgeSource::Http);
+    assert_eq!(mcp_event.service_id, mcp_info.service_id);
+    assert_eq!(http_event.service_id, http_info.service_id);
+    assert_ne!(mcp_event.request_id, http_event.request_id);
+
+    // A renderer response routed to the wrong service must not consume either request.
+    for (server, foreign_request_id) in [
+        (&mcp.server, &http_event.request_id),
+        (&http.server, &mcp_event.request_id),
+    ] {
+        assert!(server
+            .respond(
+                foreign_request_id,
+                BridgeResponse {
+                    result: Some(json!({"revision": "wrong-service"})),
+                    error: None,
+                }
+            )
+            .is_err());
+    }
+    mcp.respond(&mcp_event.request_id, json!({"revision": "mcp-result"}));
+    http.respond(&http_event.request_id, json!({"revision": "http-result"}));
+    let mcp_response = mcp_pending.await.unwrap().unwrap();
+    let http_response = http_pending.await.unwrap().unwrap();
+    assert_eq!(mcp_response.status(), 200);
+    assert_eq!(http_response.status(), 200);
+    let mcp_body = mcp_response.json::<Value>().await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(mcp_body["result"]["content"][0]["text"].as_str().unwrap())
+            .unwrap()["revision"],
+        "mcp-result"
+    );
+    assert_eq!(
+        http_response.json::<Value>().await.unwrap()["revision"],
+        "http-result"
+    );
+    mcp.server.stop().await;
+    http.server.stop().await;
+}
+
+#[tokio::test]
+async fn services_reject_the_other_protocol_routes_without_emitting_work() {
+    let mut mcp = Fixture::new(Service::Mcp, Duration::from_secs(5)).await;
+    let mut http = Fixture::new(Service::Http, Duration::from_secs(5)).await;
+    for (method, path) in [
+        (reqwest::Method::GET, "/api/state"),
+        (reqwest::Method::PUT, "/api/state"),
+        (reqwest::Method::GET, "/api/validate"),
+        (reqwest::Method::POST, "/api/assignments"),
+    ] {
+        let response = mcp
+            .request(method, path)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404, "MCP server exposed {path}");
+    }
+    for method in [
+        reqwest::Method::POST,
+        reqwest::Method::GET,
+        reqwest::Method::DELETE,
+    ] {
+        let response = http.request(method, "/mcp")
+            .header("MCP-Protocol-Version", "unsupported")
+            .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "get_state"}}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 404, "HTTP server exposed /mcp");
+    }
+    assert!(mcp.events.try_recv().is_err());
+    assert!(http.events.try_recv().is_err());
+    mcp.server.stop().await;
+    http.server.stop().await;
+}
+
+#[tokio::test]
+async fn service_tokens_cannot_authenticate_to_the_other_service() {
+    let mut mcp = Fixture::new(Service::Mcp, Duration::from_secs(5)).await;
+    let mut http = Fixture::new(Service::Http, Duration::from_secs(5)).await;
+    for (fixture, service, foreign_token) in [
+        (&mcp, Service::Mcp, http.server.info().token),
+        (&http, Service::Http, mcp.server.info().token),
+    ] {
+        let response = fixture
+            .read_request_with_token(service, &foreign_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 401);
+    }
+    assert!(mcp.events.try_recv().is_err());
+    assert!(http.events.try_recv().is_err());
+    mcp.server.stop().await;
+    http.server.stop().await;
+}
+
+#[tokio::test]
+async fn stopping_and_restarting_either_service_preserves_the_others_pending_request_and_credentials(
+) {
+    for (stopped_service, retained_service) in
+        [(Service::Mcp, Service::Http), (Service::Http, Service::Mcp)]
+    {
+        let mut stopped = Fixture::new(stopped_service, Duration::from_secs(30)).await;
+        let mut retained = Fixture::new(retained_service, Duration::from_secs(30)).await;
+        let original = stopped.server.info();
+        let retained_info = retained.server.info();
+        let stopped_pending = send(stopped.read_request(stopped_service));
+        let retained_pending = send(retained.read_request(retained_service));
+        let stopped_event = stopped.event().await;
+        let retained_event = retained.event().await;
+
+        tokio::time::timeout(Duration::from_secs(1), stopped.server.stop())
+            .await
+            .unwrap();
+        // Disabling only this service closes its pending connection promptly.
+        let stopped_result = tokio::time::timeout(Duration::from_secs(1), stopped_pending)
+            .await
+            .unwrap()
+            .unwrap();
+        if let Ok(response) = stopped_result {
+            if stopped_service == Service::Mcp && response.status() == 200 {
+                assert_eq!(
+                    response.json::<Value>().await.unwrap()["result"]["isError"],
+                    true
+                );
+            } else {
+                assert_eq!(response.status(), 503);
+            }
+        }
+        assert!(stopped
+            .client
+            .get(format!("{}/api/state", original.url))
+            .send()
+            .await
+            .is_err());
+        assert!(!retained_pending.is_finished());
+
+        let port = original.url.rsplit(':').next().unwrap().parse().unwrap();
+        let mut replacement = Fixture::on_port(stopped_service, port, Duration::from_secs(5)).await;
+        let replacement_info = replacement.server.info();
+        assert_eq!(replacement_info.url, original.url);
+        assert_ne!(replacement_info.token, original.token);
+        assert_ne!(replacement_info.service_id, original.service_id);
+        assert_eq!(
+            replacement
+                .read_request_with_token(stopped_service, &original.token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert!(replacement.events.try_recv().is_err());
+        assert!(replacement
+            .server
+            .respond(
+                &stopped_event.request_id,
+                BridgeResponse {
+                    result: Some(json!({"revision": "stale"})),
+                    error: None,
+                }
+            )
+            .is_err());
+
+        let current_retained_info = retained.server.info();
+        assert!(current_retained_info.enabled);
+        assert_eq!(current_retained_info.url, retained_info.url);
+        assert_eq!(current_retained_info.token, retained_info.token);
+        assert_eq!(current_retained_info.service_id, retained_info.service_id);
+        retained.respond(
+            &retained_event.request_id,
+            json!({"revision": "uninterrupted"}),
+        );
+        assert_eq!(retained_pending.await.unwrap().unwrap().status(), 200);
+
+        // Restarted service accepts only its new request IDs and remains operational.
+        let new_pending = send(replacement.read_request(stopped_service));
+        let new_event = replacement.event().await;
+        assert_eq!(new_event.service_id, replacement_info.service_id);
+        assert_ne!(new_event.request_id, stopped_event.request_id);
+        replacement.respond(&new_event.request_id, json!({"revision": "restarted"}));
+        assert_eq!(new_pending.await.unwrap().unwrap().status(), 200);
+        replacement.server.stop().await;
+        retained.server.stop().await;
+    }
 }

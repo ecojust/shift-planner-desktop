@@ -84,8 +84,10 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
   files.push(describe('SHA256SUMS'));
   const notes = `Shift Schedule Expert ${version} · Windows 与 macOS 桌面版
 
-本版精简配置卡片的修改状态展示。
+本版拆分 MCP 与 HTTP API 服务，并精简配置卡片的修改状态展示。
 
+- MCP 与 HTTP API 分别开启、关闭，各自使用独立地址与访问令牌，关闭一个服务不会影响另一个。
+- HTTP 设置列出四个 REST 接口的完整地址、参数说明与可复制调用示例；写入示例说明 revision 和完整 state 的使用方式。
 - 成员、班次和排班规则等配置按卡片汇总：每张卡片最多显示一个最近修改来源，不再逐字段重复显示。
 - 没有修改记录的卡片不显示来源状态；编辑中的修改合并显示一个「未保存」提示。
 - 悬停、聚焦或点击状态，仍可查看最近一次已保存修改的来源与具体时间。

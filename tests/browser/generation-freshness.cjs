@@ -34,7 +34,10 @@ async function prepare(desktop, state = fixture) {
     if (command === 'plugin:event|listen') return 1
     if (command === 'plugin:event|unlisten') return null
     if (command === 'solver_info') return { engine: 'ortools-cp-sat', protocolVersion: 1, version: 'controlled-freshness-test', local: true }
-    if (command === 'integration_status') return { enabled: false, url: '', token: '', serviceId: '' }
+    if (command === 'integration_status' || command === 'integration_stop') {
+      assert.ok(['mcp', 'http'].includes(args?.service), 'integration commands require an explicit service')
+      return { enabled: false, url: '', token: '', serviceId: '' }
+    }
     if (command === 'solve_schedule') {
       control.requests.push(args.request)
       return new Promise((resolve, reject) => control.pending.push({ request: args.request, resolve, reject }))

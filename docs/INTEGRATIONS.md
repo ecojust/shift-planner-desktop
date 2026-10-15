@@ -4,15 +4,15 @@
 
 ## 开启与连接
 
-1. 点击桌面应用右上角最右侧的**齿轮（设置）**，开启 **MCP**。
-2. 设置会显示运行状态、MCP 地址、HTTP API 地址和访问令牌。
-3. 复制 MCP 配置到支持 Streamable HTTP 的 AI 客户端，即可连接。复制的配置已包含实际地址和访问令牌。
+1. 点击桌面应用右上角最右侧的**齿轮（设置）**，按需开启 **MCP** 或 **HTTP API**，也可同时开启。
+2. 每项服务分别显示运行状态、连接地址和访问令牌。
+3. 使用 MCP 时，复制包含实际地址和 MCP 令牌的配置到支持 Streamable HTTP 的 AI 客户端；使用 HTTP API 时，复制 HTTP 地址和 HTTP 令牌，按下方接口说明调用。
 
-无需安装 Node.js、下载项目源码或运行命令。HTTP API 与 MCP 共用内置服务和访问令牌，开启 MCP 后即可使用。
+两项服务均内置于桌面应用，无需安装 Node.js、下载项目源码或运行命令。MCP 与 HTTP API 独立启停，使用各自的端口和访问令牌；开启或关闭其中一项不会影响另一项。
 
-服务仅监听本机 `127.0.0.1`，优先使用端口 `4318`；端口被占用时自动选择可用端口，请以设置中显示的地址为准。每次开启都会生成新的访问令牌，重新开启后需更新 AI 客户端中的配置。
+两项服务仅监听本机 `127.0.0.1`：MCP 默认端口为 `4318`，HTTP API 默认端口为 `4319`。各自端口被占用时会自动选择可用端口，请以设置显示的实际地址为准。每次开启都会生成该服务的新访问令牌，重新开启后需更新对应客户端配置；另一项正在运行的服务仍保留自己的地址和令牌。
 
-关闭设置弹窗后服务继续运行。关闭 MCP 开关或退出应用会停止服务；重新打开应用时默认关闭，按需开启。网页版无法运行此本地服务，需要使用桌面版。
+关闭设置弹窗后，已开启的服务继续运行。关闭某一开关只停止对应服务，退出应用会停止两项服务；重新打开应用时两项默认关闭，按需开启。网页版无法运行这些本地服务，需要使用桌面版。
 
 ## 修改权限
 
@@ -59,23 +59,49 @@
 
 ## HTTP
 
-每个请求均需要 `Authorization: Bearer <访问令牌>`，请求体为 JSON。以下示例使用默认端口；实际地址和令牌可从设置中复制。
+先在设置中开启 **HTTP API**。每个请求均需要 `Authorization: Bearer <HTTP 访问令牌>`，写入请求体为 JSON。HTTP 服务只提供下列四种接口，不提供 `/mcp`；MCP 服务地址也不提供这些 HTTP 接口。以下示例使用 HTTP 默认端口 `4319`，请按设置中的实际地址调整。
 
 ```bash
-curl http://127.0.0.1:4318/api/state \
-  -H 'Authorization: Bearer <访问令牌>'
+curl http://127.0.0.1:4319/api/state \
+  -H 'Authorization: Bearer <HTTP 访问令牌>'
 ```
 
 | 方法与路径 | 请求体 / 返回 |
 | --- | --- |
 | `GET /api/state` | 返回当前文档 `{ revision, state }` |
-| `PUT /api/state` | 请求 `{ revision, state }`，按修改权限校验完整文档并返回新快照 |
-| `POST /api/assignments` | 请求 `{ revision, employeeId, date, shiftId, locked? }`，更新一个人一天的排班 |
+| `PUT /api/state` | 请求 `{ revision, state }`，按修改权限校验并整体替换文档，返回 `{ revision, state }` |
+| `POST /api/assignments` | 更新一个人一天的排班，参数见下表，返回 `{ revision, state }` |
 | `GET /api/validate` | 返回 `{ revision, issues }`，检查当前排班的规则冲突 |
 
-单条排班使用 `shiftId: "off"` 表示休息；`remove: true` 删除该记录，删除时无需 shiftId。已锁定的单条排班必须显式提供 `unlock: true` 才可修改或删除。整体替换文档可批量更新获授权的数据，包括排班的锁定状态，但仍会检查每类数据的实际变更权限。
+`PUT /api/state` 接收当前文档的完整替换内容，不是局部字段补丁。先用 `GET /api/state` 获取最新的 `{ revision, state }`，在完整 `state` 中修改获授权的数据，再将两者一起提交。必须保留其他字段和所有月份的排班；只提交成员列表等部分内容会被拒绝，省略可选配置也可能被视为删除。成员、班次和规则的批量修改都使用此接口，没有独立的成员／班次／规则写入路由。
 
-例如先读取 revision，然后修改一条排班：
+例如将读取结果保存为 `state.json`，编辑其中目标成员的 `name`，保留其余文档和此次读取的 `revision` 后提交：
+
+```bash
+curl http://127.0.0.1:4319/api/state \
+  -H 'Authorization: Bearer <HTTP 访问令牌>' \
+  -o state.json
+
+# 编辑 state.json 后提交完整的 { revision, state }
+curl -X PUT http://127.0.0.1:4319/api/state \
+  -H 'Authorization: Bearer <HTTP 访问令牌>' \
+  -H 'Content-Type: application/json' \
+  --data-binary @state.json
+```
+
+`POST /api/assignments` 参数：
+
+| 参数 | 要求与含义 |
+| --- | --- |
+| `revision` | 必填，最近读取返回的版本 |
+| `employeeId` | 必填，已有成员 ID |
+| `date` | 必填，`YYYY-MM-DD` 日期 |
+| `shiftId` | 新增／修改时必填，已有班次 ID；`"off"` 表示休息 |
+| `locked` | 可选布尔值，设置该条排班是否锁定；默认 `false` |
+| `remove` | 可选布尔值，`true` 表示删除该条排班，删除时无需 `shiftId` |
+| `unlock` | 可选布尔值，修改或删除已锁定排班时必须显式设为 `true` |
+
+例如先开启「排班结果」权限并读取 revision，再提交一条排班：
 
 ```json
 {
@@ -87,11 +113,13 @@ curl http://127.0.0.1:4318/api/state \
 }
 ```
 
-完整文档结构与应用导出的 JSON 备份一致。更新成员、班次或规则时先读取完整文档，仅修改需要的字段，再提交 PUT。无效日期、未知员工或班次、重复排班等会被拒绝；规则冲突可通过 validate 检查，手动排班仍允许保留待解决的规则冲突。
+删除已锁定排班时，提交 `{ "revision": "<当前版本>", "employeeId": "employee-1", "date": "2026-10-15", "remove": true, "unlock": true }`。完整文档替换可按授权批量更新排班及锁定状态。
+
+完整文档结构与应用导出的 JSON 备份一致。无效日期、未知员工或班次、重复排班等会被拒绝；规则冲突可通过 `GET /api/validate` 检查，手动排班仍允许保留待解决的规则冲突。
 
 ## MCP
 
-服务提供无会话的 Streamable HTTP 端点 `/mcp`，通过 POST JSON-RPC 返回 JSON，不提供 SSE 订阅。客户端需支持自定义 Bearer 头。可直接复制设置中的配置；以下为结构示例，具体字段依客户端而定：
+先在设置中开启 **MCP**。MCP 服务仅提供无会话的 Streamable HTTP 端点 `/mcp`，通过 POST JSON-RPC 返回 JSON，不提供 SSE 订阅或 `/api/*` 接口。客户端需支持自定义 Bearer 头，并使用 MCP 自己的访问令牌。可直接复制设置中的配置；以下为默认端口下的结构示例，具体字段依客户端而定：
 
 ```json
 {
@@ -99,7 +127,7 @@ curl http://127.0.0.1:4318/api/state \
     "shift-schedule-expert": {
       "type": "http",
       "url": "http://127.0.0.1:4318/mcp",
-      "headers": { "Authorization": "Bearer <访问令牌>" }
+      "headers": { "Authorization": "Bearer <MCP 访问令牌>" }
     }
   }
 }
@@ -111,3 +139,5 @@ curl http://127.0.0.1:4318/api/state \
 | `replace_state` | `{ revision, state }` | 按修改权限校验、保存并替换完整数据 |
 | `set_assignment` | 同 HTTP 单条排班请求 | 新增、修改或删除单条排班 |
 | `validate_schedule` | `{}` | 检查当前排班冲突 |
+
+`replace_state` 与 `PUT /api/state` 使用相同的完整文档替换规则；`set_assignment` 使用上方单条排班参数。两项服务共享同一份当前排班文档、revision 和写入权限，成功写入后另一项服务读取即可获得更新。

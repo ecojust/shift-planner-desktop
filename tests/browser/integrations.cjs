@@ -37,15 +37,14 @@ async function preparePage(desktop, options = {}, initial = fixture) {
     window.isTauri = true
     const callbacks = new Map(), listeners = new Map()
     let nextCallback = 0, nextListener = 0
-    const control = window.__integrationBridge = {
-      commands: [], responses: {}, starts: 0, stops: 0, deferStop: false,
-      info: { enabled: false, url: '', token: '', serviceId: '' },
-    }
+    const emptyService = () => ({ starts: 0, stops: 0, deferStop: false, info: { enabled: false, url: '', token: '', serviceId: '' } })
+    const control = window.__integrationBridge = { commands: [], calls: [], responses: {}, requests: {}, services: { mcp: emptyService(), http: emptyService() } }
     window.__TAURI_INTERNALS__ = {
       transformCallback(fn) { callbacks.set(++nextCallback, fn); return nextCallback },
       unregisterCallback(id) { callbacks.delete(id) },
       async invoke(command, args = {}) {
         control.commands.push(command)
+        control.calls.push({ command, args })
         if (command === 'plugin:event|listen') {
           const id = ++nextListener
           listeners.set(args.event, { handler: args.handler, id })
@@ -54,20 +53,23 @@ async function preparePage(desktop, options = {}, initial = fixture) {
         if (command === 'plugin:event|unlisten') return null
         if (command === 'solver_info') return { engine: 'ortools-cp-sat', protocolVersion: 1, version: 'controlled-integration-test', local: true }
         if (command === 'import_backup') return control.importContents ?? null
-        if (command === 'integration_status') return { ...control.info }
+        const service = control.services[args.service]
+        if (command.startsWith('integration_') && !service) throw new Error(`Missing or invalid integration service: ${args.service}`)
+        if (command === 'integration_status') return { ...service.info }
         if (command === 'integration_start') {
-          control.starts++
-          control.info = { enabled: true, url: `http://127.0.0.1:${4317 + control.starts}`, token: `controlled-access-token-${control.starts}-1234567890abcdef`, serviceId: `controlled-service-${control.starts}` }
-          return { ...control.info }
+          service.starts++
+          service.info = { enabled: true, url: `http://127.0.0.1:${(args.service === 'mcp' ? 4316 : 4317) + service.starts * 2}`, token: `controlled-${args.service}-token-${service.starts}-1234567890abcdef`, serviceId: `controlled-${args.service}-service-${service.starts}` }
+          return { ...service.info }
         }
         if (command === 'integration_stop') {
-          control.stops++
-          const finish = () => { control.info = { enabled: false, url: '', token: '', serviceId: '' }; return { ...control.info } }
-          if (control.deferStop) return new Promise(resolve => { control.finishStop = () => resolve(finish()) })
+          service.stops++
+          const finish = () => { service.info = { enabled: false, url: '', token: '', serviceId: '' }; return { ...service.info } }
+          if (service.deferStop) return new Promise(resolve => { service.finishStop = () => resolve(finish()) })
           return finish()
         }
         if (command === 'integration_respond') {
-          control.responses[args.requestId] = { response: args.response, persisted: JSON.parse(localStorage.getItem('shift-planner:v1')) }
+          if (control.requests[args.requestId]?.source !== args.service) throw new Error('Response routed to the wrong integration service')
+          control.responses[args.requestId] = { service: args.service, response: args.response, persisted: JSON.parse(localStorage.getItem('shift-planner:v1')) }
           return null
         }
         throw new Error(`Unexpected mocked IPC command: ${command}`)
@@ -77,6 +79,7 @@ async function preparePage(desktop, options = {}, initial = fixture) {
       unregisterListener(event, id) { if (listeners.get(event)?.id === id) listeners.delete(event) },
     }
     window.__emitIntegrationRequest = payload => {
+      control.requests[payload.requestId] = payload
       const listener = listeners.get('integration-request')
       const handler = callbacks.get(listener?.handler)
       if (!handler) throw new Error('Expected an active integration-request listener')
@@ -96,13 +99,13 @@ async function openSettings(page) {
 async function request(page, method, args = {}, { expired = false, serviceId, source = 'mcp' } = {}) {
   const requestId = `browser-request-${++nextRequest}`
   await page.evaluate(({ requestId, method, args, expired, serviceId, source }) => {
-    window.__emitIntegrationRequest({ requestId, serviceId: serviceId ?? window.__integrationBridge.info.serviceId, method, args, source, expiresAt: Date.now() + (expired ? -1 : 10000) })
+    window.__emitIntegrationRequest({ requestId, serviceId: serviceId ?? window.__integrationBridge.services[source]?.info.serviceId, method, args, source, expiresAt: Date.now() + (expired ? -1 : 10000) })
   }, { requestId, method, args, expired, serviceId, source })
   await page.waitForFunction(requestId => Object.hasOwn(window.__integrationBridge.responses, requestId), requestId)
   return page.evaluate(requestId => window.__integrationBridge.responses[requestId], requestId)
 }
-async function snapshot(page) {
-  const { response } = await request(page, 'get_state')
+async function snapshot(page, source = 'mcp') {
+  const { response } = await request(page, 'get_state', {}, { source })
   assert.ok(response.result, JSON.stringify(response))
   return response.result
 }
@@ -184,10 +187,69 @@ async function enableAfterReload(page) {
   await page.reload({ waitUntil: 'networkidle' })
   await page.getByRole('heading', { name: '排班日历', exact: true }).waitFor()
   const dialog = await openSettings(page)
-  await page.waitForFunction(() => !document.querySelector('[role="switch"]').disabled)
-  await dialog.getByRole('switch', { name: 'MCP', exact: true }).click()
-  await page.waitForFunction(() => document.querySelector('[role="switch"]').getAttribute('aria-checked') === 'true')
+  for (const service of ['mcp', 'http']) await setService(page, dialog, service, true)
   await closeSettings(page)
+}
+async function setService(page, dialog, service, enabled) {
+  const toggle = dialog.getByRole('switch', { name: service === 'mcp' ? 'MCP' : 'HTTP API', exact: true })
+  await page.waitForFunction(label => [...document.querySelectorAll('[role="switch"]')].some(node => node.getAttribute('aria-labelledby') && document.getElementById(node.getAttribute('aria-labelledby'))?.textContent.trim() === label && !node.disabled), service === 'mcp' ? 'MCP' : 'HTTP API')
+  if ((await toggle.getAttribute('aria-checked')) !== String(enabled)) await toggle.click()
+  await page.waitForFunction(({ label, enabled }) => [...document.querySelectorAll('[role="switch"]')].some(node => document.getElementById(node.getAttribute('aria-labelledby'))?.textContent.trim() === label && node.getAttribute('aria-checked') === String(enabled) && !node.disabled), { label: service === 'mcp' ? 'MCP' : 'HTTP API', enabled })
+}
+async function checkHttpDocs(page, dialog, httpInfo, mcpInfo) {
+  const docs = dialog.locator('.integration-http-docs')
+  if (!await docs.evaluate(node => node.open)) await docs.locator(':scope > summary').click()
+  const routes = [
+    ['get-state', 'GET', '/api/state'],
+    ['put-state', 'PUT', '/api/state'],
+    ['set-assignment', 'POST', '/api/assignments'],
+    ['validate', 'GET', '/api/validate'],
+  ]
+  assert.equal(await docs.locator('.integration-api-route').count(), 4)
+  for (const [id, method, pathname] of routes) {
+    const route = docs.locator(`[data-http-route="${id}"]`)
+    if (!await route.evaluate(node => node.open)) await route.locator(':scope > summary').click()
+    assert.equal(await route.locator(':scope > summary .integration-api-method').innerText(), method)
+    assert.equal(await route.locator(':scope > summary code').innerText(), pathname)
+    await route.getByRole('button', { name: `复制 ${method} ${pathname} 地址`, exact: true }).click()
+    assert.equal(await copied(page), `${httpInfo.url}${pathname}`)
+    await route.getByRole('button', { name: `复制 ${method} ${pathname} 示例`, exact: true }).click()
+    const example = await copied(page)
+    if (method === 'GET') {
+      assert.ok(example.includes(`${httpInfo.url}${pathname}`))
+      assert.ok(example.includes(`Bearer ${httpInfo.token}`))
+    } else {
+      assert.ok(example.includes(`const base = ${JSON.stringify(httpInfo.url)}`))
+      assert.ok(example.includes(`const token = ${JSON.stringify(httpInfo.token)}`))
+      assert.ok(example.includes(`request('${pathname}'`))
+      assert.ok(example.includes('Authorization: `Bearer ${token}`'))
+      assert.ok(example.includes('JSON.stringify('))
+    }
+    assert.ok(!example.includes(mcpInfo.token), 'HTTP examples must never use the MCP token')
+    if (method !== 'GET') assert.ok(example.includes(method))
+  }
+  const text = await docs.innerText()
+  for (const field of ['revision', 'state', 'employeeId', 'date', 'shiftId', 'locked', 'remove', 'unlock', 'issues']) assert.ok(text.includes(field), `HTTP docs need ${field}`)
+  for (const status of ['401', '403', '409']) assert.ok(text.includes(status), `HTTP docs need error ${status}`)
+  await docs.getByRole('button', { name: '复制 PUT /api/state 参数', exact: true }).click()
+  const replacement = await copied(page)
+  assert.ok(replacement.includes('"revision"'))
+  assert.ok(replacement.includes('"state"'))
+  assert.match(replacement, /完整.*state|state.*完整/)
+  await docs.getByRole('button', { name: '复制 POST /api/assignments 参数', exact: true }).click()
+  const assignment = JSON.parse(await copied(page))
+  for (const key of ['revision', 'employeeId', 'date', 'shiftId']) assert.equal(typeof assignment[key], 'string', key)
+  assert.ok(!(await docs.innerText()).includes(httpInfo.token), 'expanded documentation must keep real tokens masked')
+  await screenshot(page, 'settings-http-api-reference')
+  for (const width of [390, 320]) {
+    await page.setViewportSize({ width, height: 600 })
+    await fits(page)
+    for (const code of await docs.locator('pre').all()) assert.equal(await code.evaluate(node => node.scrollWidth > node.clientWidth), false)
+    await screenshot(page, `settings-http-api-reference-${width}`)
+  }
+  await page.setViewportSize({ width: 1440, height: 960 })
+  await docs.locator(':scope > summary').click()
+  record('HTTP reference shows all four REST methods, parameters and errors, copies HTTP-only credentials, and fits narrow screens')
 }
 async function fits(page) {
   const viewport = page.viewportSize(), bounds = await page.getByRole('dialog').boundingBox()
@@ -212,6 +274,74 @@ async function settingsTrigger(page, size) {
     return [...node.parentElement.children].filter(sibling => sibling !== node && sibling.getClientRects().length)
       .every(sibling => sibling.getBoundingClientRect().right <= rect.left + 1)
   }), true, 'settings gear must be to the right of every other topbar action')
+}
+async function checkIndependentServices() {
+  const page = await preparePage(true)
+  const dialog = await openSettings(page)
+  await setService(page, dialog, 'mcp', false)
+  await setService(page, dialog, 'http', false)
+  await setService(page, dialog, 'http', true)
+  assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).getAttribute('aria-checked'), 'false')
+  assert.equal(await page.evaluate(() => window.__integrationBridge.services.mcp.starts), 0)
+  const httpOnly = await snapshot(page, 'http')
+  httpOnly.state.employees[0].role = 'HTTP 单独运行时修改'
+  const httpSaved = await request(page, 'replace_state', httpOnly, { source: 'http' })
+  assert.equal(httpSaved.service, 'http')
+  assert.equal(httpSaved.persisted.provenance.fields['employees.qa-1.role'].source, 'http')
+  assert.equal((await request(page, 'get_state')).response.error?.status, 503)
+  const firstHttp = await page.evaluate(() => window.__integrationBridge.services.http.info)
+  await screenshot(page, 'settings-http-only')
+  record('HTTP starts and reads/writes on its own while MCP remains off, with responses and provenance routed as HTTP')
+
+  await setService(page, dialog, 'mcp', true)
+  const firstMcp = await page.evaluate(() => window.__integrationBridge.services.mcp.info)
+  assert.notEqual(firstHttp.url, firstMcp.url)
+  assert.notEqual(firstHttp.token, firstMcp.token)
+  assert.notEqual(firstHttp.serviceId, firstMcp.serviceId)
+  for (const [source, serviceId] of [['mcp', firstHttp.serviceId], ['http', firstMcp.serviceId]]) {
+    assert.equal((await request(page, 'get_state', {}, { source, serviceId })).response.error?.status, 503)
+  }
+
+  await page.evaluate(() => { window.__integrationBridge.services.http.deferStop = true })
+  await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).click()
+  await page.waitForFunction(() => typeof window.__integrationBridge.services.http.finishStop === 'function')
+  assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).isDisabled(), true)
+  assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).isDisabled(), false)
+  assert.equal((await request(page, 'get_state', {}, { source: 'http', serviceId: firstHttp.serviceId })).response.error?.status, 503)
+  const duringHttpStop = await snapshot(page)
+  duringHttpStop.state.employees[0].name = 'HTTP 停止期间 MCP 仍可修改'
+  const mcpSaved = await request(page, 'replace_state', duringHttpStop)
+  assert.equal(mcpSaved.service, 'mcp')
+  assert.equal(mcpSaved.persisted.provenance.fields['employees.qa-1.name'].source, 'mcp')
+  await page.evaluate(() => { const http = window.__integrationBridge.services.http; http.deferStop = false; http.finishStop() })
+  await setService(page, dialog, 'http', false)
+  assert.deepEqual(await page.evaluate(() => window.__integrationBridge.services.mcp.info), firstMcp)
+  await setService(page, dialog, 'http', true)
+  const secondHttp = await page.evaluate(() => window.__integrationBridge.services.http.info)
+  assert.notEqual(secondHttp.token, firstHttp.token)
+  assert.equal((await request(page, 'get_state', {}, { source: 'http', serviceId: firstHttp.serviceId })).response.error?.status, 503)
+  record('stopping HTTP rejects its queued requests immediately while MCP keeps writing; restarting HTTP rejects its old IDs without changing MCP credentials')
+
+  await page.evaluate(() => { window.__integrationBridge.services.mcp.deferStop = true })
+  await dialog.getByRole('switch', { name: 'MCP', exact: true }).click()
+  await page.waitForFunction(() => typeof window.__integrationBridge.services.mcp.finishStop === 'function')
+  assert.equal((await request(page, 'get_state', {}, { serviceId: firstMcp.serviceId })).response.error?.status, 503)
+  const duringMcpStop = await snapshot(page, 'http')
+  duringMcpStop.state.employees[0].name = 'MCP 停止期间 HTTP 仍可修改'
+  const continuedHttp = await request(page, 'replace_state', duringMcpStop, { source: 'http' })
+  assert.equal(continuedHttp.service, 'http')
+  assert.equal(continuedHttp.persisted.provenance.fields['employees.qa-1.name'].source, 'http')
+  await page.evaluate(() => { const mcp = window.__integrationBridge.services.mcp; mcp.deferStop = false; mcp.finishStop() })
+  await setService(page, dialog, 'mcp', false)
+  assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).getAttribute('aria-checked'), 'true')
+  assert.deepEqual(await page.evaluate(() => window.__integrationBridge.services.http.info), secondHttp)
+  assert.equal((await snapshot(page, 'http')).state.employees[0].name, 'MCP 停止期间 HTTP 仍可修改')
+  await screenshot(page, 'settings-http-survives-mcp-stop')
+  await setService(page, dialog, 'mcp', true)
+  assert.equal((await request(page, 'get_state', {}, { serviceId: firstMcp.serviceId })).response.error?.status, 503)
+  assert.deepEqual(await page.evaluate(() => window.__integrationBridge.services.http.info), secondHttp)
+  record('stopping MCP leaves HTTP fully operational and attributed as HTTP; restarting MCP cannot reuse stale session IDs or alter HTTP credentials')
+  await page.close()
 }
 async function checkAggregatedCards() {
   const seed = clone(fixture)
@@ -357,8 +487,11 @@ async function main() {
     record('settings gear is a 32px SVG-only button at the far right of desktop and narrow topbars')
     let dialog = await openSettings(page)
     const toggle = dialog.getByRole('switch', { name: 'MCP', exact: true })
-    await page.waitForFunction(() => !document.querySelector('[role="switch"]').disabled)
+    await setService(page, dialog, 'mcp', false)
+    await setService(page, dialog, 'http', false)
+    assert.equal(await dialog.getByRole('switch').count(), 2)
     assert.equal(await toggle.getAttribute('aria-checked'), 'false')
+    assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).getAttribute('aria-checked'), 'false')
     assert.equal(await dialog.getByRole('checkbox').count(), 4)
     for (const [name, checked] of [['成员', true], ['班次', false], ['排班规则', false], ['排班结果', false]]) {
       const checkbox = dialog.getByRole('checkbox', { name: `允许修改${name}`, exact: true })
@@ -369,11 +502,16 @@ async function main() {
     assert.doesNotMatch(await dialog.innerText(), /npm|服务地址|连接并启用同步|同步方向/)
     await toggle.click()
     await page.waitForFunction(() => document.querySelector('[role="switch"]').getAttribute('aria-checked') === 'true')
-    const firstInfo = await page.evaluate(() => window.__integrationBridge.info)
-    assert.equal(await page.evaluate(() => window.__integrationBridge.starts), 1)
+    const firstInfo = await page.evaluate(() => window.__integrationBridge.services.mcp.info)
+    assert.equal(await dialog.getByRole('switch', { name: 'HTTP API', exact: true }).getAttribute('aria-checked'), 'false')
+    await setService(page, dialog, 'http', true)
+    const httpInfo = await page.evaluate(() => window.__integrationBridge.services.http.info)
+    assert.notEqual(httpInfo.token, firstInfo.token)
+    assert.notEqual(httpInfo.url, firstInfo.url)
+    assert.equal(await page.evaluate(() => window.__integrationBridge.services.mcp.starts), 1)
     assert.match(await dialog.innerText(), /已开启/)
     assert.ok((await dialog.innerText()).includes(`${firstInfo.url}/mcp`))
-    assert.ok((await dialog.innerText()).includes(`${firstInfo.url}/api`))
+    assert.ok((await dialog.innerText()).includes(`${httpInfo.url}/api`))
     assert.ok(!(await dialog.innerText()).includes(firstInfo.token))
     const configColors = await dialog.getByRole('button', { name: '复制 MCP 配置', exact: true }).evaluate(node => ({ background: getComputedStyle(node).backgroundColor, color: getComputedStyle(node).color }))
     assert.equal(configColors.background, 'rgb(36, 91, 78)')
@@ -383,30 +521,38 @@ async function main() {
     await dialog.getByRole('button', { name: '复制 MCP 地址', exact: true }).click()
     assert.equal(await copied(page), `${firstInfo.url}/mcp`)
     await dialog.getByRole('button', { name: '复制 HTTP API 地址', exact: true }).click()
-    assert.equal(await copied(page), `${firstInfo.url}/api`)
-    await dialog.getByRole('button', { name: '显示访问令牌', exact: true }).click()
+    assert.equal(await copied(page), `${httpInfo.url}/api`)
+    await dialog.getByRole('button', { name: '显示 MCP 访问令牌', exact: true }).click()
     assert.ok((await dialog.innerText()).includes(firstInfo.token))
-    await dialog.getByRole('button', { name: '隐藏访问令牌', exact: true }).click()
+    await dialog.getByRole('button', { name: '隐藏 MCP 访问令牌', exact: true }).click()
     assert.ok(!(await dialog.innerText()).includes(firstInfo.token))
-    await dialog.getByRole('button', { name: '复制访问令牌', exact: true }).click()
+    await dialog.getByRole('button', { name: '复制 MCP 访问令牌', exact: true }).click()
     assert.equal(await copied(page), firstInfo.token)
+    await dialog.getByRole('button', { name: '显示 HTTP 访问令牌', exact: true }).click()
+    assert.ok((await dialog.innerText()).includes(httpInfo.token))
+    assert.ok(!(await dialog.innerText()).includes(firstInfo.token))
+    await dialog.getByRole('button', { name: '隐藏 HTTP 访问令牌', exact: true }).click()
+    await dialog.getByRole('button', { name: '复制 HTTP 访问令牌', exact: true }).click()
+    assert.equal(await copied(page), httpInfo.token)
     await dialog.getByRole('button', { name: '复制 MCP 配置', exact: true }).click()
     const config = JSON.parse(await copied(page)).mcpServers['shift-schedule-expert']
     assert.deepEqual(config, { type: 'http', url: `${firstInfo.url}/mcp`, headers: { Authorization: `Bearer ${firstInfo.token}` } })
     assert.ok(!(await dialog.innerText()).includes(firstInfo.token))
+    assert.ok(!(await dialog.innerText()).includes(httpInfo.token))
     await screenshot(page, 'desktop-enabled')
-    record('addresses and token copy correctly; token stays masked; copied MCP config includes usable credentials')
+    record('both services copy their own addresses and tokens without leaking the other token; MCP config includes only MCP credentials')
+    await checkHttpDocs(page, dialog, httpInfo, firstInfo)
 
     await dialog.getByRole('button', { name: '关闭设置', exact: true }).focus()
     await page.keyboard.press('Shift+Tab')
-    assert.equal(await dialog.getByRole('button', { name: '复制 MCP 配置', exact: true }).evaluate(node => node === document.activeElement), true)
+    assert.equal(await dialog.getByRole('checkbox', { name: '允许修改排班结果', exact: true }).evaluate(node => node === document.activeElement), true)
     await page.keyboard.press('Tab')
     assert.equal(await dialog.getByRole('button', { name: '关闭设置', exact: true }).evaluate(node => node === document.activeElement), true)
     await page.keyboard.press('Escape')
     await dialog.waitFor({ state: 'detached' })
     assert.equal(await page.getByRole('button', { name: '设置', exact: true }).evaluate(node => node === document.activeElement), true)
-    assert.equal(await page.evaluate(() => window.__integrationBridge.info.enabled), true)
-    assert.equal(await page.evaluate(() => window.__integrationBridge.stops), 0)
+    assert.equal(await page.evaluate(() => window.__integrationBridge.services.mcp.info.enabled), true)
+    assert.equal(await page.evaluate(() => window.__integrationBridge.services.mcp.stops), 0)
     record('settings trap keyboard focus, restore focus on Escape and keep MCP running after closing')
 
     await section(page, '成员管理')
@@ -457,9 +603,9 @@ async function main() {
     record('enabled connection details fit mobile viewports at 390px and 320px')
 
     const beforeStop = await snapshot(page)
-    await page.evaluate(() => { window.__integrationBridge.deferStop = true })
+    await page.evaluate(() => { window.__integrationBridge.services.mcp.deferStop = true })
     await dialog.getByRole('switch', { name: 'MCP', exact: true }).click()
-    await page.waitForFunction(() => typeof window.__integrationBridge.finishStop === 'function')
+    await page.waitForFunction(() => typeof window.__integrationBridge.services.mcp.finishStop === 'function')
     assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).getAttribute('aria-checked'), 'false')
     assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).isDisabled(), true)
     const queued = clone(beforeStop)
@@ -467,16 +613,16 @@ async function main() {
     const rejectedQueued = await request(page, 'replace_state', queued)
     assert.equal(rejectedQueued.response.error.status, 503)
     assert.equal(rejectedQueued.persisted.employees[0].name, '外部 AI 已修改成员')
-    await page.evaluate(() => { window.__integrationBridge.deferStop = false; window.__integrationBridge.finishStop() })
+    await page.evaluate(() => { window.__integrationBridge.services.mcp.deferStop = false; window.__integrationBridge.services.mcp.finishStop() })
     await page.waitForFunction(() => !document.querySelector('[role="switch"]').disabled)
     assert.equal(await dialog.getByRole('button', { name: '复制 MCP 配置', exact: true }).count(), 0)
-    assert.equal(await page.evaluate(() => window.__integrationBridge.stops), 1)
+    assert.equal(await page.evaluate(() => window.__integrationBridge.services.mcp.stops), 1)
     assert.equal((await request(page, 'get_state')).response.error.status, 503)
     record('switching off immediately rejects queued data access while native stop is still pending')
 
     await dialog.getByRole('switch', { name: 'MCP', exact: true }).click()
     await page.waitForFunction(() => document.querySelector('[role="switch"]').getAttribute('aria-checked') === 'true')
-    const secondInfo = await page.evaluate(() => window.__integrationBridge.info)
+    const secondInfo = await page.evaluate(() => window.__integrationBridge.services.mcp.info)
     assert.notEqual(secondInfo.token, firstInfo.token)
     await dialog.getByRole('button', { name: '复制 MCP 配置', exact: true }).click()
     assert.equal(JSON.parse(await copied(page)).mcpServers['shift-schedule-expert'].headers.Authorization, `Bearer ${secondInfo.token}`)
@@ -567,7 +713,11 @@ async function main() {
     const noMetadataChange = await request(page, 'replace_state', metadataOnly, { source: 'mcp' })
     assert.deepEqual(noMetadataChange.response.result, await snapshot(page))
     assert.deepEqual(noMetadataChange.persisted.provenance, trusted.persisted.provenance)
-    await deniedWithoutMutation(page, 'replace_state', clone(await snapshot(page)), { source: 'forged' })
+    const beforeInvalidSource = await snapshot(page)
+    const invalidId = `invalid-source-${++nextRequest}`
+    await page.evaluate(({ requestId, args }) => window.__emitIntegrationRequest({ requestId, serviceId: window.__integrationBridge.services.mcp.info.serviceId, method: 'replace_state', args, source: 'forged', expiresAt: Date.now() + 10000 }), { requestId: invalidId, args: clone(beforeInvalidSource) })
+    assert.deepEqual(await snapshot(page), beforeInvalidSource)
+    assert.equal(await page.evaluate(requestId => window.__integrationBridge.responses[requestId], invalidId), undefined)
     record('caller-provided metadata and args.source cannot forge field provenance or erase pending external-change notices')
 
     await section(page, '成员管理')
@@ -862,12 +1012,16 @@ async function main() {
     }
     record('compact settings at 800x600, short, and 320px viewports scroll internally with a stationary heading and accessible close/copy controls')
     await page.close()
+    await checkIndependentServices()
     await checkAggregatedCards()
 
     const web = await preparePage(false)
     dialog = await openSettings(web)
-    assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).isDisabled(), true)
-    assert.equal(await dialog.getByRole('switch', { name: 'MCP', exact: true }).getAttribute('aria-checked'), 'false')
+    assert.equal(await dialog.getByRole('switch').count(), 2)
+    for (const name of ['MCP', 'HTTP API']) {
+      assert.equal(await dialog.getByRole('switch', { name, exact: true }).isDisabled(), true)
+      assert.equal(await dialog.getByRole('switch', { name, exact: true }).getAttribute('aria-checked'), 'false')
+    }
     assert.match(await dialog.innerText(), /请使用桌面版/)
     assert.equal(await dialog.getByRole('checkbox').count(), 4)
     for (const [name, checked] of [['成员', true], ['班次', false], ['排班规则', false], ['排班结果', false]]) {

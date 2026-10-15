@@ -44,6 +44,31 @@ pub struct ServerInfo {
     pub service_id: String,
 }
 
+/// Each service owns a separate listener, credentials and pending-request queue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Service {
+    #[default]
+    Mcp,
+    Http,
+}
+
+impl Service {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mcp => "MCP",
+            Self::Http => "HTTP",
+        }
+    }
+
+    fn supports_path(self, path: &str) -> bool {
+        match self {
+            Self::Mcp => path == "/mcp",
+            Self::Http => matches!(path, "/api/state" | "/api/assignments" | "/api/validate"),
+        }
+    }
+}
+
 /// Set by the transport route, never taken from client arguments or headers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -78,20 +103,32 @@ pub struct BridgeResponse {
 pub type EmitRequest = Arc<dyn Fn(BridgeRequest) -> Result<(), String> + Send + Sync>;
 
 pub struct ServerOptions {
+    pub service: Service,
     pub port: u16,
     pub request_timeout: Duration,
 }
 
 impl Default for ServerOptions {
     fn default() -> Self {
+        Self::for_service(Service::Mcp)
+    }
+}
+
+impl ServerOptions {
+    pub fn for_service(service: Service) -> Self {
         Self {
-            port: 4318,
+            service,
+            port: match service {
+                Service::Mcp => 4318,
+                Service::Http => 4319,
+            },
             request_timeout: Duration::from_secs(15),
         }
     }
 }
 
 struct Shared {
+    service: Service,
     info: ServerInfo,
     active: AtomicBool,
     emit: EmitRequest,
@@ -103,7 +140,7 @@ impl Shared {
     fn cancel(&self) {
         self.active.store(false, Ordering::SeqCst);
         for (_, pending) in self.pending.lock().unwrap().drain() {
-            let _ = pending.send(Err(failure(503, "MCP 服务已关闭")));
+            let _ = pending.send(Err(failure(503, "服务已关闭")));
         }
     }
 
@@ -119,7 +156,7 @@ impl Shared {
         {
             let mut pending = self.pending.lock().unwrap();
             if !self.active.load(Ordering::SeqCst) {
-                return Err(failure(503, "MCP 服务已关闭"));
+                return Err(failure(503, "服务已关闭"));
             }
             if pending.len() >= MAX_PENDING {
                 return Err(failure(429, "请求过多，请稍后重试"));
@@ -147,7 +184,7 @@ impl Shared {
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(failure(503, "MCP 服务已关闭")),
+            Ok(Err(_)) => Err(failure(503, "服务已关闭")),
             Err(_) => Err(failure(504, "应用响应超时，请确认排班窗口已打开")),
         }
     }
@@ -180,6 +217,7 @@ impl Server {
         };
         let address = listener.local_addr()?;
         let shared = Arc::new(Shared {
+            service: options.service,
             info: ServerInfo {
                 enabled: true,
                 url: format!("http://127.0.0.1:{}", address.port()),
@@ -240,7 +278,7 @@ impl Server {
     pub fn respond(&self, request_id: &str, response: BridgeResponse) -> Result<(), String> {
         let mut pending = self.shared.pending.lock().unwrap();
         if !self.shared.active.load(Ordering::SeqCst) {
-            return Err("MCP 服务已关闭".into());
+            return Err("服务已关闭".into());
         }
         let sender = pending.remove(request_id).ok_or("请求已过期或已完成")?;
         let result = if let Some(error) = response.error {
@@ -343,13 +381,17 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     }) {
         return error_response(failure(403, "Origin forbidden"));
     }
-    let mut response = if request.method() == Method::OPTIONS {
+    let mut response = if !shared.service.supports_path(request.uri().path()) {
+        // Route isolation also applies to unauthenticated requests and preflight:
+        // credentials for this listener never expose the other protocol.
+        error_response(failure(404, "Not found"))
+    } else if request.method() == Method::OPTIONS {
         // Browser preflight carries no Bearer token and never accesses planner data.
         StatusCode::NO_CONTENT.into_response()
     } else if !authorized(headers, &shared.info.token) {
         error_response(failure(401, "访问令牌无效"))
     } else if !shared.active.load(Ordering::SeqCst) {
-        error_response(failure(503, "MCP 服务已关闭"))
+        error_response(failure(503, "服务已关闭"))
     } else {
         let expires_at = now_ms().saturating_add(shared.timeout.as_millis() as u64);
         match tokio::time::timeout(shared.timeout, route(shared.clone(), request, expires_at)).await
@@ -378,6 +420,9 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
 async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Response {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
+    if !shared.service.supports_path(&path) {
+        return error_response(failure(404, "Not found"));
+    }
     if path == "/mcp"
         && request
             .headers()
