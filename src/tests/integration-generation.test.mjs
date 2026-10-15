@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { createIntegrationHandler, IntegrationError } from '../integrationData.ts'
 import { parseBackup } from '../storage.ts'
 import { createPayrollConfig } from '../payroll.ts'
+import { checkSchedule } from '../scheduleCheck.ts'
 
 const allPermissions = { members: true, shifts: true, rules: true, assignments: true }
 const oldTime = '2020-01-01T00:00:00.000Z'
@@ -66,6 +67,7 @@ function setup(initial = fixture()) {
     failRelease: error => { releaseError = error },
     failAcquire: error => { acquireError = error },
     onApply: callback => { onApply = callback },
+    setCheck: callback => { adapter.check = callback },
     generate(args = {}, source = 'mcp', context) {
       const input = { revision: read(source).revision, ...args }
       return Promise.resolve().then(() => handle('generate_schedule', input, source, context))
@@ -96,8 +98,13 @@ test('successful generation confirms only the target month and never saves provi
   assert.equal(outcome.boundaryContext.endDate, '2026-11-01')
   assert.equal(outcome.boundaryContext.referenceDate, app.calls[0].request.options.referenceDate)
   assert.ok(outcome.issues.some(issue => issue.type.startsWith('boundary-')))
+  assert.equal(outcome.validation.month, '2026-10')
+  assert.equal(outcome.validation.status, 'pending')
+  assert.ok(outcome.validation.issues.some(issue => issue.type.startsWith('boundary-')))
+  assert.ok(Number.isFinite(Date.parse(outcome.validation.checkedAt)))
   assert.ok(!Object.hasOwn(app.state(), 'boundaryPreview'))
   assert.ok(!Object.hasOwn(app.state(), 'boundaryContext'))
+  assert.ok(!Object.hasOwn(app.state(), 'validation'))
   assert.deepEqual(parseBackup(JSON.stringify(app.state())).scheduleCoverage, app.state().scheduleCoverage)
 })
 
@@ -172,6 +179,7 @@ test('generation accepts month and time-limit boundaries and defaults to current
     const result = await finish(app, {}, args)
     assert.equal(result.success, true)
     assert.equal(result.month, args.month ?? '2026-10')
+    assert.equal(result.validation.month, args.month ?? '2026-10')
     assert.equal(app.calls[0].request.options.timeLimitSeconds, args.timeLimitSeconds ?? 15)
     assert.equal(app.calls[0].request.options.allowPartial, false)
     assert.equal(app.state().month, '2026-10', 'generating a different month does not navigate the calendar')
@@ -268,11 +276,127 @@ test('solver non-success is a structured unsaved outcome with diagnostics, and r
     assert.equal(result.generatedAt, undefined)
     assert.ok(result.message.length > 0)
     assert.equal(result.issues[0].id, 'conflict')
+    assert.equal(result.validation.month, '2026-10')
+    assert.deepEqual(result.validation.issues, checkSchedule(before.state).issues)
     assert.deepEqual(result.stats, { wallTimeSeconds: 0.25, shortageCount: 0, optimal: false })
     assert.deepEqual(app.read(), before)
     assert.equal(app.saves(), 0)
     assert.equal(app.held(), 0)
     assert.equal(app.releases.length, 1)
+    assert.equal((await finish(app)).success, true)
+  }
+})
+
+test('formal validation checks the saved target month without preview and never persists check metadata', async () => {
+  const app = setup(), before = app.read(), checked = []
+  app.setCheck(async state => {
+    assert.equal(app.saves(), 0)
+    assert.equal(app.held(), 1)
+    assert.equal(state.month, '2026-11')
+    assert.deepEqual(structuredClone(state.scheduleCoverage), { '2026-11': { employeeIds: ['e1', 'e2'] } })
+    assert.deepEqual(state.assignments, [assignment('2026-11-02')])
+    assert.ok(!Object.hasOwn(state, 'boundaryPreview'))
+    assert.ok(!Object.hasOwn(state, 'boundaryContext'))
+    assert.equal(state.provenance, before.state.provenance)
+    const result = checkSchedule(state)
+    checked.push(result)
+    return result
+  })
+  const result = await finish(app, { assignments: [assignment('2026-11-02')], boundaryPreview: [assignment('2026-12-01', 'e2')] }, { month: '2026-11' }, 'http')
+  assert.equal(result.success, true)
+  assert.equal(result.validation, checked[0])
+  assert.equal(result.validation.month, '2026-11')
+  assert.equal(result.validation.status, 'pending')
+  assert.equal(app.state().month, '2026-10')
+  assert.deepEqual(app.state().assignments, [assignment('2026-11-02')])
+  assert.ok(!Object.hasOwn(app.state(), 'validation'))
+  assert.ok(!Object.hasOwn(app.state(), 'checkedAt'))
+  assert.ok(!Object.hasOwn(app.state(), 'boundaryPreview'))
+})
+
+test('unsuccessful generation checks the retained target-month roster, not the rejected solver assignments', async () => {
+  const initial = fixture()
+  initial.assignments = [assignment('2026-11-02')]
+  initial.employees[0].unavailableDates = ['2026-11-02']
+  const app = setup(initial), before = app.read(), checked = []
+  app.setCheck(async state => {
+    assert.equal(state.month, '2026-11')
+    assert.deepEqual(state.assignments, before.state.assignments)
+    assert.equal(state.scheduleCoverage, undefined)
+    const result = checkSchedule(state)
+    checked.push(result)
+    return result
+  })
+  const result = await finish(app, { status: 'INFEASIBLE', assignments: [], issues: [{ id: 'solver-conflict', type: 'coverage-capacity', severity: 'error', message: '没有可行方案' }] }, { month: '2026-11' })
+  assert.equal(result.success, false)
+  assert.equal(result.validation, checked[0])
+  assert.equal(result.validation.month, '2026-11')
+  assert.equal(result.validation.status, 'noncompliant')
+  assert.ok(result.validation.issues.some(issue => issue.type === 'unavailable'))
+  assert.equal(result.issues[0].id, 'solver-conflict')
+  assert.deepEqual(app.read(), before)
+  assert.equal(app.saves(), 0)
+})
+
+test('asynchronous formal checking retains the lease and all lifecycle guards before claiming a commit', async () => {
+  for (const kind of ['state', 'lease', 'permission', 'context', 'abort']) {
+    const app = setup(), check = deferred(), entered = deferred(), controller = new AbortController()
+    let active = true, claims = 0
+    app.setCheck(state => { entered.resolve(state); return check.promise })
+    const pending = app.generate({}, 'http', {
+      signal: controller.signal,
+      assertActive() { if (!active) throw new IntegrationError('请求已过期', 409) },
+      claimCommit: async () => { claims++ },
+    })
+    const call = await app.nextSolve()
+    call.resolve(response(call.request, { assignments: [assignment()] }))
+    const stateToCheck = await entered.promise
+    assert.equal(app.held(), 1, kind)
+    assert.equal(app.saves(), 0, kind)
+    assert.equal(claims, 0, kind)
+    assert.throws(() => app.handle('set_assignment', { revision: app.read().revision, ...assignment() }, 'mcp'), statusIs(409), kind)
+    if (kind === 'state') app.edit(state => { state.rules.minRestHours = 12 })
+    if (kind === 'lease') app.invalidateLease()
+    if (kind === 'permission') app.setPermissions({ ...allPermissions, assignments: false })
+    if (kind === 'context') active = false
+    if (kind === 'abort') controller.abort(new IntegrationError('请求已取消', 409))
+    const before = app.read()
+    check.resolve(checkSchedule(stateToCheck))
+    await assert.rejects(pending, error => error instanceof IntegrationError && [403, 409].includes(error.status), kind)
+    assert.deepEqual(app.read(), before, kind)
+    assert.equal(claims, 0, kind)
+    assert.equal(app.saves(), 0, kind)
+    assert.equal(app.held(), 0, kind)
+  }
+})
+
+test('cancelling while checking a failed solve does not return a stale validation result', async () => {
+  const app = setup(), before = app.read(), gate = deferred(), entered = deferred(), controller = new AbortController()
+  app.setCheck(state => { entered.resolve(state); return gate.promise })
+  const pending = app.generate({}, 'mcp', { signal: controller.signal })
+  const call = await app.nextSolve()
+  call.resolve(response(call.request, { status: 'INFEASIBLE' }))
+  const stateToCheck = await entered.promise
+  controller.abort(new IntegrationError('请求已取消', 409))
+  gate.resolve(checkSchedule(stateToCheck))
+  await assert.rejects(pending, statusIs(409))
+  assert.deepEqual(app.read(), before)
+  assert.equal(app.saves(), 0)
+  assert.equal(app.held(), 0)
+})
+
+test('an unexpected formal-check failure is reported before claiming or saving and releases the lease', async () => {
+  for (const status of ['FEASIBLE', 'INFEASIBLE']) {
+    const app = setup(), before = app.read(), failure = new Error('规则检查工作线程退出')
+    let claims = 0
+    app.setCheck(async () => { throw failure })
+    await assert.rejects(finish(app, { status }, {}, 'mcp', { claimCommit: async () => { claims++ } }), error => error === failure)
+    assert.deepEqual(app.read(), before)
+    assert.equal(claims, 0)
+    assert.equal(app.saves(), 0)
+    assert.equal(app.held(), 0)
+    assert.equal(app.releases[0].error, failure)
+    app.setCheck(undefined)
     assert.equal((await finish(app)).success, true)
   }
 })

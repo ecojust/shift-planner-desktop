@@ -2,10 +2,10 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from 'vue'
 import Icon from './Icon.vue'
 
-type ScheduleStatus = 'empty' | 'scheduled' | 'invalid' | 'pending' | 'conflict'
+type ScheduleStatus = 'empty' | 'scheduled' | 'invalid' | 'pending' | 'conflict' | 'checking'
 type ScheduleStatusEntry = ScheduleStatus | { status: ScheduleStatus; description?: string }
 const props = defineProps<{ modelValue: string; scheduleStatuses?: Readonly<Record<string, ScheduleStatusEntry>>; getScheduleStatus?: (month: string) => ScheduleStatusEntry }>()
-const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
+const emit = defineEmits<{ 'update:modelValue': [value: string]; 'visible-months': [months: string[]] }>()
 const id = useId()
 const trigger = ref<HTMLButtonElement | null>(null)
 const panel = ref<HTMLElement | null>(null)
@@ -22,7 +22,7 @@ const years = computed(() => Array.from({ length: Math.min(12, 10000 - yearPage.
 const position = ref({ left: '12px', top: '12px' })
 const formattedYear = (value: number) => String(value).padStart(4, '0')
 const title = computed(() => `${formattedYear(selectedYear.value)} 年 ${selectedMonth.value} 月`)
-const statusLabels: Record<ScheduleStatus, string> = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效', pending: '已排班 · 跨月待确认', conflict: '排班有冲突，需重新检查' }
+const statusLabels: Record<ScheduleStatus, string> = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效', pending: '已排班 · 跨月待核对', conflict: '不符合规则', checking: '正在检查' }
 function statusInfo(value: string) {
   const entry = props.getScheduleStatus?.(value) ?? props.scheduleStatuses?.[value]
   const status = typeof entry === 'string' ? entry : entry?.status ?? 'empty'
@@ -35,6 +35,8 @@ const monthChoices = computed(() => months.map(month => {
   const value = `${formattedYear(year.value)}-${String(month).padStart(2, '0')}`
   return { month, ...statusInfo(value) }
 }))
+watch([visible, year, mode], () => emit('visible-months', visible.value && mode.value === 'months'
+  ? months.map(month => `${formattedYear(year.value)}-${String(month).padStart(2, '0')}`) : []))
 
 function positionPanel() {
   if (!visible.value || !trigger.value || !panel.value) return
@@ -167,7 +169,7 @@ onUnmounted(() => {
       <div v-if="mode === 'months'" class="sp-month-picker-grid" role="group" :aria-label="`${year} 年的月份`">
         <button v-for="choice in monthChoices" :key="choice.month" type="button" class="sp-month-picker-choice" :data-month="choice.month" :data-schedule-status="choice.status" :tabindex="choice.month === focusedMonth ? 0 : -1" :aria-label="`${year} 年 ${choice.month} 月`" :aria-describedby="`${id}-month-${choice.month}-status`" :title="choice.description" :aria-pressed="year === selectedYear && choice.month === selectedMonth" @focus="focusedMonth = choice.month" @keydown="monthKey($event, choice.month)" @click="chooseMonth(choice.month)">
           <span class="sp-month-picker-name">{{ choice.month }} 月</span>
-          <span class="sp-month-picker-status" :class="`is-${choice.status}`" aria-hidden="true"><Icon :name="['invalid', 'pending', 'conflict'].includes(choice.status) ? 'info' : choice.status === 'scheduled' ? 'check' : 'calendar'" :size="12" /><span class="sp-month-picker-status-copy"><template v-if="choice.status === 'invalid'"><span>规则已修改</span><span>排班已失效</span></template><template v-else-if="choice.status === 'pending'"><span>已排班</span><span>跨月待确认</span></template><template v-else-if="choice.status === 'conflict'"><span>排班有冲突</span><span>需重新检查</span></template><span v-else>{{ choice.label }}</span></span></span>
+          <span class="sp-month-picker-status" :class="`is-${choice.status}`" aria-hidden="true"><Icon :name="choice.status === 'checking' ? 'clock' : ['invalid', 'pending', 'conflict'].includes(choice.status) ? 'info' : choice.status === 'scheduled' ? 'check' : 'calendar'" :size="12" /><span class="sp-month-picker-status-copy"><template v-if="choice.status === 'invalid'"><span>规则已修改</span><span>排班已失效</span></template><template v-else-if="choice.status === 'pending'"><span>已排班</span><span>跨月待核对</span></template><template v-else-if="choice.status === 'conflict'"><span>不符合规则</span><span>查看具体原因</span></template><span v-else>{{ choice.label }}</span></span></span>
           <span :id="`${id}-month-${choice.month}-status`" class="sp-month-picker-sr-only">{{ choice.description }}</span>
         </button>
       </div>

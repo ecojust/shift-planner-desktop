@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import Icon from './Icon.vue'
 import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
@@ -14,10 +14,13 @@ import SourceBadge from './SourceBadge.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import MonthPicker from './MonthPicker.vue'
 import BoundaryWeekNotice from './BoundaryWeekNotice.vue'
+import ScheduleCheckPanel from './ScheduleCheckPanel.vue'
+import { createScheduleCheckRunner, type ScheduleCheckEvent } from './scheduleCheckRunner'
+import type { ScheduleCheckResult } from './scheduleCheck'
 import AppSelect from './AppSelect.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { makeDefaultState } from './defaults'
-import { datesOfMonth, shiftHours, validateSchedule, validateBoundaryPreview } from './scheduler'
+import { datesOfMonth, shiftHours, validateBoundaryPreview } from './scheduler'
 import { clearScheduleCoverage, markScheduleCoverageComplete, pruneScheduleCoverage } from './scheduleCoverage'
 import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP_BYTES } from './storage'
 import { calculatePayroll, createPayrollConfig, dayInfo, payrollRows } from './payroll'
@@ -68,6 +71,7 @@ const deleteMonthButton = ref<HTMLButtonElement | null>(null)
 const cancelMonthDeletionButton = ref<HTMLButtonElement | null>(null)
 const generating = ref(false)
 const cancelling = ref(false)
+const checkingGeneratedSchedule = ref(false)
 const solveTimeLimit = ref(15)
 const elapsedSeconds = ref(0)
 const phaseSeconds = ref(0)
@@ -91,10 +95,11 @@ type ExternalGenerationJob = {
   running: boolean
   abortReason?: unknown
   removeAbort?: () => void
+  cancelCheck?: () => void
   cancelPromise?: Promise<boolean>
 }
 let externalGenerationJob: ExternalGenerationJob | null = null
-const solverFeedback = ref<{ success: boolean; message: string; details: string[]; issues: Issue[]; diagnostic: boolean; attempt: Attempt | null; stale: boolean } | null>(null)
+const solverFeedback = ref<{ month: string; success: boolean; message: string; details: string[]; issues: Issue[]; diagnostic: boolean; attempt: Attempt | null; stale: boolean } | null>(null)
 const expandedFeedback = ref(false)
 let engineCheckPending = false
 let unlistenProgress: (() => void) | null = null
@@ -128,6 +133,7 @@ function integrationEditingBusy() {
   return employeeReorder.active.value || !!saveError.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || readingRules.value || !!rulesImportCandidate.value || !!monthDeletion.value || !!calendarReset.value || showBackup.value || section.value !== 'calendar'
 }
 const integrationGeneration: IntegrationGenerationAdapter = {
+  check: checkIntegrationSchedule,
   acquire(request, source) {
     if (!desktop || disposed) throw new IntegrationError('桌面排班服务暂不可用', 503)
     if (generating.value || externalGenerationJob || integrationEditingBusy()) throw new IntegrationError('应用正在编辑或生成排班，请完成操作并返回排班日历后重试', 409)
@@ -264,40 +270,111 @@ const monthScheduleStatuses = computed(() => {
     const invalidation = state.value.provenance?.invalidatedSchedules?.[month]
     statuses[month] = invalidation ? {
       status: 'invalid',
-      description: `成员、班次或规则已于 ${formatChangeTime(invalidation.at)} 修改。已有排班记录仍保留，请按当前配置重新生成。`,
+      description: `成员、班次或规则已于 ${formatChangeTime(invalidation.at)} 修改。已有排班记录仍保留，正在按当前配置核对规则。`,
     } : { status: 'scheduled' }
   }
   return statuses
 })
-// The picker requests only its visible months. Cache their checks per document
-// revision instead of validating every historical month on each render.
+// Checks run away from the UI thread. The cache contains only results for the
+// current rule/roster input; switching months always starts a fresh active check.
+const checksByMonth = shallowRef<Record<string, ScheduleCheckEvent>>({})
+const currentScheduleCheck = computed<ScheduleCheckEvent>(() => checksByMonth.value[state.value.month] ?? { status: 'checking', month: state.value.month })
+const scheduleInput = computed(() => JSON.stringify({
+  employees: state.value.employees.map(({ avatar: _avatar, ...employee }) => employee),
+  shifts: state.value.shifts, rules: state.value.rules,
+  assignments: state.value.assignments, scheduleCoverage: state.value.scheduleCoverage,
+}))
+const createCheckWorker = () => new Worker(new URL('./schedule-check.worker.ts', import.meta.url), { type: 'module' })
+function recordScheduleCheck(event: ScheduleCheckEvent) {
+  if (!disposed) checksByMonth.value = { ...checksByMonth.value, [event.month]: event }
+}
+const currentCheckRunner = createScheduleCheckRunner({ createWorker: createCheckWorker, onChange: recordScheduleCheck })
+let visibleCheckMonths: string[] = []
+let checkQueue: string[] = []
+let gridCheckTimer = 0
+const gridCheckRunner = createScheduleCheckRunner({ createWorker: createCheckWorker, onChange(event) {
+  recordScheduleCheck(event)
+  if (event.status !== 'checking') scheduleNextGridCheck()
+} })
+function scheduleNextGridCheck() {
+  window.clearTimeout(gridCheckTimer)
+  gridCheckTimer = window.setTimeout(() => {
+    if (disposed) return
+    let month: string | undefined
+    while ((month = checkQueue.shift())) {
+      if (month !== state.value.month && monthScheduleStatuses.value[month] && !checksByMonth.value[month]) {
+        gridCheckRunner.start({ ...state.value, month })
+        return
+      }
+    }
+  }, 0)
+}
+function checkVisibleMonths(months: string[]) {
+  visibleCheckMonths = months
+  // Keep a completed cache, but cancel work for a closed or replaced picker.
+  gridCheckRunner.cancel()
+  const retained = Object.fromEntries(Object.entries(checksByMonth.value).filter(([month, check]) => month === state.value.month || check.status !== 'checking'))
+  checksByMonth.value = retained
+  checkQueue = months.filter(month => month !== state.value.month && !!monthScheduleStatuses.value[month] && !retained[month])
+  scheduleNextGridCheck()
+}
+function refreshScheduleCheck() {
+  currentCheckRunner.start(state.value)
+  checkVisibleMonths(visibleCheckMonths)
+}
+const pendingIntegrationChecks = new Set<() => void>()
+function checkIntegrationSchedule(document: PlannerState): Promise<ScheduleCheckResult> {
+  checkingGeneratedSchedule.value = true
+  return new Promise((resolve, reject) => {
+    const job = externalGenerationJob
+    const finish = () => {
+      pendingIntegrationChecks.delete(cancel)
+      if (job?.cancelCheck === cancel) job.cancelCheck = undefined
+      checkingGeneratedSchedule.value = false
+      runner.dispose()
+    }
+    const runner = createScheduleCheckRunner({ createWorker: createCheckWorker, onChange(event) {
+      if (event.status === 'checking') return
+      finish()
+      if (event.status === 'ready') resolve(event.result)
+      else reject(new IntegrationError(event.message, 503))
+    } })
+    const cancel = () => { finish(); reject(job?.abortReason instanceof Error ? job.abortReason : new IntegrationError('规则检查已取消', 409)) }
+    pendingIntegrationChecks.add(cancel)
+    if (job) job.cancelCheck = cancel
+    runner.start(document)
+  })
+}
 const monthScheduleStatus = computed(() => {
-  const snapshot = state.value
-  const statuses = monthScheduleStatuses.value
-  const cache = new Map<string, { status: 'empty' | 'scheduled' | 'invalid' | 'pending' | 'conflict'; description?: string }>()
-  // Assignment/coverage/configuration mutations invalidate this small cache.
-  JSON.stringify([snapshot.assignments, snapshot.scheduleCoverage, snapshot.employees, snapshot.shifts, snapshot.rules])
+  const statuses = monthScheduleStatuses.value, checks = checksByMonth.value
   return (month: string) => {
-    if (cache.has(month)) return cache.get(month)!
     const known = statuses[month]
-    if (!known || known.status === 'invalid') return known ?? { status: 'empty' as const }
-    const checks = validateSchedule({ ...snapshot, month })
-    const boundary = checks.filter(issue => issue.type.startsWith('boundary-') || issue.type === 'history-incomplete')
-    const conflict = checks.find(issue => issue.severity === 'error')
-    const entry = conflict ? { status: 'conflict' as const, description: conflict.message }
-      : boundary.length ? { status: 'pending' as const, description: boundary.map(issue => issue.message).join(' ') } : known
-    cache.set(month, entry)
-    return entry
+    if (!known) return { status: 'empty' as const }
+    const check = checks[month]
+    if (!check) return known
+    if (check.status === 'checking') return { status: 'checking' as const, description: '正在按当前配置检查排班规则。' }
+    if (check.status === 'error') return { status: 'pending' as const, description: check.message }
+    if (check.result.status === 'compliant') return { status: 'scheduled' as const, description: '已按当前配置检查，符合规则。' }
+    return { status: check.result.status === 'noncompliant' ? 'conflict' as const : 'pending' as const,
+      description: check.result.issues.map(issue => issue.message).join(' ') }
   }
 })
-const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
+const issues = computed(() => currentScheduleCheck.value.status === 'ready' ? currentScheduleCheck.value.result.issues.map(formatUserIssue) : [])
+const scheduleCheckSummary = computed(() => {
+  const check = currentScheduleCheck.value
+  if (check.status === 'checking') return '正在检查排班规则…'
+  if (check.status === 'error') return '规则检查未完成，请重试。'
+  if (check.result.status === 'noncompliant') return `不符合规则：${check.result.issues.length} 项原因待处理。`
+  if (check.result.status === 'pending') return '跨月规则待核对，请查看具体原因。'
+  return monthHasSchedule.value ? '当前排班符合规则。' : '当前月份尚未排班。'
+})
 const externalChange = computed(() => state.value.provenance?.pendingExternalChange)
 const scheduleUpdate = computed(() => state.value.provenance?.scheduleUpdates?.[state.value.month])
 async function reviewExternalChanges() {
   chooseSection('calendar')
   showIssues.value = true
   await nextTick()
-  document.querySelector('.sp-issues')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  document.querySelector('[aria-label="排班规则检查"]')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
 }
 function acknowledgeExternalChanges() {
   acceptProvenance(() => { if (state.value.provenance) delete state.value.provenance.pendingExternalChange })
@@ -451,8 +528,7 @@ function saveCell() {
   // must not clear its invalidation while replacing its only assignment.
   state.value = { ...state.value, assignments, employees: state.value.employees.map(employee => employee.id === edit.employee.id ? { ...employee, unavailableDates } : employee) }
   editing.value = null
-  const conflict = issues.value.find(i => i.employeeId === edit.employee.id && (!i.date || i.date === edit.date))
-  flash(conflict ? `已保存，请处理冲突：${conflict.message}` : '班次已更新，锁定班次会在重新生成时保留')
+  flash('班次已更新，正在重新检查排班规则；锁定班次会在重新生成时保留')
 }
 function openDate(date: string) { calendarDate.value = date; calendarKind.value = info(date).kind }
 function saveCalendar() { state.value.calendar[calendarDate.value] = calendarKind.value; calendarDate.value = ''; flash('日期类型已更新；津贴按排班领取固定金额') }
@@ -494,6 +570,7 @@ async function cancelExternalGeneration(job: ExternalGenerationJob) {
   job.cancelled = true
   if (externalGenerationJob !== job) return
   discardActiveResult = true; cancelling.value = true; cancellationError.value = ''
+  job.cancelCheck?.()
   if (!job.running) return
   try {
     if (!job.cancelPromise) job.cancelPromise = cancelDesktop(job.request.requestId).finally(() => { job.cancelPromise = undefined })
@@ -516,6 +593,9 @@ function finishGeneration() {
   generating.value = false; cancelling.value = false; activeRequestId = null
   externalGeneration.value = null
   showGenerate.value = false
+  // Failed attempts and identical generated rosters may leave the data
+  // unchanged. Still recheck the visible month after every completed attempt.
+  if (!disposed) refreshScheduleCheck()
   void nextTick(() => {
     if (!disposed && !showGenerate.value && !generating.value) document.querySelector<HTMLButtonElement>('.sp-heading-actions .sp-primary')?.focus({ preventScroll: true })
   })
@@ -524,7 +604,7 @@ function feedback(success: boolean, message: string, details: string[] = [], dia
   const visibleMessage = formatUserMessage(message)
   // Both success paths check the input revision before committing assignments.
   // That commit advances revision itself; it does not make its own result stale.
-  solverFeedback.value = { success, message: visibleMessage, details: [...new Set(details.map(formatUserMessage))].filter(detail => !visibleMessage.includes(detail)), diagnostic, issues: withSolverGuidance(issues).map(formatUserIssue), attempt: activeAttempt, stale: !success && !!activeAttempt && activeAttempt.revision !== revision }
+  solverFeedback.value = { month: activeAttempt?.request.state.month ?? state.value.month, success, message: visibleMessage, details: [...new Set(details.map(formatUserMessage))].filter(detail => !visibleMessage.includes(detail)), diagnostic, issues: withSolverGuidance(issues).map(formatUserIssue), attempt: activeAttempt, stale: !success && !!activeAttempt && activeAttempt.revision !== revision }
   expandedFeedback.value = false
   // The persistent result card is the sole announcement of solver outcomes.
   notice.value = ''; window.clearTimeout(noticeTimer)
@@ -824,6 +904,14 @@ watch(state, () => {
   try { saveLocal(state.value); savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); saveError.value = '' }
   catch { saveError.value = '自动保存失败，请导出 JSON 备份，避免刷新丢失。' }
 }, 350) }, { deep: true, flush: 'sync' })
+watch([scheduleInput, () => state.value.month], ([input], previous) => {
+  if (!previous || input !== previous[0]) {
+    gridCheckRunner.cancel()
+    checksByMonth.value = {}
+    if (previous && solverFeedback.value) solverFeedback.value.stale = true
+  }
+  refreshScheduleCheck()
+}, { immediate: true, flush: 'sync' })
 function settingsChanged(options?: { silent?: boolean }) { history.value = []; if (!options?.silent) flash('设置已保存，重新生成可按新规则安排班次') }
 watch(() => state.value.month, () => { weekIndex.value = 0; history.value = [] }, { flush: 'sync' })
 function flushSave() {
@@ -846,7 +934,7 @@ function escapeKey(event: KeyboardEvent) {
   }
 }
 onMounted(() => { if (desktop) void checkEngine(); document.title = 'Shift Schedule Expert'; window.addEventListener('keydown', escapeKey); window.addEventListener('pagehide', flushSave) })
-onUnmounted(() => { disposed = true; unlistenProgress?.(); unlistenProgress = null; if (activeRequestId) void cancelDesktop(activeRequestId).catch(() => {}); window.clearInterval(generationTimer); flushSave(); window.removeEventListener('keydown', escapeKey); window.removeEventListener('pagehide', flushSave); worker?.terminate(); window.clearTimeout(workerTimer); window.clearTimeout(saveTimer); window.clearTimeout(noticeTimer) })
+onUnmounted(() => { disposed = true; currentCheckRunner.dispose(); gridCheckRunner.dispose(); window.clearTimeout(gridCheckTimer); for (const cancel of pendingIntegrationChecks) cancel(); pendingIntegrationChecks.clear(); unlistenProgress?.(); unlistenProgress = null; if (activeRequestId) void cancelDesktop(activeRequestId).catch(() => {}); window.clearInterval(generationTimer); flushSave(); window.removeEventListener('keydown', escapeKey); window.removeEventListener('pagehide', flushSave); worker?.terminate(); window.clearTimeout(workerTimer); window.clearTimeout(saveTimer); window.clearTimeout(noticeTimer) })
 watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidate], async () => { await nextTick(); (document.querySelector('.sp-modal input, .sp-modal select, .sp-modal button') as HTMLElement | null)?.focus() })
 watch(monthDeletion, async target => { if (target) { await nextTick(); cancelMonthDeletionButton.value?.focus({ preventScroll: true }) } })
 watch([generating, section, importCandidate], () => { if (monthDeletion.value) closeMonthDeletion(false); calendarReset.value = null }, { flush: 'sync' })
@@ -876,7 +964,7 @@ watch([generating, cancelling], async () => {
         <div class="sp-breadcrumb"><button type="button" class="sp-sidebar-toggle sp-icon-button" :aria-label="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" :title="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" :aria-expanded="!sidebarCollapsed" aria-controls="sp-app-sidebar" @click="toggleSidebar"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path :d="sidebarCollapsed ? 'm13 9 3 3-3 3' : 'm16 9-3 3 3 3'"/></svg></button><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" :aria-expanded="mobileNav" aria-controls="sp-app-sidebar" @click="mobileNav = true"><Icon name="menu" /></button><strong>{{ sectionLabel }}</strong></div>
         <div class="sp-global-month" role="group" aria-label="所有面板共用排班月份">
           <button class="sp-icon-button" aria-label="上个月" :disabled="state.month === '0001-01'" @click="navigateMonth(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button>
-          <MonthPicker :model-value="state.month" :get-schedule-status="monthScheduleStatus" @update:model-value="changeMonth" />
+          <MonthPicker :model-value="state.month" :get-schedule-status="monthScheduleStatus" @visible-months="checkVisibleMonths" @update:model-value="changeMonth" />
           <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
           <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
         </div>
@@ -892,7 +980,7 @@ watch([generating, cancelling], async () => {
           <div>
             <strong>外部修改了配置，请核对现有排班</strong>
             <p>最近修改来自 {{ externalChange.source.toUpperCase() }} · {{ formatChangeTime(externalChange.at) }}。待核对：{{ externalChange.categories.join('、') }}。</p>
-            <p>配置修改不会自动重新排班。{{ issues.length ? `当前月份检查出 ${issues.length} 项冲突或提醒，请查看并按需重新生成。` : '当前月份未发现规则冲突，请确认其他月份和配置是否符合预期。' }}</p>
+            <p>配置修改不会自动重新排班。{{ scheduleCheckSummary }}</p>
             <div class="sp-external-actions">
               <button class="sp-button" @click="reviewExternalChanges">查看排班检查</button>
               <button class="sp-button" :disabled="generating" @click="acknowledgeExternalChanges">已核对变更</button>
@@ -903,8 +991,9 @@ watch([generating, cancelling], async () => {
         <div v-if="section === 'calendar' && solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success || solverFeedback.stale }" role="status">
           <Icon :name="solverFeedback.success && !solverFeedback.stale ? 'shield' : 'info'" :size="20" />
           <div>
-            <strong>{{ solverFeedback.stale ? '配置已更改，上次排班结果需要重新检查' : solverFeedback.message }}</strong>
-            <p v-if="solverFeedback.stale" class="sp-diagnostic-stale">设置已更改，下方提示仍对应上一次排班；请重新生成以检查修改。</p>
+            <strong>{{ solverFeedback.month }} · {{ solverFeedback.stale ? '排班或配置已更改，下方保留上次生成结果' : solverFeedback.message }}</strong>
+            <p>上次生成尝试；当前保存排班的规则检查结果见下方。</p>
+            <p v-if="solverFeedback.stale" class="sp-diagnostic-stale">下方提示对应上次生成尝试；当前排班是否符合规则，请查看最新规则检查。</p>
             <p v-for="(detail,index) in solverFeedback.details" :key="index">{{ detail }}</p>
             <ol v-if="solverFeedback.issues.length" class="sp-conflict-list">
               <li v-for="(issue,index) in (expandedFeedback ? solverFeedback.issues : solverFeedback.issues.slice(0,5))" :key="`${issue.id}-${index}`">
@@ -922,6 +1011,7 @@ watch([generating, cancelling], async () => {
           </div>
           <button class="sp-icon-button" aria-label="关闭排班结果" @click="solverFeedback = null"><Icon name="close" :size="16" /></button>
         </div>
+        <ScheduleCheckPanel v-if="section === 'calendar'" :month="state.month" :check="currentScheduleCheck" :has-schedule="monthHasSchedule" @retry="refreshScheduleCheck" @open-issue="openDiagnostic" />
         <dl v-if="section === 'calendar'" class="sp-overview" aria-label="本月排班概览">
           <div><dt>需求覆盖</dt><dd>{{ coverage.percentage }}<small>%</small></dd><span :class="coverage.percentage === 100 && !coverage.excess ? 'sp-text-green' : 'sp-text-amber'">{{ coverage.excess ? `固定班次超出 ${coverage.excess} 人次，请调整` : coverage.percentage === 100 ? `${coverage.filled} 个需求班位已满足` : `缺 ${coverage.total - coverage.filled} 个班位` }}</span></div>
           <div><dt>参与成员</dt><dd>{{ state.employees.length }}<small>人</small></dd><span>{{ state.shifts.length }} 种班次</span></div>
@@ -969,9 +1059,9 @@ watch([generating, cancelling], async () => {
               </table>
             </div>
             <p class="sp-allowance-legend"><span aria-hidden="true">✦</span> 金色金额为该班次的固定津贴，排一次领取一份。跨夜班全部津贴记在开始日期，只领一次。右侧汇总整月金额。</p>
-            <div class="sp-calendar-bottom"><span><Icon name="lock" :size="14" />点击班次调整，锁定后自动排班保留</span><button class="sp-check-status" :class="{ warning: issues.length }" :aria-expanded="showIssues" @click="showIssues = !showIssues"><Icon :name="issues.length ? 'info' : 'shield'" :size="15" />{{ issues.length ? `${issues.length} 项排班提醒` : '排班检查通过' }}<Icon name="arrow" :size="13" /></button></div>
+            <div class="sp-calendar-bottom"><span><Icon name="lock" :size="14" />点击班次调整，锁定后自动排班保留</span><button class="sp-check-status" :class="{ warning: currentScheduleCheck.status !== 'ready' || currentScheduleCheck.result.status !== 'compliant' }" @click="reviewExternalChanges"><Icon :name="currentScheduleCheck.status === 'checking' ? 'clock' : issues.length ? 'info' : 'shield'" :size="15" />{{ scheduleCheckSummary }}<Icon name="arrow" :size="13" /></button></div>
           </section>
-          <div v-if="showIssues" class="sp-issues"><template v-if="issues.length"><button v-for="issue in issues.slice(0, 100)" :key="issue.id" @click="jumpToIssue(issue.date)"><span :class="issue.severity">{{ issue.severity === 'error' ? '冲突' : '提醒' }}</span><span>{{ issue.message }}</span><small v-if="issue.date">{{ issue.date }} ↗</small></button><p v-if="issues.length > 100">还有 {{ issues.length - 100 }} 项，请先处理当前提醒。</p></template><p v-else>休假、班次资格、周工时上下限、连续工作和休息间隔均通过检查。<button class="sp-link" @click="chooseSection('rules')">自定义规则 →</button></p></div>
+
         </template>
 
         <SettingsPanel v-if="section !== 'calendar'" ref="settingsPanel" :state="state" :section="section" :payroll="state.payroll" @change="settingsChanged" />
@@ -1006,7 +1096,7 @@ watch([generating, cancelling], async () => {
           <div class="sp-solve-progress sp-generation-progress">
             <span class="sp-solve-spinner" aria-hidden="true"></span>
             <div>
-              <strong role="status" aria-live="polite">{{ cancelling ? '正在取消排班…' : cancellationError ? '取消尚未完成' : solverPhaseLabels[solvePhase] }}</strong>
+              <strong role="status" aria-live="polite">{{ cancelling ? '正在取消排班…' : cancellationError ? '取消尚未完成' : checkingGeneratedSchedule ? '正在检查排班规则…' : solverPhaseLabels[solvePhase] }}</strong>
               <p class="sp-generation-solutions" aria-live="polite" aria-atomic="true">已获取方案 <b data-solution-count>{{ solutionCount }}</b> 种</p>
               <p class="sp-generation-timing" aria-live="off"><span>总计 <span data-elapsed-seconds>{{ elapsedSeconds }}</span> 秒</span><span>· 当前阶段 <span data-phase-seconds>{{ phaseSeconds }}</span> 秒</span><span>· 完成前保留原表</span></p>
               <p>搜索时限 {{ externalGeneration?.timeLimitSeconds ?? (desktop ? solveTimeLimit : 30) }} 秒；时限内继续搜索优化，结束后校验并采用优选结果。</p>

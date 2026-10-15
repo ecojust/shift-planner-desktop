@@ -8,7 +8,8 @@ import { checkDesktopResult, type SolverRequest, type SolverResult, type SolverS
 import { createSolverRequest } from './solverDebug.ts'
 import { clearScheduleCoverage, markScheduleCoverageComplete, pruneScheduleCoverage } from './scheduleCoverage.ts'
 import { getWeekBoundaryContext, type WeekBoundaryContext } from './weekBoundary.ts'
-import type { Assignment, Issue } from './domain.ts'
+import { checkSchedule, type ScheduleCheckResult } from './scheduleCheck.ts'
+import type { Assignment, Issue, PlannerState } from './domain.ts'
 
 export type IntegrationSource = 'mcp' | 'http'
 
@@ -21,6 +22,8 @@ interface IntegrationGenerationDetails {
   revision: string
   boundaryPreview?: Assignment[]
   boundaryContext?: Omit<WeekBoundaryContext, 'weeks'>
+  /** Current formal roster only; never treats a temporary boundary preview as saved. */
+  validation?: ScheduleCheckResult
 }
 export type IntegrationGenerationOutcome = IntegrationGenerationDetails & (
   | { success: false; saved: false }
@@ -33,6 +36,8 @@ export interface IntegrationGenerationLease {
 }
 export interface IntegrationGenerationAdapter {
   solve(request: SolverRequest, signal?: AbortSignal): Promise<SolverResult>
+  /** Hosts can run this read-only check off the UI thread before committing. */
+  check?(state: PlannerState): Promise<ScheduleCheckResult>
   /** Acquire the same lock used by manual generation before starting any work. */
   acquire(request: SolverRequest, source: IntegrationSource): IntegrationGenerationLease
 }
@@ -141,7 +146,12 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
       const stats = result?.stats ?? { wallTimeSeconds: 0, shortageCount: 0, optimal: false }
       const details = { month, status, message: checked.message, issues: checked.issues, stats }
       if (!checked.success || !checked.assignments) {
-        outcome = { ...details, success: false, saved: false, revision: current.revision }
+        // A failed solve leaves the original roster in place. Explain that
+        // roster separately from the solver's failure diagnostics.
+        const stateToCheck = { ...current.state, month }
+        const validation = generation.check ? await generation.check(stateToCheck) : checkSchedule(stateToCheck, { referenceDate: request.options.referenceDate })
+        assertCurrent()
+        outcome = { ...details, success: false, saved: false, revision: current.revision, validation }
         return outcome
       }
       // The solver returns the whole roster. Its independent check proved that
@@ -151,6 +161,11 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
         ...checked.assignments.filter(item => item.date.startsWith(`${month}-`)),
       ]
       const next = parseBackup(JSON.stringify(markScheduleCoverageComplete({ ...current.state, assignments }, [month])))
+      // Check the exact formal target-month roster, including automatic rest
+      // coverage, without provisional neighboring cells. Pending boundary
+      // information is informative and does not undo a valid solved result.
+      const stateToCheck = { ...next, month }
+      const validation = generation.check ? await generation.check(stateToCheck) : checkSchedule(stateToCheck, { referenceDate: request.options.referenceDate })
       assertCurrent()
       if (context.claimCommit) await context.claimCommit()
       // No awaits are permitted between this final lifecycle/revision check and
@@ -169,7 +184,7 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
       const boundary = getWeekBoundaryContext(request.state, { referenceDate: request.options.referenceDate })
       const boundaryContext = boundary ? { startDate: boundary.startDate, endDate: boundary.endDate, referenceDate: boundary.referenceDate, incompleteHistory: boundary.incompleteHistory } : undefined
       outcome = { ...details, success: true, saved: true, ...snapshot(), generatedAt,
-        boundaryPreview: result.boundaryPreview ?? [], ...(boundaryContext ? { boundaryContext } : {}) }
+        validation, boundaryPreview: result.boundaryPreview ?? [], ...(boundaryContext ? { boundaryContext } : {}) }
       return outcome
     } catch (error) {
       failure = error

@@ -60,7 +60,8 @@ test('coverage is per member and invalidated saved records remain visible', () =
     provenance: { fields: {}, invalidatedSchedules: { '2026-09': { source: 'manual', at: '2026-10-01T00:00:00Z' } } },
   }), '2026-10-15')
   assert.deepEqual(kinds(notices[0]), ['known', 'invalid', 'unknown'])
-  assert.match(notices[0].items[1].description, /仍按原记录/)
+  assert.match(notices[0].items[1].label, /配置已修改/)
+  assert.match(notices[0].items[1].description, /按已有排班和当前配置检查/)
   assert.match(notices[0].items[2].description, /1 位成员/)
 })
 

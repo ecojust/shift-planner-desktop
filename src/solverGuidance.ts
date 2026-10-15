@@ -27,7 +27,7 @@ export function boundaryWeekNotices(state: BoundaryNoticeState, referenceDate?: 
     const items: BoundaryWeekNoticeInfo['items'] = []
     if (known) items.push({ kind: 'known', label: `已计入${adjacent}排班`, description: '已有工作与排班休息固定保留。' })
     if (known && state.provenance?.invalidatedSchedules?.[adjacentMonth]) {
-      items.push({ kind: 'invalid', label: `${adjacent}排班已失效`, description: '仍按原记录检查跨月周，冲突需调整后重新生成。' })
+      items.push({ kind: 'invalid', label: `${adjacent}配置已修改`, description: '按已有排班和当前配置检查跨月周，发现冲突时再调整。' })
     }
     if (unknown.length) items.push({ kind: 'unknown', label: '历史待核对', description: `${unknown.length} 位成员的月外历史不完整，未知空白不视为休息，整周规则仍待核对。` })
     if (preview) items.push({ kind: 'preview', label: '未来未排 · 临时预排', description: '为月外未来空白试排，检查本周能否衔接；不保存到相邻月份。' })

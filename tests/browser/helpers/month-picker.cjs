@@ -1,7 +1,11 @@
 const assert = require('node:assert/strict')
-const statusLabels = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效', pending: '已排班 · 跨月待确认', conflict: '排班有冲突，需重新检查' }
+const statusLabels = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效', pending: '已排班 · 跨月待核对', conflict: '不符合规则', checking: '正在检查' }
+const visibleStatusLabels = { ...statusLabels, conflict: '不符合规则 查看具体原因' }
 
 async function assertStatusDescription(locator, expected) {
+  // Switching months and opening the month grid launch real background checks.
+  // Wait for their requested final state rather than sampling a transient label.
+  await locator.page().waitForFunction(({ node, expected }) => node.getAttribute('data-schedule-status') === expected, { node: await locator.elementHandle(), expected }, { timeout: 45000 })
   assert.equal(await locator.getAttribute('data-schedule-status'), expected)
   const description = await locator.evaluate(node => (node.getAttribute('aria-describedby') || '').split(/\s+/).map(id => document.getElementById(id)?.textContent || '').join(' '))
   assert.ok(description.includes(statusLabels[expected]), `Expected ${statusLabels[expected]} in accessible description: ${description}`)
@@ -19,7 +23,7 @@ async function assertMonthChoiceStatus(dialog, month, expected) {
   await assertStatusDescription(choice, expected)
   const visibleStatus = choice.locator('.sp-month-picker-status')
   assert.equal(await visibleStatus.isVisible(), true)
-  assert.equal((await visibleStatus.innerText()).replace(/[\s，·]/g, ''), statusLabels[expected].replace(/[\s，·]/g, ''), `${month}: the month grid visibly explains its saved schedule status`)
+  assert.equal((await visibleStatus.innerText()).replace(/[\s，·]/g, ''), visibleStatusLabels[expected].replace(/[\s，·]/g, ''), `${month}: the month grid visibly explains its saved schedule status`)
 }
 
 async function readGlobalMonth(page) {
