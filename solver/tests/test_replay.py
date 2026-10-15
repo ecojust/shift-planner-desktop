@@ -33,7 +33,7 @@ class ReplayTests(unittest.TestCase):
             output, diagnostics = io.StringIO(), io.StringIO()
             with patch.object(entry.sys, 'argv', ['main.py', '--hosted', '--input', str(path)]), \
                     patch.object(entry.sys, 'stdin', NeverReadStdin()), \
-                    patch.object(entry, 'load_engine', return_value=lambda value: value), \
+                    patch.object(entry, 'load_engine', return_value=lambda value, **_: value), \
                     contextlib.redirect_stdout(output), contextlib.redirect_stderr(diagnostics):
                 entry.main()
         self.assertEqual(json.loads(output.getvalue()), request)

@@ -4,12 +4,13 @@ from __future__ import annotations
 import calendar
 import copy
 import datetime as dt
+import hashlib
 import math
 import re
 import time
 from collections import defaultdict
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
-from typing import Any
+from typing import Any, Callable
 
 from ortools.sat.python import cp_model
 from diagnostics import ConstraintDiagnostics, daily_capacity_issues, weekday_capacity_issues, problem
@@ -28,6 +29,41 @@ class InvalidInput(ValueError):
 
 class TimeBudgetExceeded(Exception):
     pass
+
+
+class SolutionCounter(cp_model.CpSolverSolutionCallback):
+    """Count distinct rosters across optimization phases, not auxiliary values."""
+
+    def __init__(self, variables, on_solution_count: Callable[[int], None] | None = None):
+        super().__init__()
+        self._indexes = tuple(variable.index for variable in variables)
+        self._seen: set[bytes] = set()
+        self._notify = on_solution_count
+        self.count = 0
+
+    def on_solution_callback(self):
+        # The response is one consistent native snapshot. Reading its indexed
+        # values avoids a separate Python/native call for every boolean. Keep
+        # only a fixed-size digest per roster, never its full assignment list.
+        # Fixed/month-external records are constant throughout this request.
+        try:
+            values = self.response_proto.solution
+            signature = hashlib.blake2b(bytes(values[index] for index in self._indexes), digest_size=32).digest()
+            if signature in self._seen:
+                return
+            self._seen.add(signature)
+            self.count += 1
+            if self._notify is not None:
+                try:
+                    self._notify(self.count)
+                except Exception:
+                    # Progress is optional; a closed display/pipe must not
+                    # turn a valid solve into an error or stop the search.
+                    self._notify = None
+        except Exception:
+            # Counting must not change CP-SAT's result, even if progress
+            # bookkeeping itself is unavailable (for example, memory pressure).
+            pass
 
 
 def issue(kind: str, message: str, **extra: Any) -> dict:
@@ -231,14 +267,16 @@ def validate_request(request):
     return state, dates, options
 
 
-def solve(request: Any) -> dict:
+def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) -> dict:
     began = time.monotonic()
+    solution_counter = None
     request_id = request.get('requestId', '') if isinstance(request, dict) else ''
     if not isinstance(request_id, str):
         request_id = ''
 
     def response(status, message, issues=None, assignments=None, solver=None, shortage=0, objective=None, bound=None):
-        stats = {'wallTimeSeconds': round(time.monotonic() - began, 6), 'shortageCount': shortage, 'optimal': status == 'OPTIMAL'}
+        stats = {'wallTimeSeconds': round(time.monotonic() - began, 6), 'shortageCount': shortage, 'optimal': status == 'OPTIMAL',
+                 'solutionCount': solution_counter.count if solution_counter is not None else 0}
         if objective is not None:
             stats['objectiveValue'] = objective
         if bound is not None:
@@ -672,13 +710,16 @@ def solve(request: Any) -> dict:
         error = model.validate()
         if error:
             return response('MODEL_INVALID', '求解模型无效，原排班未修改。', [issue('model-invalid', error[:1000])])
+        # Reuse one tracker across coverage, staffing and fairness. A repeated
+        # roster with different phase objectives/auxiliary variables counts once.
+        solution_counter = SolutionCounter(x.values(), on_solution_count)
         def run(limit):
             solver = cp_model.CpSolver()
             solver.parameters.max_time_in_seconds = max(0.001, limit)
             solver.parameters.num_search_workers = 2
             solver.parameters.random_seed = int(options.get('seed', 1010))
             solver.parameters.log_search_progress = False
-            status = solver.solve(model)
+            status = solver.solve(model, solution_counter)
             return solver, status
         def extract(solver):
             result = copy.deepcopy(fixed)

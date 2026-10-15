@@ -18,13 +18,13 @@ export interface SolverResult {
   status: SolverStatus
   assignments?: Assignment[]
   issues: Issue[]
-  stats: { wallTimeSeconds: number; objectiveValue?: number; bestBound?: number; shortageCount: number; optimal: boolean }
+  stats: { wallTimeSeconds: number; objectiveValue?: number; bestBound?: number; shortageCount: number; optimal: boolean; solutionCount?: number }
   hostDiagnostics?: { exitTimedOut?: boolean; phase?: string; code?: string }
   message: string
 }
 export interface SolverInfo { engine: string; protocolVersion: number; version: string }
 export type SolverPhase = 'starting' | 'loading' | 'reading' | 'solving' | 'finishing'
-export interface SolverProgress { requestId: string; phase: SolverPhase }
+export interface SolverProgress { requestId: string; phase: SolverPhase; solutionCount?: number }
 export const solverPhaseLabels: Record<SolverPhase, string> = {
   starting: '正在准备排班',
   loading: '正在准备排班',
@@ -36,6 +36,12 @@ export function matchingSolverPhase(progress: unknown, requestId: string | null)
   if (!requestId || !progress || typeof progress !== 'object') return null
   const value = progress as Partial<SolverProgress>
   return value.requestId === requestId && typeof value.phase === 'string' && Object.hasOwn(solverPhaseLabels, value.phase) ? value.phase as SolverPhase : null
+}
+/** A count belongs to the same validated progress protocol as its phase. */
+export function matchingSolverSolutionCount(progress: unknown, requestId: string | null): number | null {
+  if (!matchingSolverPhase(progress, requestId)) return null
+  const count = (progress as Partial<SolverProgress>).solutionCount
+  return typeof count === 'number' && Number.isSafeInteger(count) && count >= 0 ? count : null
 }
 export const listenSolverProgress = (callback: (progress: SolverProgress) => void) => listen<SolverProgress>('solver-progress', event => callback(event.payload))
 

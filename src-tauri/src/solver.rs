@@ -23,6 +23,7 @@ use tokio::{
 const INPUT_LIMIT: usize = 2 * 1024 * 1024;
 const OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 const STDERR_LIMIT: usize = 256 * 1024;
+const MAX_SAFE_SOLUTION_COUNT: u64 = 9_007_199_254_740_991;
 const ENGINE: &str = "ortools-cp-sat";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -346,7 +347,13 @@ impl SolverPhase {
     }
 }
 
-type ProgressSink = Option<Arc<dyn Fn(SolverPhase) + Send + Sync>>;
+type ProgressSink = Option<Arc<dyn Fn(SolverPhase, Option<u64>) + Send + Sync>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticEvent {
+    Phase(SolverPhase),
+    Solutions { count: u64, bytes: usize },
+}
 
 #[derive(Clone, Copy)]
 struct Watchdog {
@@ -422,17 +429,45 @@ struct Diagnostics {
 }
 
 impl Diagnostics {
-    fn accept_line(&mut self) -> Result<Option<SolverPhase>, String> {
+    fn account(&mut self, bytes: usize) -> Result<(), String> {
+        self.total += bytes;
+        if self.total > STDERR_LIMIT {
+            return Err("OUTPUT_LIMIT: 本地求解器诊断输出超过安全上限，任务已停止。".into());
+        }
+        Ok(())
+    }
+
+    fn accept_line(&mut self, terminator_bytes: usize) -> Result<Option<DiagnosticEvent>, String> {
+        let bytes = self.line.len() + terminator_bytes;
         let line = String::from_utf8_lossy(&self.line)
             .trim_end_matches('\r')
             .to_owned();
         self.line.clear();
+        if let Some(count) = line.strip_prefix("SHIFTFLOW_SOLUTIONS_V1:") {
+            // Progress is advisory: malformed counters must not discard a valid result.
+            // Only positive JavaScript-safe integers can reach the renderer. The host
+            // excludes a marker from the diagnostic budget only after verifying its
+            // phase and monotonicity; ignored/duplicate markers still consume budget.
+            if let Some(count) = (!count.is_empty()
+                && count.len() <= 16
+                && !count.starts_with('0')
+                && count.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| count.parse::<u64>().ok())
+            .flatten()
+            .filter(|count| (1..=MAX_SAFE_SOLUTION_COUNT).contains(count))
+            {
+                return Ok(Some(DiagnosticEvent::Solutions { count, bytes }));
+            }
+            self.account(bytes)?;
+            return Ok(None);
+        }
+        self.account(bytes)?;
         if let Some(stage) = line.strip_prefix("SHIFTFLOW_STAGE_V1:") {
             return match stage {
-                "loading" => Ok(Some(SolverPhase::Loading)),
-                "reading" => Ok(Some(SolverPhase::Reading)),
-                "solving" => Ok(Some(SolverPhase::Solving)),
-                "finishing" => Ok(Some(SolverPhase::Finishing)),
+                "loading" => Ok(Some(DiagnosticEvent::Phase(SolverPhase::Loading))),
+                "reading" => Ok(Some(DiagnosticEvent::Phase(SolverPhase::Reading))),
+                "solving" => Ok(Some(DiagnosticEvent::Phase(SolverPhase::Solving))),
+                "finishing" => Ok(Some(DiagnosticEvent::Phase(SolverPhase::Finishing))),
                 _ => Err(
                     "STAGE_PROTOCOL_ERROR: 本地求解器返回了不支持的启动阶段，请更新完整安装包。"
                         .into(),
@@ -459,29 +494,28 @@ impl Diagnostics {
         Ok(None)
     }
 
-    fn push(&mut self, bytes: &[u8]) -> Result<Vec<SolverPhase>, String> {
-        self.total += bytes.len();
-        if self.total > STDERR_LIMIT {
-            return Err("OUTPUT_LIMIT: 本地求解器诊断输出超过安全上限，任务已停止。".into());
-        }
-        let mut phases = Vec::new();
+    fn push(&mut self, bytes: &[u8]) -> Result<Vec<DiagnosticEvent>, String> {
+        let mut events = Vec::new();
         for &byte in bytes {
             if byte == b'\n' {
-                if let Some(phase) = self.accept_line()? {
-                    phases.push(phase);
+                if let Some(event) = self.accept_line(1)? {
+                    events.push(event);
                 }
             } else {
                 self.line.push(byte);
+                if self.line.len() > STDERR_LIMIT {
+                    return Err("OUTPUT_LIMIT: 本地求解器诊断输出超过安全上限，任务已停止。".into());
+                }
             }
         }
-        Ok(phases)
+        Ok(events)
     }
 
-    fn finish(&mut self) -> Result<Vec<SolverPhase>, String> {
+    fn finish(&mut self) -> Result<Vec<DiagnosticEvent>, String> {
         if self.line.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(self.accept_line()?.into_iter().collect())
+        Ok(self.accept_line(0)?.into_iter().collect())
     }
 
     fn decorate(&self, message: String) -> String {
@@ -498,6 +532,7 @@ fn advance_phase(
     expected: &ExpectedResponse,
     watchdog: Watchdog,
     deadline: &mut tokio::time::Instant,
+    solution_count: Option<u64>,
     progress: &ProgressSink,
 ) -> Result<(), String> {
     if *current == next {
@@ -530,9 +565,31 @@ fn advance_phase(
         *deadline = tokio::time::Instant::now() + watchdog.exit;
     }
     if let Some(progress) = progress {
-        progress(next);
+        progress(next, solution_count);
     }
     Ok(())
+}
+
+fn report_solutions(
+    phase: SolverPhase,
+    count: u64,
+    expected: &ExpectedResponse,
+    solution_count: &mut Option<u64>,
+    progress: &ProgressSink,
+) -> bool {
+    // Keep this independent of phase transitions/deadlines: even continuous updates
+    // cannot extend the solve budget. A late marker cannot resurrect a finished solve.
+    if phase != SolverPhase::Solving
+        || !matches!(expected, ExpectedResponse::Schedule(_))
+        || count <= solution_count.unwrap_or(0)
+    {
+        return false;
+    }
+    *solution_count = Some(count);
+    if let Some(progress) = progress {
+        progress(phase, *solution_count);
+    }
+    true
 }
 
 fn watchdog_error(phase: SolverPhase) -> String {
@@ -574,11 +631,12 @@ async fn execute(
     };
     let handle = app.clone();
     let event_id = request_id.to_owned();
-    let progress: ProgressSink = Some(Arc::new(move |phase| {
-        let _ = handle.emit(
-            "solver-progress",
-            json!({ "requestId": event_id, "phase": phase.as_str() }),
-        );
+    let progress: ProgressSink = Some(Arc::new(move |phase, solution_count| {
+        let mut payload = json!({ "requestId": event_id, "phase": phase.as_str() });
+        if let Some(count) = solution_count {
+            payload["solutionCount"] = json!(count);
+        }
+        let _ = handle.emit("solver-progress", payload);
     }));
     supervise(
         command,
@@ -612,7 +670,7 @@ async fn supervise(
     #[cfg(windows)]
     command.creation_flags(0x08000000);
     if let Some(progress) = &progress {
-        progress(SolverPhase::Starting);
+        progress(SolverPhase::Starting, None);
     }
     let mut child = command
         .spawn()
@@ -636,6 +694,7 @@ async fn supervise(
         .ok_or("STARTUP_ERROR: 求解器诊断通道不可用。")?;
     let mut diagnostics = Diagnostics::default();
     let mut phase = SolverPhase::Starting;
+    let mut solution_count = None;
     let mut deadline = tokio::time::Instant::now() + watchdog.startup;
     let result: Result<(Value, bool), String> = {
         let writer = async {
@@ -702,12 +761,23 @@ async fn supervise(
                 }
                 read = stderr.read(&mut err_buffer), if !stderr_done => {
                     let count = match read { Ok(count) => count, Err(_) => break Err("OUTPUT_ERROR: 读取内置求解器诊断失败。".into()) };
-                    let phases = if count == 0 { stderr_done = true; diagnostics.finish() } else { diagnostics.push(&err_buffer[..count]) };
-                    let phases = match phases { Ok(phases) => phases, Err(error) => break Err(error) };
+                    let events = if count == 0 { stderr_done = true; diagnostics.finish() } else { diagnostics.push(&err_buffer[..count]) };
+                    let events = match events { Ok(events) => events, Err(error) => break Err(error) };
                     let mut stage_error = None;
-                    for next in phases {
-                        if let Err(error) = advance_phase(&mut phase, next, &expected, watchdog, &mut deadline, &progress) {
-                            stage_error = Some(error); break;
+                    for event in events {
+                        match event {
+                            DiagnosticEvent::Phase(next) => {
+                                if let Err(error) = advance_phase(&mut phase, next, &expected, watchdog, &mut deadline, solution_count, &progress) {
+                                    stage_error = Some(error); break;
+                                }
+                            }
+                            DiagnosticEvent::Solutions { count, bytes } => {
+                                if !report_solutions(phase, count, &expected, &mut solution_count, &progress) {
+                                    if let Err(error) = diagnostics.account(bytes) {
+                                        stage_error = Some(error); break;
+                                    }
+                                }
+                            }
                         }
                     }
                     if let Some(error) = stage_error { break Err(error); }
@@ -955,6 +1025,11 @@ mod tests {
             .env("TMP", &directory.0)
             .env("TEMP", &directory.0)
             .arg("--hosted");
+        let progress_events = Arc::new(Mutex::new(Vec::new()));
+        let observed_events = progress_events.clone();
+        let progress: ProgressSink = Some(Arc::new(move |phase, count| {
+            observed_events.lock().unwrap().push((phase, count));
+        }));
         let result = supervise(
             command,
             Some(input),
@@ -962,7 +1037,7 @@ mod tests {
             cancel,
             pid,
             ExpectedResponse::Schedule(id.clone()),
-            None,
+            progress,
         )
         .await
         .unwrap();
@@ -974,6 +1049,24 @@ mod tests {
             "{result}"
         );
         assert_eq!(result["stats"]["shortageCount"], 0);
+        let final_count = result["stats"]["solutionCount"]
+            .as_u64()
+            .expect("the real solver must report its distinct solution count");
+        assert!(final_count > 0);
+        let events = progress_events.lock().unwrap();
+        let solving_counts: Vec<_> = events
+            .iter()
+            .filter_map(|(phase, count)| {
+                (*phase == SolverPhase::Solving).then_some(*count).flatten()
+            })
+            .collect();
+        assert_eq!(solving_counts.last(), Some(&final_count));
+        assert!(solving_counts.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            events.last(),
+            Some(&(SolverPhase::Finishing, Some(final_count)))
+        );
+        drop(events);
         let assignments = result["assignments"]
             .as_array()
             .expect("solver must return assignments");
@@ -1160,8 +1253,9 @@ mod tests {
     async fn slow_startup_does_not_consume_the_solver_time_budget() {
         let phases = Arc::new(Mutex::new(Vec::new()));
         let observed = phases.clone();
-        let progress: ProgressSink =
-            Some(Arc::new(move |phase| observed.lock().unwrap().push(phase)));
+        let progress: ProgressSink = Some(Arc::new(move |phase, _| {
+            observed.lock().unwrap().push(phase)
+        }));
         // Loading must outlast the solve budget, while the solve phase keeps
         // enough scheduling headroom for shared CI runners.
         let script = format!("printf 'SHIFTFLOW_STAGE_V1:loading\\n' >&2; sleep 1.25; printf 'SHIFTFLOW_STAGE_V1:reading\\n' >&2; cat >/dev/null; printf 'SHIFTFLOW_STAGE_V1:solving\\n' >&2; sleep 0.03; printf '%s\\n' '{}'; printf 'SHIFTFLOW_STAGE_V1:finishing\\n' >&2", SCHEDULE_RESULT);
@@ -1188,6 +1282,168 @@ mod tests {
     async fn info_loading_has_its_own_budget_and_does_not_require_solving() {
         let output = staged_script("printf 'SHIFTFLOW_STAGE_V1:loading\\n' >&2; sleep 0.12; printf '{\"engine\":\"ortools-cp-sat\",\"protocolVersion\":1,\"version\":\"test\"}\\n'; printf 'SHIFTFLOW_STAGE_V1:finishing\\n' >&2", 2000, 1, 500, true, None).await.unwrap();
         assert_eq!(output["version"], "test");
+    }
+
+    #[test]
+    fn solution_markers_handle_split_lines_multiple_events_and_unterminated_tails() {
+        let mut diagnostics = Diagnostics::default();
+        let mut events = Vec::new();
+        for byte in b"SHIFTFLOW_STAGE_V1:solving\nSHIFTFLOW_SOLUTIONS_V1:1\r\n" {
+            events.extend(diagnostics.push(&[*byte]).unwrap());
+        }
+        events.extend(
+            diagnostics
+                .push(b"SHIFTFLOW_SOLUTIONS_V1:2\nSHIFTFLOW_SOLUTIONS_V1:3")
+                .unwrap(),
+        );
+        events.extend(diagnostics.finish().unwrap());
+        assert_eq!(
+            events,
+            vec![
+                DiagnosticEvent::Phase(SolverPhase::Solving),
+                DiagnosticEvent::Solutions {
+                    count: 1,
+                    bytes: b"SHIFTFLOW_SOLUTIONS_V1:1\r\n".len()
+                },
+                DiagnosticEvent::Solutions {
+                    count: 2,
+                    bytes: b"SHIFTFLOW_SOLUTIONS_V1:2\n".len()
+                },
+                DiagnosticEvent::Solutions {
+                    count: 3,
+                    bytes: b"SHIFTFLOW_SOLUTIONS_V1:3".len()
+                },
+            ]
+        );
+        assert!(diagnostics.finish().unwrap().is_empty());
+        assert!(diagnostics.summary.is_empty());
+    }
+
+    #[test]
+    fn optional_solution_markers_require_positive_safe_integers_without_diagnostic_noise() {
+        let mut diagnostics = Diagnostics::default();
+        for count in [
+            "",
+            "0",
+            "01",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.0",
+            "1e3",
+            "NaN",
+            "inf",
+            "１２",
+            "9007199254740992",
+            "18446744073709551616",
+        ] {
+            let line = format!("SHIFTFLOW_SOLUTIONS_V1:{count}\n");
+            assert!(
+                diagnostics.push(line.as_bytes()).unwrap().is_empty(),
+                "{count}"
+            );
+        }
+        assert!(diagnostics
+            .push(b"SHIFTFLOW_SOLUTIONS_V1:\xff\n")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            diagnostics
+                .push(b"SHIFTFLOW_SOLUTIONS_V1:9007199254740991\n")
+                .unwrap(),
+            vec![DiagnosticEvent::Solutions {
+                count: MAX_SAFE_SOLUTION_COUNT,
+                bytes: b"SHIFTFLOW_SOLUTIONS_V1:9007199254740991\n".len()
+            }]
+        );
+        assert_eq!(diagnostics.decorate("test".into()), "test");
+        assert!(diagnostics
+            .push(&vec![b'x'; STDERR_LIMIT + 1])
+            .unwrap_err()
+            .starts_with("OUTPUT_LIMIT:"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn solution_progress_is_monotonic_and_finishing_retains_the_latest_count() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let progress: ProgressSink = Some(Arc::new(move |phase, count| {
+            observed.lock().unwrap().push((phase, count))
+        }));
+        let script = format!("printf 'SHIFTFLOW_SOLUTIONS_V1:90\\nSHIFTFLOW_STAGE_V1:loading\\nSHIFTFLOW_SOLUTIONS_V1:91\\nSHIFTFLOW_STAGE_V1:reading\\n' >&2; cat >/dev/null; printf 'SHIFTFLOW_STAGE_V1:solving\\nSHIFTFLOW_SOLUTIONS_V1:1\\nSHIFTFLOW_SOLUTIONS_V1:1\\nSHIFTFLOW_SOLUTIONS_V1:3\\nSHIFTFLOW_SOLUTIONS_V1:2\\nSHIFTFLOW_SOLUTIONS_V1:0\\nSHIFTFLOW_SOLUTIONS_V1:nan\\nSHIFTFLOW_SOLUTIONS_V1:9007199254740992\\nSHIFTFLOW_STAGE_V1:finishing\\nSHIFTFLOW_SOLUTIONS_V1:99\\n' >&2; printf '%s\\n' '{}'", SCHEDULE_RESULT);
+        let output = staged_script(&script, 2000, 2000, 1000, false, progress)
+            .await
+            .unwrap();
+        assert_eq!(
+            output,
+            serde_json::from_str::<Value>(SCHEDULE_RESULT).unwrap()
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                (SolverPhase::Starting, None),
+                (SolverPhase::Loading, None),
+                (SolverPhase::Reading, None),
+                (SolverPhase::Solving, None),
+                (SolverPhase::Solving, Some(1)),
+                (SolverPhase::Solving, Some(3)),
+                (SolverPhase::Finishing, Some(3)),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn info_never_reports_solution_counts() {
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let observed = counts.clone();
+        let progress: ProgressSink = Some(Arc::new(move |_, count| {
+            observed.lock().unwrap().push(count)
+        }));
+        let output = staged_script("printf 'SHIFTFLOW_SOLUTIONS_V1:5\\nSHIFTFLOW_STAGE_V1:loading\\nSHIFTFLOW_SOLUTIONS_V1:6\\n' >&2; printf '{\"engine\":\"ortools-cp-sat\",\"protocolVersion\":1,\"version\":\"test\"}\\n'; printf 'SHIFTFLOW_STAGE_V1:finishing\\nSHIFTFLOW_SOLUTIONS_V1:7\\n' >&2", 2000, 1, 500, true, progress).await.unwrap();
+        assert_eq!(output["version"], "test");
+        assert_eq!(*counts.lock().unwrap(), vec![None, None, None]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn continuous_solution_progress_never_extends_the_solver_deadline() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let progress: ProgressSink = Some(Arc::new(move |_, count| {
+            if let Some(count) = count {
+                observed.lock().unwrap().push(count);
+            }
+        }));
+        let script = "printf 'SHIFTFLOW_STAGE_V1:loading\\nSHIFTFLOW_STAGE_V1:reading\\n' >&2; cat >/dev/null; printf 'SHIFTFLOW_STAGE_V1:solving\\n' >&2; i=1; while true; do printf 'SHIFTFLOW_SOLUTIONS_V1:%s\\nSHIFTFLOW_SOLUTIONS_V1:%s\\n' \"$i\" \"$i\" >&2; i=$((i + 1)); sleep 0.01; done";
+        let began = std::time::Instant::now();
+        let error = staged_script(script, 2000, 150, 500, false, progress)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("SOLVE_TIMEOUT:"), "{error}");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        let counts = events.lock().unwrap();
+        assert!(!counts.is_empty());
+        assert!(counts.windows(2).all(|pair| pair[1] > pair[0]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_accepted_solution_counts_are_exempt_from_the_diagnostic_budget() {
+        for (expression, accepted) in [("i", true), ("1", false), ("12001 - i", false)] {
+            let script = format!("printf 'SHIFTFLOW_STAGE_V1:loading\\nSHIFTFLOW_STAGE_V1:reading\\n' >&2; cat >/dev/null; printf 'SHIFTFLOW_STAGE_V1:solving\\n' >&2; awk 'BEGIN {{ for (i = 1; i <= 12000; i++) printf \"SHIFTFLOW_SOLUTIONS_V1:%d\\n\", {expression} }}' >&2; printf '%s\\n' '{}'; printf 'SHIFTFLOW_STAGE_V1:finishing\\n' >&2", SCHEDULE_RESULT);
+            let result = staged_script(&script, 2000, 10000, 1000, false, None).await;
+            if accepted {
+                assert_eq!(result.unwrap()["status"], "FEASIBLE");
+            } else {
+                assert!(
+                    result.unwrap_err().starts_with("OUTPUT_LIMIT:"),
+                    "{expression}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]

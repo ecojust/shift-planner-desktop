@@ -471,7 +471,7 @@ function weightedDailyTargets(weeks: WeightedWeek[], fixed: Assignment[], employ
  * Locked cells and every out-of-month assignment are preserved, even when
  * invalid; validation explains those conflicts instead of silently deleting.
  */
-export function generateSchedule(state: PlannerState, seed = 1010): { assignments: Assignment[]; issues: Issue[]; success: boolean } {
+export function generateSchedule(state: PlannerState, seed = 1010, onSolutionCount?: (count: number) => void): { assignments: Assignment[]; issues: Issue[]; success: boolean } {
   const dates = datesOfMonth(state.month)
   const window = monthWindow(state.month)
   const activeDates = new Set(dates)
@@ -622,7 +622,12 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
     if (firstDifference >= 0 && rank[firstDifference]! < bestRank[firstDifference]!) { bestRank = rank; best = assignments }
     // Stop once all hard requirements and coverage pass; further random restarts
     // only polish fairness and needlessly delay an already usable roster.
-    if (deficit < EPSILON && missing === 0 && weightErrors === 0 && !validateSchedule({ ...state, assignments }).length) break
+    if (deficit < EPSILON && missing === 0 && weightErrors === 0 && !validateSchedule({ ...state, assignments }).length) {
+      // This heuristic stops at its first complete roster. Attempts with rule
+      // violations or missing coverage must never appear as feasible solutions.
+      try { onSolutionCount?.(1) } catch { /* Optional progress cannot affect the result. */ }
+      break
+    }
   }
   best.sort((a, b) => a.date.localeCompare(b.date) || a.employeeId.localeCompare(b.employeeId) || a.shiftId.localeCompare(b.shiftId))
   const issues = validateSchedule({ ...state, assignments: best })

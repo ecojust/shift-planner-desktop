@@ -20,6 +20,8 @@ npm run desktop:dev
 
 桌面宿主使用 `--hosted`，求解器仅在 stderr 上写独立的 ASCII 阶段行：`SHIFTFLOW_STAGE_V1:loading`、`reading`、`solving`、`finishing`。分别表示进入 Python 后加载依赖、读取请求、开始约束计算和结果已写出。stdout 保持单个 JSON 响应；普通 CLI 调用不输出这些阶段行。
 
+求解过程中，每找到一个新的可行排班，`--hosted` 还会立即在 stderr 写出 `SHIFTFLOW_SOLUTIONS_V1:N`。数量按排班变量跨优化阶段去重，不包含诊断子模型或自检的解，也不表示已枚举所有可能方案。宿主将其转为当前任务的 `solver-progress` 事件，弹窗实时显示数量；数量更新不会重置计算时限，最终仍只返回一个优选排班。
+
 桌面启动预算与计算预算独立：启动、加载和读取阶段最多 120 秒，进入 `solving` 后才开始计算看门狗（用户设置的搜索时限加 15 秒返回余量），结果阶段另留 5 秒退出余量。CP-SAT 自身仍遵守用户的原始时限。`--info` 不执行排班计算，只使用启动预算。启动失败、原生计算未响应和 CP-SAT 返回 `UNKNOWN` 是不同情况，不能统一解释为排班无解。
 
 Tauri 为每个任务创建独立缓存子目录作为工作与临时目录；任务结束或取消后，先回收整个进程树，再尝试清理该任务目录。新版发行目录不再执行每次启动的 onefile 解压，目录管理仍用于隔离运行期间的临时文件。
@@ -46,7 +48,7 @@ stdin 读取到 EOF 后处理一份 JSON（上限 8 MiB），stdout 只写一行
 - `MODEL_INVALID`：请求不合法或模型验证失败。
 - `ERROR`：求解器异常。
 
-`stats` 包含实际建模加求解耗时 `wallTimeSeconds`、`shortageCount`（缺少的班次人次）、`optimal`，以及适用时的 `objectiveValue` 和 `bestBound`。不同员工、班次、权重配置的目标值不能横向作质量百分比分数。
+`stats` 包含实际建模加求解耗时 `wallTimeSeconds`、`shortageCount`（缺少的班次人次）、`solutionCount`（本次找到的不同可行排班数量）、`optimal`，以及适用时的 `objectiveValue` 和 `bestBound`。不同员工、班次、权重配置的目标值不能横向作质量百分比分数。
 
 ## 硬约束
 

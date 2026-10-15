@@ -14,6 +14,13 @@ def stage(name):
         sys.stderr.flush()
 
 
+def solution_count(count):
+    # Only the hosted protocol has a progress channel. The engine isolates
+    # callback I/O failures and continues solving with an accurate final count.
+    sys.stderr.write(f'SHIFTFLOW_SOLUTIONS_V1:{count}\n')
+    sys.stderr.flush()
+
+
 def emit(result):
     sys.stdout.write(json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(',', ':')) + '\n')
     sys.stdout.flush()
@@ -107,9 +114,9 @@ def main():
         stage('reading')
         request = read_request()
         stage('solving')
-        result = solve(request)
+        result = solve(request, on_solution_count=solution_count) if '--hosted' in sys.argv[1:] else solve(request)
     except (ValueError, UnicodeDecodeError, RecursionError) as exc:
-        result = {'protocolVersion': 1, 'requestId': '', 'engine': 'ortools-cp-sat', 'status': 'MODEL_INVALID', 'issues': [{'id': 'invalid-json', 'type': 'configuration', 'severity': 'error', 'message': str(exc)[:500]}], 'stats': {'wallTimeSeconds': 0, 'shortageCount': 0, 'optimal': False}, 'message': '请求数据无效，原排班未修改。'}
+        result = {'protocolVersion': 1, 'requestId': '', 'engine': 'ortools-cp-sat', 'status': 'MODEL_INVALID', 'issues': [{'id': 'invalid-json', 'type': 'configuration', 'severity': 'error', 'message': str(exc)[:500]}], 'stats': {'wallTimeSeconds': 0, 'shortageCount': 0, 'optimal': False, 'solutionCount': 0}, 'message': '请求数据无效，原排班未修改。'}
     emit(result)
 
 

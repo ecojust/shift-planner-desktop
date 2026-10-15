@@ -22,7 +22,7 @@ const fixture = {
   assignments: [{ employeeId: 'qa-1', date: '2026-10-01', shiftId: 'day', locked: true }, { employeeId: 'qa-2', date: '2026-09-30', shiftId: 'off', locked: false }],
 }
 const clone = value => JSON.parse(JSON.stringify(value))
-const report = { url, scope: 'Controlled desktop bridge and real Python CLI payloads; real web Worker; no native packaging or Rust IPC', startedAt: new Date().toISOString(), checks: [], errors: [], screenshots: [], ok: false }
+const report = { url, scope: 'Controlled desktop bridge with real Python hosted progress streams; real web Worker; no native packaging or Rust IPC', startedAt: new Date().toISOString(), checks: [], errors: [], screenshots: [], streams: [], ok: false }
 let browser, activePage, cliSequence = 0
 function record(name) { report.checks.push(name); console.log('PASS', name) }
 async function until(predicate, message) {
@@ -32,19 +32,39 @@ async function until(predicate, message) {
 }
 async function screenshot(page, name) { const file = path.join(out, name + '.png'); await page.screenshot({ path: file }); report.screenshots.push(file) }
 async function stored(page) { return page.evaluate(() => JSON.parse(localStorage.getItem('shift-planner:v1'))) }
-async function runSolver(request) {
+async function runSolver(request, onProgress) {
   const file = path.join(out, `request-${++cliSequence}.json`)
   await fs.writeFile(file, JSON.stringify(request))
   return new Promise((resolve, reject) => {
-    const child = spawn(python, [path.join(repo, 'solver/main.py'), '--input', file], { cwd: repo })
-    let stdout = '', stderr = ''
+    const child = spawn(python, [path.join(repo, 'solver/main.py'), '--hosted', '--input', file], { cwd: repo })
+    let stdout = '', stderr = '', buffered = '', stream = Promise.resolve(), closed = false
+    const observed = { requestId: request.requestId, inputFile: file, counts: [], status: null }
     const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Python CLI did not finish within 45 seconds')) }, 45000)
     child.stdout.on('data', data => { stdout += data })
-    child.stderr.on('data', data => { stderr += data })
+    child.stderr.on('data', data => {
+      stderr += data; buffered += data
+      const lines = buffered.split('\n'); buffered = lines.pop()
+      for (const line of lines) {
+        const count = /^SHIFTFLOW_SOLUTIONS_V1:(\d+)$/.exec(line)
+        const stage = /^SHIFTFLOW_STAGE_V1:(loading|reading|solving|finishing)$/.exec(line)
+        const payload = count ? { requestId: request.requestId, phase: 'solving', solutionCount: Number(count[1]) } : stage ? { requestId: request.requestId, phase: stage[1] } : null
+        if (!payload) continue
+        const event = { receivedBeforeClose: !closed, receivedBeforeResultOutput: stdout.length === 0, receivedAt: Date.now(), ...payload }
+        if (count) observed.counts.push(event)
+        if (onProgress) stream = stream.then(() => onProgress(payload, event))
+      }
+    })
     child.on('error', error => { clearTimeout(timeout); reject(error) })
-    child.on('close', code => {
+    child.on('close', async code => {
+      closed = true
       clearTimeout(timeout)
-      try { assert.equal(code, 0, stderr); const result = JSON.parse(stdout); assert.ok(['OPTIMAL', 'FEASIBLE'].includes(result.status), stdout); resolve(result) } catch (error) { reject(error) }
+      try {
+        await stream
+        assert.equal(code, 0, stderr); const result = JSON.parse(stdout); assert.ok(['OPTIMAL', 'FEASIBLE'].includes(result.status), stdout)
+        observed.status = result.status; observed.finalCount = result.stats.solutionCount
+        report.streams.push(observed)
+        resolve(result)
+      } catch (error) { reject(error) }
     })
   })
 }
@@ -61,6 +81,7 @@ async function preparePage(state, desktop = false, viewport = { width: 1440, hei
       if (command === 'plugin:event|listen') return 1
       if (command === 'plugin:event|unlisten') return null
       if (command === 'solver_info') return { engine: 'ortools-cp-sat', protocolVersion: 1, version: 'controlled-progress-bridge', local: true }
+      if (command === 'integration_status') return { enabled: false, url: '', token: '', serviceId: '' }
       if (command === 'solve_schedule') {
         control.requests.push(args.request)
         return new Promise((resolve, reject) => control.pending.set(args.request.requestId, { resolve, reject }))
@@ -75,7 +96,7 @@ async function preparePage(state, desktop = false, viewport = { width: 1440, hei
   await page.addInitScript(({ state, desktop }) => {
     localStorage.setItem('shift-planner:v1', JSON.stringify(state))
     // Observe actual DOM insertion even when the real Worker finishes quickly.
-    window.__generationObservation = { visibleProgress: false, progressInDialog: false, workers: 0 }
+    window.__generationObservation = { visibleProgress: false, progressInDialog: false, workers: 0, solutionCounts: [], workerCounts: [] }
     const observe = () => {
       const observer = new MutationObserver(records => {
         for (const mutation of records) for (const node of mutation.addedNodes) {
@@ -83,8 +104,13 @@ async function preparePage(state, desktop = false, viewport = { width: 1440, hei
           const found = node.matches('.sp-solve-progress') ? node : node.querySelector('.sp-solve-progress')
           if (found) { window.__generationObservation.visibleProgress = true; window.__generationObservation.progressInDialog = !!found.closest('[role="dialog"]') }
         }
+        const count = document.querySelector('.sp-solve-progress [data-solution-count]')
+        if (count) {
+          const value = Number(count.textContent)
+          if (window.__generationObservation.solutionCounts.at(-1) !== value) window.__generationObservation.solutionCounts.push(value)
+        }
       })
-      observer.observe(document.documentElement, { childList: true, subtree: true })
+      observer.observe(document.documentElement, { childList: true, characterData: true, subtree: true })
     }
     if (document.documentElement) observe(); else document.addEventListener('DOMContentLoaded', observe, { once: true })
     if (desktop) {
@@ -109,7 +135,12 @@ async function preparePage(state, desktop = false, viewport = { width: 1440, hei
       // Count workers without replacing scheduling, messages, errors or results.
       const ActualWorker = window.Worker
       window.Worker = class extends ActualWorker {
-        constructor(...args) { super(...args); window.__generationObservation.workers++ }
+        constructor(...args) {
+          super(...args); window.__generationObservation.workers++
+          this.addEventListener('message', event => {
+            if (event.data?.progress?.solutionCount !== undefined) window.__generationObservation.workerCounts.push({ count: event.data.progress.solutionCount, progressOpen: !!document.querySelector('.sp-solve-progress'), resultShown: !!document.querySelector('.sp-solve-result') })
+          })
+        }
       }
     }
   }, { state, desktop })
@@ -137,19 +168,27 @@ async function start(page, control, seconds, repeatStart = false) {
   assert.equal(await element.evaluate(node => node.isConnected && node === document.querySelector('[role="dialog"]')), true, 'settings and progress share the same dialog node')
   return { dialog, request, progress: dialog.locator('.sp-solve-progress') }
 }
-async function emit(page, requestId, phase) { await page.evaluate(({ requestId, phase }) => window.__emitGenerationPhase({ requestId, phase }), { requestId, phase }) }
+async function emit(page, requestId, phase, solutionCount) { await page.evaluate(payload => window.__emitGenerationPhase(payload), { requestId, phase, solutionCount }) }
+async function countIs(progress, expected) { assert.equal(await progress.locator('[data-solution-count]').innerText(), String(expected)); assert.match(await progress.innerText(), new RegExp(`已获取方案\\s*${expected}\\s*种`)) }
 async function timers(progress) {
   const text = await progress.innerText(), values = text.match(/总计\s*(\d+)\s*秒\s*·\s*当前阶段\s*(\d+)\s*秒/)
   assert.ok(values, text)
   return { total: Number(values[1]), phase: Number(values[2]) }
 }
-async function settle(control, request, mode) {
+async function settle(control, request, mode, page) {
   const pending = control.pending.get(request.requestId)
   assert.ok(pending, 'request remains active until explicitly settled')
   control.pending.delete(request.requestId)
   if (mode === 'transport') pending.reject(new Error('SOLVE_TIMEOUT: controlled test deadline'))
   else if (mode === 'unknown') pending.resolve({ protocolVersion: 1, engine: 'ortools-cp-sat', requestId: request.requestId, status: 'UNKNOWN', issues: [], stats: { wallTimeSeconds: 15, shortageCount: 0, optimal: false }, message: 'Test controlled search did not find a result' })
-  else pending.resolve(await runSolver(request))
+  else pending.resolve(await runSolver(request, page ? async (payload, event) => {
+    await page.evaluate(payload => window.__emitGenerationPhase(payload), payload)
+    if (payload.solutionCount === undefined) return
+    await page.waitForFunction(count => Number(document.querySelector('[data-solution-count]')?.textContent) >= count, payload.solutionCount)
+    assert.equal(await page.locator('.sp-solve-progress').isVisible(), true, 'Actual hosted callback counts arrive while the manual task is still pending')
+    event.displayedWhilePending = true
+    event.displayedCount = Number(await page.locator('[data-solution-count]').innerText())
+  } : undefined))
 }
 async function finished(page, expected) {
   await page.getByRole('dialog').waitFor({ state: 'hidden' })
@@ -173,6 +212,7 @@ async function main() {
   try {
     const { page, control } = await preparePage(fixture, true)
     const first = await start(page, control, undefined, true)
+    await countIs(first.progress, 0)
     assert.equal(first.request.options.timeLimitSeconds, 15)
     assert.equal(await first.dialog.locator('.sp-generation-advanced').count(), 0)
     assert.equal(await page.locator('.sp-main .sp-solve-progress').count(), 0, 'progress must not remain in the page behind the dialog')
@@ -196,9 +236,22 @@ async function main() {
     await emit(page, first.request.requestId, 'solving')
     assert.deepEqual(await timers(first.progress), { total: 4, phase: 0 })
     assert.match(await first.progress.innerText(), /正在计算方案与轮班公平性/)
-    assert.match(await first.progress.innerText(), /排班搜索时限 15 秒，结束后还需返回并校验结果。/)
+    assert.match(await first.progress.innerText(), /搜索时限 15 秒；时限内继续搜索优化，结束后校验并采用优选结果。/)
     await page.clock.runFor(1250)
     assert.deepEqual(await timers(first.progress), { total: 5, phase: 1 })
+    await emit(page, first.request.requestId, 'solving', 3)
+    await countIs(first.progress, 3)
+    await emit(page, first.request.requestId, 'solving', 5)
+    await countIs(first.progress, 5)
+    for (const value of [0, 2, -1, 1.5, '7', null, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity]) {
+      await emit(page, first.request.requestId, 'solving', value)
+      await countIs(first.progress, 5)
+    }
+    await emit(page, 'unrelated-request', 'finishing', 99)
+    await emit(page, first.request.requestId, 'not-a-phase', 100)
+    await countIs(first.progress, 5)
+    assert.deepEqual(await timers(first.progress), { total: 5, phase: 1 }, 'Count-only events must not restart the current phase timer')
+    record('manual solution counts increase live, reject stale IDs and malformed values, never regress and preserve the current phase clock')
     await screenshot(page, '01-desktop-solving')
     record('desktop progress shows actual phase and elapsed clocks with selected 15-second search limit')
 
@@ -217,7 +270,8 @@ async function main() {
 
     await emit(page, first.request.requestId, 'finishing')
     assert.deepEqual(await timers(first.progress), { total: 5, phase: 0 })
-    await settle(control, first.request, 'success')
+    await settle(control, first.request, 'success', page)
+    assert.ok(report.streams.at(-1).counts.some(event => event.receivedBeforeClose && event.receivedBeforeResultOutput && event.displayedWhilePending), 'Real Python solution callbacks must reach the active manual progress UI before the final response')
     await finished(page, /排班已生成/)
     await page.clock.runFor(500)
     const generated = (await stored(page)).assignments
@@ -227,14 +281,17 @@ async function main() {
     record('real Python success payload closes progress, saves complete roster and preserves locked and outside-month entries')
 
     const second = await start(page, control, 30)
+    await countIs(second.progress, 0)
     assert.equal(second.request.options.timeLimitSeconds, 30)
     assert.deepEqual(await timers(second.progress), { total: 0, phase: 0 })
     const secondPhase = await second.progress.locator('[role="status"]').innerText()
-    await emit(page, first.request.requestId, 'finishing')
+    await emit(page, first.request.requestId, 'finishing', 98)
+    await countIs(second.progress, 0)
     assert.deepEqual(await timers(second.progress), { total: 0, phase: 0 })
     assert.equal(await second.progress.locator('[role="status"]').innerText(), secondPhase)
-    await emit(page, second.request.requestId, 'solving')
-    assert.match(await second.progress.innerText(), /排班搜索时限 30 秒/)
+    await emit(page, second.request.requestId, 'solving', 4)
+    await countIs(second.progress, 4)
+    assert.match(await second.progress.innerText(), /搜索时限 30 秒/)
     await settle(control, second.request, 'unknown')
     await finished(page, /尚未找到可行方案/)
     assert.deepEqual((await stored(page)).assignments, generated)
@@ -242,7 +299,8 @@ async function main() {
     record('second run resets timers, uses 30 seconds and preserves roster when no solution was found yet')
 
     const third = await start(page, control)
-    await emit(page, third.request.requestId, 'solving')
+    await countIs(third.progress, 0)
+    await emit(page, third.request.requestId, 'solving', 2)
     const cancel = third.dialog.getByRole('button', { name: '取消排班', exact: true })
     await cancel.click()
     await until(() => control.cancellations.length === 1, 'cancel reaches the bridge')
@@ -262,6 +320,9 @@ async function main() {
     record('cancel is sent once, traps focus while pending and closes only after confirmation')
 
     const fourth = await start(page, control)
+    await countIs(fourth.progress, 0)
+    await emit(page, third.request.requestId, 'solving', 100)
+    await countIs(fourth.progress, 0)
     await settle(control, third.request, 'success')
     assert.equal(await fourth.dialog.isVisible(), true)
     assert.equal(await page.locator('.sp-solve-result').count(), 0)
@@ -274,7 +335,8 @@ async function main() {
     record('transport failure closes progress, gives user guidance and retains the roster')
 
     const fifth = await start(page, control)
-    await emit(page, fifth.request.requestId, 'solving')
+    await countIs(fifth.progress, 0)
+    await emit(page, fifth.request.requestId, 'solving', 123)
     for (const viewport of [{ width: 390, height: 844 }, { width: 320, height: 740 }]) {
       await page.setViewportSize(viewport)
       await page.clock.runFor(500)
@@ -313,11 +375,17 @@ async function main() {
       assert.equal(await web.getByRole('dialog').count(), 0)
       await web.waitForFunction(() => document.activeElement === document.querySelector('.sp-heading-actions .sp-primary'))
       const observed = await web.evaluate(() => window.__generationObservation)
-      assert.deepEqual(observed, { visibleProgress: true, progressInDialog: true, workers: 1 })
+      assert.equal(observed.visibleProgress, true)
+      assert.equal(observed.progressInDialog, true)
+      assert.equal(observed.workers, 1)
       if (mode === 'success') {
+        assert.ok(observed.workerCounts.some(event => event.count === 1 && event.progressOpen && !event.resultShown), 'A real worker reports its complete solution while the progress dialog is still active')
+        assert.ok(observed.solutionCounts.includes(1), 'The worker progress message updates the visible count before its final result')
         assert.match(await web.locator('.sp-solve-result').innerText(), /排班已生成/)
         await web.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).assignments.filter(item => item.date.startsWith('2026-10') && item.shiftId === 'day').length === 31)
       } else {
+        assert.equal(observed.workerCounts.length, 0, 'An infeasible worker must not report an invented complete solution')
+        assert.ok(observed.solutionCounts.every(count => count === 0))
         assert.match(await web.locator('.sp-solve-result').innerText(), /暂未找到.*原排班未改变/)
         assert.deepEqual((await stored(web)).assignments, fixture.assignments)
       }

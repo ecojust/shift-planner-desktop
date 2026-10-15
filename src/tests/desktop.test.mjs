@@ -178,6 +178,29 @@ test('progress events must belong to the currently active request and use a know
   assert.equal(matchingSolverPhase({ requestId: 'current', phase: '__proto__' }, 'current'), null)
   assert.equal(matchingSolverPhase(null, 'current'), null)
 })
+test('solution counts accept only nonnegative safe integers in matching progress events', async () => {
+  const { matchingSolverSolutionCount } = await import('../DesktopSolver.ts')
+  const progress = { requestId: 'current', phase: 'solving' }
+  for (const count of [0, 1, 42, Number.MAX_SAFE_INTEGER]) {
+    assert.equal(matchingSolverSolutionCount({ ...progress, solutionCount: count }, 'current'), count)
+  }
+  for (const count of [undefined, null, '3', true, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.equal(matchingSolverSolutionCount({ ...progress, solutionCount: count }, 'current'), null)
+  }
+  assert.equal(matchingSolverSolutionCount(null, 'current'), null)
+})
+test('previous jobs and invalid phases cannot supply a solution count to a new job', async () => {
+  const { matchingSolverSolutionCount, matchingSolverPhase } = await import('../DesktopSolver.ts')
+  const progress = { requestId: 'previous', phase: 'solving', solutionCount: 5 }
+  assert.equal(matchingSolverSolutionCount(progress, 'new-job'), null)
+  assert.equal(matchingSolverSolutionCount(progress, null), null)
+  for (const phase of [undefined, 'imagined-progress', '__proto__']) {
+    assert.equal(matchingSolverSolutionCount({ ...progress, phase }, 'previous'), null)
+  }
+  // A legacy stage event can still advance the stage without inventing a count.
+  assert.equal(matchingSolverPhase({ requestId: 'new-job', phase: 'finishing' }, 'new-job'), 'finishing')
+  assert.equal(matchingSolverSolutionCount({ requestId: 'new-job', phase: 'finishing' }, 'new-job'), null)
+})
 test('startup, search, exit and legacy timeouts explain the correct stage without declaring infeasibility', async () => {
   const { formatSolverError } = await import('../DesktopSolver.ts')
   for (const [code, phrase] of [['STARTUP_TIMEOUT', '尚未开始生成排班'], ['SOLVE_TIMEOUT', '不能证明规则无解'], ['EXIT_TIMEOUT', '排班结果未能及时完成确认'], ['TIMEOUT', '无法据此判断规则是否无解']]) {

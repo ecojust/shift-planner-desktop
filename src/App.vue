@@ -8,6 +8,8 @@ import { useIntegrations } from './integrations'
 import { IntegrationError, type IntegrationGenerationAdapter, type IntegrationSource } from './integrationData'
 import { configurationFields, markSchedulesCurrent, withChangeProvenance, type ChangeStamp } from './dataProvenance'
 import { formatChangeTime } from './changeTime'
+import { reorderVisibleEmployees } from './employeeOrder'
+import { useEmployeeReorder, type EmployeeOrderChange } from './useEmployeeReorder'
 import SourceBadge from './SourceBadge.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import MonthPicker from './MonthPicker.vue'
@@ -19,7 +21,7 @@ import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP
 import { calculatePayroll, createPayrollConfig, dayInfo, payrollRows } from './payroll'
 import type { DayKind, PayrollConfig, PayrollResult } from './payroll'
 import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain'
-import { desktop, solveDesktop, cancelDesktop, desktopSolverInfo, importDesktopBackup, exportDesktopFile, checkDesktopResult, listenSolverProgress, matchingSolverPhase, solverPhaseLabels, formatSolverError, formatUserMessage, formatUserIssue } from './DesktopSolver'
+import { desktop, solveDesktop, cancelDesktop, desktopSolverInfo, importDesktopBackup, exportDesktopFile, checkDesktopResult, listenSolverProgress, matchingSolverPhase, matchingSolverSolutionCount, solverPhaseLabels, formatSolverError, formatUserMessage, formatUserIssue } from './DesktopSolver'
 import type { SolverRequest, SolverPhase } from './DesktopSolver'
 import { BUILD_VERSION } from './buildInfo'
 import { minimumMonthHours, monthlyHoursByEmployee } from './hours.ts'
@@ -67,6 +69,7 @@ const cancelling = ref(false)
 const solveTimeLimit = ref(15)
 const elapsedSeconds = ref(0)
 const phaseSeconds = ref(0)
+const solutionCount = ref(0)
 const cancellationError = ref('')
 const externalGeneration = ref<{ source: IntegrationSource; month: string; timeLimitSeconds: number } | null>(null)
 let phaseStartedAt = 0
@@ -120,7 +123,7 @@ function acceptProvenance(update: () => void) {
   try { update() } finally { acceptingProvenance = false }
 }
 function integrationEditingBusy() {
-  return !!saveError.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || readingRules.value || !!rulesImportCandidate.value || !!monthDeletion.value || !!calendarReset.value || showBackup.value || section.value !== 'calendar'
+  return employeeReorder.active.value || !!saveError.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || readingRules.value || !!rulesImportCandidate.value || !!monthDeletion.value || !!calendarReset.value || showBackup.value || section.value !== 'calendar'
 }
 const integrationGeneration: IntegrationGenerationAdapter = {
   acquire(request, source) {
@@ -215,6 +218,40 @@ const weekCount = computed(() => Math.ceil((dates.value.length + monthOffset.val
 const visibleDates = computed(() => view.value === 'month' ? dates.value : dates.value.slice(Math.max(0, weekIndex.value * 7 - monthOffset.value), Math.min(dates.value.length, weekIndex.value * 7 + 7 - monthOffset.value)))
 const groups = computed(() => [...new Set(state.value.employees.map(e => e.group).filter(Boolean))])
 const employees = computed(() => state.value.employees.filter(e => (!groupFilter.value || e.group === groupFilter.value) && `${e.name}${e.role}`.includes(employeeQuery.value.trim())))
+const employeeTable = ref<HTMLTableElement | null>(null)
+const canReorderEmployees = computed(() => !generating.value && !saveError.value && section.value === 'calendar'
+  && !editing.value && !calendarDate.value && !importCandidate.value && !readingRules.value && !rulesImportCandidate.value
+  && !monthDeletion.value && !calendarReset.value && !showBackup.value && !showGenerate.value && !showHelp.value
+  && !showIntegrationSettings.value && !mobileNav.value)
+let applyingSavedEmployeeOrder = false
+const employeeReorder = useEmployeeReorder({
+  table: () => employeeTable.value,
+  canStart: () => canReorderEmployees.value,
+  visibleIds: () => employees.value.map(employee => employee.id),
+  revision: () => revision,
+  commit: saveEmployeeOrder,
+})
+function saveEmployeeOrder(change: EmployeeOrderChange) {
+  if (!canReorderEmployees.value || change.revision !== revision
+    || change.visibleIds.join('\0') !== employees.value.map(employee => employee.id).join('\0')) return false
+  const reordered = reorderVisibleEmployees(state.value.employees, change.visibleIds, change.sourceId, change.targetId, change.position)
+  if (reordered === state.value.employees) return false
+  const next = { ...state.value, employees: reordered }
+  try { saveLocal(next) }
+  catch { flash('人员顺序保存失败，已保留原顺序。请检查设备存储空间后重试。'); return false }
+  const previousFeedback = solverFeedback.value, wasStale = previousFeedback?.stale
+  applyingSavedEmployeeOrder = true
+  try { acceptProvenance(() => { state.value = next }) }
+  finally { applyingSavedEmployeeOrder = false }
+  // Order is presentation only, including for a previous infeasible result.
+  if (previousFeedback && solverFeedback.value === previousFeedback) previousFeedback.stale = wasStale!
+  savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+  flash('人员顺序已保存，成员管理已同步')
+  return true
+}
+watch([employeeQuery, groupFilter, section, view, weekIndex, generating, editing, calendarDate, importCandidate,
+  readingRules, rulesImportCandidate, monthDeletion, calendarReset, showBackup, showGenerate, showHelp,
+  showIntegrationSettings, mobileNav, saveError], () => employeeReorder.cancel(), { flush: 'sync' })
 const assignments = computed(() => new Map(state.value.assignments.map(a => [`${a.employeeId}:${a.date}`, a])))
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
 const monthEntryCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(`${state.value.month}-`)).length)
@@ -300,6 +337,9 @@ function scheduleConfigurationKey(document: Document) {
   return JSON.stringify(Object.entries(configurationFields(document))
     .filter(([path]) => /^(employees|shifts|rules|calendar|monthlyReferenceHours)(\.|$)/.test(path))
     .sort(([a], [b]) => a.localeCompare(b)))
+}
+function configurationContentKey(document: PlannerState) {
+  return JSON.stringify(Object.entries(configurationFields(document)).sort(([a], [b]) => a.localeCompare(b)))
 }
 function remember() {
   history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value, configuration: scheduleConfigurationKey(state.value), invalidatedSchedules: clone(state.value.provenance?.invalidatedSchedules ?? {}) })
@@ -406,7 +446,7 @@ let revision = 0
 function beginGenerationProgress() {
   showGenerate.value = true; generating.value = true; cancelling.value = false
   cancellationError.value = ''; discardActiveResult = false
-  solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solvePhase.value = desktop ? 'starting' : 'solving'
+  solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solutionCount.value = 0; solvePhase.value = desktop ? 'starting' : 'solving'
   const started = performance.now(); phaseStartedAt = started
   window.clearInterval(generationTimer)
   generationTimer = window.setInterval(() => {
@@ -461,14 +501,19 @@ function feedback(success: boolean, message: string, details: string[] = [], dia
   // The persistent result card is the sole announcement of solver outcomes.
   notice.value = ''; window.clearTimeout(noticeTimer)
 }
+function receiveSolverProgress(progress: unknown) {
+  if (disposed || !generating.value) return
+  const phase = matchingSolverPhase(progress, activeRequestId)
+  if (phase && phase !== solvePhase.value) {
+    solvePhase.value = phase; phaseStartedAt = performance.now(); phaseSeconds.value = 0
+  }
+  const count = matchingSolverSolutionCount(progress, activeRequestId)
+  if (count !== null) solutionCount.value = Math.max(solutionCount.value, count)
+}
 async function ensureProgressListener() {
   if (unlistenProgress) return
-  if (!progressListenerPending) progressListenerPending = listenSolverProgress(progress => {
-    const phase = matchingSolverPhase(progress, activeRequestId)
-    if (!disposed && generating.value && phase && phase !== solvePhase.value) {
-      solvePhase.value = phase; phaseStartedAt = performance.now(); phaseSeconds.value = 0
-    }
-  }).then(unlisten => { if (disposed) unlisten(); else unlistenProgress = unlisten }).finally(() => { progressListenerPending = null })
+  if (!progressListenerPending) progressListenerPending = listenSolverProgress(receiveSolverProgress)
+    .then(unlisten => { if (disposed) unlisten(); else unlistenProgress = unlisten }).finally(() => { progressListenerPending = null })
   await progressListenerPending
 }
 async function checkEngine() {
@@ -534,6 +579,10 @@ async function generate() {
     worker = new Worker(new URL('./scheduler.worker.ts', import.meta.url), { type: 'module' })
     worker.onmessage = event => {
       if (!isCurrent()) return
+      if (event.data && typeof event.data === 'object' && Object.hasOwn(event.data, 'progress')) {
+        receiveSolverProgress(event.data.progress)
+        return
+      }
       try {
         const { result, error } = event.data
         if (inputRevision !== revision) feedback(false, '排班期间设置发生变化，已保留你的修改。请按最新设置重新生成。')
@@ -554,7 +603,7 @@ async function generate() {
       if (!isCurrent()) return
       feedback(false, '排班等待超时，尚未找到方案，已保留原表。'); finishGeneration()
     }, 30000)
-    worker.postMessage({ state: request.state, seed: request.options.seed })
+    worker.postMessage({ state: request.state, seed: request.options.seed, requestId: request.requestId })
   } catch {
     if (isCurrent()) { feedback(false, '排班暂时无法开始，请重试；原排班未改变。'); finishGeneration() }
   }
@@ -718,7 +767,8 @@ let recordingProvenance = false
 let provenanceSnapshot = clone({ ...state.value, assignments: [] })
 watch(state, () => {
   if (recordingProvenance) return
-  const configurationChanged = JSON.stringify(configurationFields(provenanceSnapshot)) !== JSON.stringify(configurationFields(state.value))
+  employeeReorder.cancel()
+  const configurationChanged = configurationContentKey(provenanceSnapshot) !== configurationContentKey(state.value)
   recordingProvenance = true
   try {
     if (!acceptingProvenance) {
@@ -731,7 +781,9 @@ watch(state, () => {
   if (monthDeletion.value) closeMonthDeletion(false)
   calendarReset.value = null
   if (solverFeedback.value && (configurationChanged || !solverFeedback.value.success)) solverFeedback.value.stale = true
-  window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
+  window.clearTimeout(saveTimer)
+  if (applyingSavedEmployeeOrder) return
+  saveTimer = window.setTimeout(() => {
   if (saveError.value.startsWith('原有数据读取失败')) return
   try { saveLocal(state.value); savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); saveError.value = '' }
   catch { saveError.value = '自动保存失败，请导出 JSON 备份，避免刷新丢失。' }
@@ -847,17 +899,19 @@ watch([generating, cancelling], async () => {
               <div class="sp-calendar-actions"><div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div><button ref="deleteMonthButton" type="button" class="sp-icon-button sp-delete-month" aria-label="删除本月排班" :title="`删除 ${monthTitle}的排班`" :disabled="generating || !monthEntryCount" @click="requestMonthDeletion"><Icon name="trash" :size="18" /></button></div>
             </div>
             <div class="sp-filterbar"><div class="sp-filters"><label class="sp-search"><Icon name="search" :size="16" /><input v-model="employeeQuery" placeholder="搜索成员" aria-label="搜索成员" /></label><AppSelect v-model="groupFilter" class="sp-group-filter" label="按工作组筛选" :options="[{ value: '', label: '全部工作组' }, ...groups.map(group => ({ value: group, label: group }))]" /></div><div class="sp-legend"><span v-for="s in state.shifts" :key="s.id"><i :style="{ background: s.color }"></i>{{ s.name }}</span><span><i class="sp-leave-dot"></i>请假</span><button class="sp-icon-button" :disabled="!history.length" aria-label="撤销上次调整" @click="undo"><Icon name="undo" :size="16" /></button></div></div>
+            <p id="employee-order-help" class="sp-employee-order-assist">拖动姓名左侧手柄调整人员顺序，成员管理同步。也可聚焦手柄按空格开始，用上下方向键选择位置，回车或空格保存，Escape 取消。筛选时仅调整可见成员，其他成员位置保持。</p>
+            <p class="sp-employee-order-assist" role="status" aria-live="polite" aria-atomic="true">{{ employeeReorder.announcement.value }}</p>
             <div class="sp-table-scroll" tabindex="0" aria-label="可横向滚动的排班表">
-              <table class="sp-schedule-table" :class="{ 'sp-month-table': view === 'month' }">
+              <table ref="employeeTable" class="sp-schedule-table" :class="{ 'sp-month-table': view === 'month', 'is-reordering-employees': employeeReorder.active.value }">
                 <thead><tr>
-                  <th class="sp-person-col"><span>团队成员</span><small>{{ employees.length }} 位成员</small></th>
+                  <th class="sp-person-col"><span>团队成员</span><small>{{ employees.length }} 位成员 · 拖动排序</small></th>
                   <th v-for="date in visibleDates" :key="date" :class="{ 'sp-current-day': date === today, 'sp-restday': info(date).kind === 'restday' }"><button class="sp-date-heading" :aria-label="`设置 ${date} 日期类型`" @click="openDate(date)"><span>周{{ weekday(date) }}</span><strong>{{ Number(date.slice(8)) }}<i v-if="date === today"></i></strong><small v-if="info(date).kind === 'statutory'" class="sp-holiday">{{ info(date).label }}</small><small v-else-if="info(date).label.includes('调休') || info(date).label.includes('补班')">{{ info(date).label }}</small><small v-else>{{ date === today ? '今天' : ' ' }}</small></button></th>
                   <th class="sp-hours-col" title="仅计算实际落在本月的工时，包括上月夜班进入本月的部分">本月工时</th>
                   <th class="sp-allowance-col" title="按本月开始的班次数累计固定津贴">额外津贴<small>当月合计 · 元</small></th>
                 </tr></thead>
                 <tbody>
-                  <tr v-for="employee in employees" :key="employee.id">
-                    <th class="sp-person-col"><div class="sp-person"><EmployeeAvatar class="sp-person-avatar" :name="employee.name" :color="employee.color" :avatar="employee.avatar" size="small" /><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
+                  <tr v-for="employee in employees" :key="employee.id" :data-employee-id="employee.id" :data-drop-position="employeeReorder.dropPosition(employee.id)" :class="{ 'is-reordering': employeeReorder.sourceId.value === employee.id }">
+                    <th class="sp-person-col"><div class="sp-person"><button type="button" class="sp-employee-drag-handle" :data-drag-employee-id="employee.id" :aria-label="`调整${employee.name}的显示顺序`" aria-describedby="employee-order-help" :aria-pressed="employeeReorder.sourceId.value === employee.id" title="拖动调整顺序；空格开始，上下键移动，回车保存，Escape 取消" :disabled="!canReorderEmployees || employees.length < 2" @pointerdown="employeeReorder.pointerdown(employee.id, employee.name, $event)" @keydown="employeeReorder.keydown(employee.id, employee.name, $event)" @click.stop.prevent><svg viewBox="0 0 16 20" width="16" height="20" aria-hidden="true" focusable="false"><g fill="currentColor"><circle cx="5" cy="5" r="1.4"/><circle cx="11" cy="5" r="1.4"/><circle cx="5" cy="10" r="1.4"/><circle cx="11" cy="10" r="1.4"/><circle cx="5" cy="15" r="1.4"/><circle cx="11" cy="15" r="1.4"/></g></svg></button><EmployeeAvatar class="sp-person-avatar" :name="employee.name" :color="employee.color" :avatar="employee.avatar" size="small" /><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
                     <td v-for="date in visibleDates" :key="date" :class="{ 'sp-current-day': date === today }">
                       <button class="sp-shift-cell" :class="{ 'is-off': !findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date), 'is-leave': leave(employee,date), 'has-allowance': (dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0 }" :style="findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date) ? { background: findShift(entry(employee.id,date)!.shiftId)!.color } : {}" :aria-label="`${employee.name} ${date} ${leave(employee,date) ? '请假' : findShift(entry(employee.id,date)?.shiftId || '')?.name || '休息'}，点击编辑`" :aria-description="allowanceDescription(employee.id,date)" :title="allowanceDescription(employee.id,date)" @click="openCell(employee,date)">
                         <template v-if="leave(employee,date)"><span>请假</span><small>全天休假</small></template>
@@ -917,8 +971,9 @@ watch([generating, cancelling], async () => {
             <span class="sp-solve-spinner" aria-hidden="true"></span>
             <div>
               <strong role="status" aria-live="polite">{{ cancelling ? '正在取消排班…' : cancellationError ? '取消尚未完成' : solverPhaseLabels[solvePhase] }}</strong>
+              <p class="sp-generation-solutions" aria-live="polite" aria-atomic="true">已获取方案 <b data-solution-count>{{ solutionCount }}</b> 种</p>
               <p class="sp-generation-timing" aria-live="off"><span>总计 <span data-elapsed-seconds>{{ elapsedSeconds }}</span> 秒</span><span>· 当前阶段 <span data-phase-seconds>{{ phaseSeconds }}</span> 秒</span><span>· 完成前保留原表</span></p>
-              <p>排班搜索时限 {{ externalGeneration?.timeLimitSeconds ?? (desktop ? solveTimeLimit : 30) }} 秒，结束后还需返回并校验结果。</p>
+              <p>搜索时限 {{ externalGeneration?.timeLimitSeconds ?? (desktop ? solveTimeLimit : 30) }} 秒；时限内继续搜索优化，结束后校验并采用优选结果。</p>
             </div>
           </div>
           <p v-if="cancellationError" class="sp-generation-cancel-error" role="alert">{{ cancellationError }}</p>

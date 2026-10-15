@@ -26,29 +26,86 @@ const fixture = {
   ],
   provenance: { fields: {}, invalidatedSchedules: { '2026-10': stamp, '2026-11': stamp } },
 }
-const report = { url, scope: 'Real Vue bridge, two real CP-SAT subprocess solves, independent roster audit and controlled lifecycle races; no native transport', checks: [], errors: [], solverRuns: [], screenshots: [], ok: false }
+const report = { url, scope: 'Real Vue bridge with live hosted Python progress, two real CP-SAT subprocess solves, independent roster audit and controlled lifecycle races; no native transport', checks: [], errors: [], solverRuns: [], screenshots: [], ok: false }
 const control = { mode: 'hold', requests: [], pending: new Map(), cancellations: [], cancelMode: 'reject' }
 let browser, page, nextId = 0
 function record(name, detail) { report.checks.push({ name, ...(detail ? { detail } : {}) }); console.log('PASS', name) }
 async function shot(name) { const file = path.join(out, `${name}.png`); await page.screenshot({ path: file }); report.screenshots.push(file) }
 async function realSolve(request) {
   const index = report.solverRuns.length + 1
-  const inputFile = path.join(out, `real-${index}-${request.state.month}-request.json`)
+  const prefix = path.join(out, `real-${index}-${request.state.month}`)
+  const inputFile = `${prefix}-request.json`
   await fs.writeFile(inputFile, JSON.stringify(request, null, 2) + '\n')
+  const source = await page.evaluate(id => window.__generationBridge.requests[id]?.source, request.requestId)
+  assert.ok(['mcp', 'http'].includes(source))
   return new Promise((resolve, reject) => {
-    const child = spawn(path.join(root, 'solver/.venv/bin/python'), [path.join(root, 'solver/main.py')], { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] })
-    let stdout = '', stderr = ''
+    const child = spawn(path.join(root, 'solver/.venv/bin/python'), [path.join(root, 'solver/main.py'), '--hosted'], { cwd: root, stdio: ['pipe', 'pipe', 'pipe'] })
+    let stdout = '', stderr = '', buffered = '', exited = false, stream = Promise.resolve(), streamError = null, screenshot = null
+    const progress = []
+    function lineReceived(raw) {
+      const line = raw.replace(/\r$/, '')
+      const count = /^SHIFTFLOW_SOLUTIONS_V1:(\d+)$/.exec(line)
+      const stage = /^SHIFTFLOW_STAGE_V1:(loading|reading|solving|finishing)$/.exec(line)
+      const payload = count ? { requestId: request.requestId, phase: 'solving', solutionCount: Number(count[1]) }
+        : stage ? { requestId: request.requestId, phase: stage[1] } : null
+      if (!payload) return
+      const observation = { ...payload, receivedAt: Date.now(), receivedBeforeExit: !exited, receivedBeforeResultOutput: stdout.length === 0 }
+      progress.push(observation)
+      // Drain stderr continuously and deliver real lines in order. The process
+      // never waits for screenshots or browser messages to continue solving.
+      stream = stream.then(async () => {
+        if (streamError) return
+        const displayed = await page.evaluate(async payload => {
+          window.__generationEmit('solver-progress', payload)
+          await Promise.resolve() // Allow Vue's scheduled DOM update.
+          const count = document.querySelector('[data-solution-count]')
+          return { count: count ? Number(count.textContent) : null, claimed: window.__generationBridge.claims.some(item => item.requestId === payload.requestId) }
+        }, payload)
+        observation.deliveredAt = Date.now()
+        observation.deliveredBeforeExit = !exited
+        observation.displayedCount = displayed.count
+        assert.equal(displayed.claimed, false, 'Progress must be visible before claiming or saving the final result')
+        if (count) {
+          assert.ok(Number.isSafeInteger(payload.solutionCount) && payload.solutionCount > 0)
+          assert.equal(displayed.count, payload.solutionCount, 'Vue displays each actual count from the live Python stream')
+          if (!screenshot) {
+            // Capture the first actual positive count without sleeping or
+            // injecting a count. Later lines continue to reach the UI.
+            screenshot = shot(`real-${source}-generation-progress`)
+            screenshot.catch(error => { streamError ??= error })
+          }
+        }
+      }).catch(error => { streamError ??= error })
+    }
     const timeout = setTimeout(() => { child.kill('SIGKILL'); reject(new Error('Real CP-SAT browser fixture exceeded 90 seconds')) }, 90000)
     child.stdout.on('data', data => { stdout += data })
-    child.stderr.on('data', data => { stderr += data })
+    child.stderr.on('data', data => {
+      stderr += data; buffered += data
+      const lines = buffered.split('\n'); buffered = lines.pop()
+      for (const line of lines) lineReceived(line)
+    })
+    child.on('exit', () => { exited = true })
     child.on('error', error => { clearTimeout(timeout); reject(error) })
     child.on('close', async code => {
       clearTimeout(timeout)
       try {
+        if (buffered) lineReceived(buffered)
+        await stream
+        await screenshot
+        await fs.writeFile(`${prefix}-stderr.log`, stderr)
+        await fs.writeFile(`${prefix}-progress.json`, JSON.stringify(progress, null, 2) + '\n')
+        if (streamError) throw streamError
         assert.equal(code, 0, stderr)
         const result = JSON.parse(stdout)
-        await fs.writeFile(path.join(out, `real-${index}-${request.state.month}-result.json`), JSON.stringify(result, null, 2) + '\n')
-        report.solverRuns.push({ month: request.state.month, requestId: request.requestId, engine: result.engine, status: result.status, stats: result.stats, inputFile })
+        const counts = progress.filter(item => item.solutionCount !== undefined)
+        assert.ok(counts.length > 0, `${source} emits real solution updates`)
+        assert.ok(counts.some(item => item.receivedBeforeExit && item.receivedBeforeResultOutput), `${source} reports solutions before completing its process and result output`)
+        assert.ok(counts.some(item => item.deliveredBeforeExit), `${source} updates the actual Vue display while the Python process is still running`)
+        assert.ok(counts.every((item, i) => i === 0 || item.solutionCount > counts[i - 1].solutionCount), 'Real distinct solution counts strictly increase')
+        assert.equal(counts.at(-1).solutionCount, result.stats.solutionCount)
+        assert.equal(progress.at(-1).displayedCount, result.stats.solutionCount, 'The final displayed count agrees with the actual solver result')
+        await fs.writeFile(`${prefix}-result.json`, JSON.stringify(result, null, 2) + '\n')
+        report.solverRuns.push({ month: request.state.month, source, requestId: request.requestId, engine: result.engine, status: result.status, stats: result.stats, inputFile, progressFile: `${prefix}-progress.json`, stderrFile: `${prefix}-stderr.log`, liveCounts: counts })
         resolve(result)
       } catch (error) { reject(error) }
     })
@@ -257,7 +314,6 @@ async function main() {
       await note.waitFor()
       assert.match(await note.innerText(), new RegExp(`${source.toUpperCase()}.*${month}`))
       if (source === 'http') assert.match(await note.innerText(), /当前查看月份保持不变/)
-      await shot(`real-${source}-generation-progress`)
       const result = await response(id), outcome = result.response.result
       assert.ok(outcome?.success && outcome.saved, JSON.stringify(result.response))
       assert.equal(outcome.month, month)
@@ -277,6 +333,7 @@ async function main() {
       await assertMonthChoiceStatus(picker, '2026-12', 'empty')
       await page.keyboard.press('Escape')
       await shot(`real-${source}-generation-saved`)
+      record(`${source} displays live hosted-Python solution counts before process exit and agrees with final stats`, { solutionCount: report.solverRuns.at(-1).stats.solutionCount, progressFile: report.solverRuns.at(-1).progressFile })
       record(`${source} runs real CP-SAT, validates complete coverage and locks/history, saves source/time and preserves the viewed month`, { targetMonth: month, status: outcome.status })
     }
     assert.equal(report.solverRuns.length, 2)

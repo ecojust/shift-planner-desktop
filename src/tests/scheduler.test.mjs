@@ -122,6 +122,30 @@ test('malformed config returns issues and preserves assignments', () => {
   assert.ok(result.issues.some(issue => issue.type === 'configuration'))
 })
 
+test('browser progress counts the first complete roster without changing the result', () => {
+  const value = state({ employees: ['a', 'b', 'c'].map(id => employee(id, { eligibleShiftIds: ['morning'] })), shifts: [{ ...morning }] })
+  const counts = []
+  let finished = false
+  const result = generateSchedule(value, 42, count => {
+    assert.equal(finished, false)
+    counts.push(count)
+  })
+  finished = true
+  assert.deepEqual(result.issues, [])
+  assert.deepEqual(counts, [1])
+  assert.deepEqual(result, generateSchedule(value, 42))
+  assert.deepEqual(result, generateSchedule(value, 42, () => { throw new Error('progress sink unavailable') }))
+})
+
+test('browser progress excludes incomplete attempts and invalid configurations', () => {
+  const counts = []
+  const missing = state({ employees: [employee('a', { maxHoursPerWeek: 8, eligibleShiftIds: ['morning'] })], shifts: [{ ...morning, required: 3 }] })
+  const result = generateSchedule(missing, 42, count => counts.push(count))
+  assert.ok(result.issues.some(issue => issue.type === 'coverage'))
+  generateSchedule(state({ month: '2026-99' }), 42, count => counts.push(count))
+  assert.deepEqual(counts, [])
+})
+
 test('duplicate copies of one person do not satisfy a two-person requirement', () => {
   const value = state({ shifts: [{ ...morning, required: 2 }, { ...night }], assignments: [assignment('2026-10-01'), assignment('2026-10-01')] })
   const issues = validateSchedule(value)
