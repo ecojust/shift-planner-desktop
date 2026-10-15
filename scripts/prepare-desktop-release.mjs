@@ -84,8 +84,9 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
   files.push(describe('SHA256SUMS'));
   const notes = `Shift Schedule Expert ${version} · Windows 与 macOS 桌面版
 
-本版在排班日历中按月份显示排班状态，并持久保存配置修改导致的失效标记。
+本版按月份保存排班状态，并突出显示 MCP／HTTP 对配置的修改。
 
+- MCP／HTTP 修改使用高对比底色、图标和明确的来源文字；手动修改保持轻量样式，每张配置卡仍最多显示一个状态。
 - 本月已有排班记录时显示「已排班」，没有记录时显示「未排班」。
 - 保存成员、班次或规则修改后，已有排班月份显示「规则已修改，排班已失效」，保留原排班供查看。
 - 状态在切换页面、月份、重启和完整备份恢复后保留；重新生成成功只解除当前月份的失效状态。
