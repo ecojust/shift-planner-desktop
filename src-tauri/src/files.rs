@@ -66,36 +66,36 @@ pub async fn import_backup(app: AppHandle) -> Result<Option<String>, String> {
         let choice = app
             .dialog()
             .file()
-            .add_filter("排班 JSON 备份", &["json"])
+            .add_filter("排班 JSON 文件", &["json"])
             .blocking_pick_file();
         let Some(choice) = choice else {
             return Ok(None);
         };
         let path = choice
             .into_path()
-            .map_err(|_| "无法读取所选位置，请选择本地备份文件。")?;
+            .map_err(|_| "无法读取所选位置，请选择本地 JSON 文件。")?;
         if !path
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
         {
-            return Err("请选择 JSON 格式的排班备份。".into());
+            return Err("请选择 JSON 格式的排班文件。".into());
         }
         // Open once and cap the actual read too, so a file changing after metadata cannot exceed the limit.
         use std::io::Read;
-        let file = std::fs::File::open(path).map_err(|error| format!("读取备份失败：{error}"))?;
-        if file.metadata().map_err(|_| "无法读取备份大小。")?.len() > IMPORT_LIMIT {
-            return Err("备份文件超过 8 MB 上限。".into());
+        let file = std::fs::File::open(path).map_err(|error| format!("读取文件失败：{error}"))?;
+        if file.metadata().map_err(|_| "无法读取文件大小。")?.len() > IMPORT_LIMIT {
+            return Err("JSON 文件超过 8 MB 上限。".into());
         }
         let mut bytes = Vec::new();
         file.take(IMPORT_LIMIT + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| "读取备份失败。")?;
+            .map_err(|_| "读取文件失败。")?;
         if bytes.len() as u64 > IMPORT_LIMIT {
-            return Err("备份文件超过 8 MB 上限。".into());
+            return Err("JSON 文件超过 8 MB 上限。".into());
         }
         let content =
-            String::from_utf8(bytes).map_err(|_| "备份必须为 UTF-8 编码的 JSON 文件。")?;
+            String::from_utf8(bytes).map_err(|_| "文件必须为 UTF-8 编码的 JSON。")?;
         Ok(Some(content))
     })
     .await

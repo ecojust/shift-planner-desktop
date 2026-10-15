@@ -55,6 +55,7 @@ pub async fn integration_start(
     }
     let server = Server::start(
         Arc::new(move |request| {
+            // Preserve the route-owned source alongside the untrusted client arguments.
             app.emit_to("main", "integration-request", request)
                 .map_err(|error| error.to_string())
         }),

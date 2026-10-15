@@ -6,7 +6,9 @@ const fixture = () => ({ version: 1, teamName: '测试', month: '2026-10', emplo
 function setup() {
   let state = fixture(), busy = false, failSave = false
   let saves = 0
-  const handle = createIntegrationHandler(() => state, next => { if (failSave) throw new Error('磁盘写入失败'); saves++; state = next }, () => busy)
+  const rawHandle = createIntegrationHandler(() => state, next => { if (failSave) throw new Error('磁盘写入失败'); saves++; state = next }, () => busy,
+    () => ({ members: true, shifts: true, rules: true, assignments: true }))
+  const handle = (method, args) => rawHandle(method, args, 'mcp')
   return { handle, state: () => state, saves: () => saves, busy: value => { busy = value }, failSave: value => { failSave = value } }
 }
 

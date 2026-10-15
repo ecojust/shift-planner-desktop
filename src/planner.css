@@ -40,7 +40,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-breadcrumb { display: flex; align-items: center; gap: 12px; font-size: 12px; color: #809086; white-space: nowrap; }
 .sp-breadcrumb strong { font-weight: 500; color: #53675b; }
-.sp-top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 20px; min-width: 0; }
+.sp-top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; min-width: 0; }
 .sp-build-version { display: flex; align-items: center; gap: 8px; color: #78877d; font-size: 11px; white-space: nowrap; }
 .sp-build-version code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: #476352; font-size: 11px; padding: 5px 8px; background: #f3f6f2; border: 1px solid #e7ece5; border-radius: 5px; font-variant-numeric: tabular-nums; }
 .sp-save-indicator { display: flex; gap: 7px; align-items: center; font-size: 11px; color: #76897a; white-space: nowrap; }
@@ -49,14 +49,30 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-save-indicator.error i { background: #a95037; }
 .sp-icon-button { display: inline-flex; justify-content: center; align-items: center; height: 31px; width: 31px; border: 0; background: transparent; border-radius: 6px; padding: 5px; color: #7f9087 !important; }
 .sp-icon-button:hover { background: #edf4f0; }
+.sp-top-actions .sp-settings-trigger { flex-shrink: 0; width: 32px; height: 32px; padding: 6px; }
+.sp-settings-trigger:focus-visible { outline: 3px solid #99ddd4; outline-offset: 2px; }
+@media (pointer: coarse) { .sp-top-actions .sp-settings-trigger { width: 40px; height: 40px; } }
 .sp-mobile-toggle { display: none; }
 .sp-content { max-width: 1680px; margin: 0 auto; padding: 24px 28px 28px; }
 .sp-page-heading { display: flex; align-items: center; justify-content: space-between; gap: 20px; margin-bottom: 20px; min-height: 48px; }
 .sp-page-heading h1 { font-size: 24px; font-weight: 650; letter-spacing: -.7px; line-height: 1.4; }
 .sp-page-heading p { font-size: 12px; color: #748477; margin-top: 5px; }
 .sp-context { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.sp-schedule-update { display: flex; flex-basis: 100%; flex-wrap: wrap; align-items: baseline; gap: 3px 5px; color: #526e60; }
+.sp-schedule-update time { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-schedule-update small { color: #829187; font-size: 10px; }
 .sp-context button { background: none; padding: 0; border: 0; font-size: inherit; color: #597867; text-decoration: underline; text-decoration-color: #bacabc; text-underline-offset: 3px; }
 .sp-heading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.sp-rules-import-error { display: flex; align-items: flex-start; gap: 12px; padding: 12px 15px; margin: 0 0 16px; border: 1px solid #ecd4c8; border-radius: 9px; background: #fff4ee; color: #9a4f39; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.sp-rules-import-error > span { flex: 1; min-width: 0; }
+.sp-rules-import-error > button { flex-shrink: 0; min-width: 32px; min-height: 32px; padding: 0; border: 0; background: transparent; color: inherit; font-size: 22px; cursor: pointer; }
+.sp-rules-import-preview { padding: 14px; border: 1px solid #e0e9e3; border-radius: 9px; background: #f6faf7; color: #5d796a; }
+.sp-rules-import-preview > strong { display: block; color: #315d48; font-size: 14px; }
+.sp-rules-import-preview .sp-rules-import-file { margin: 0 0 8px; color: #81968b; font-size: 11px; }
+.sp-rules-import-preview dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 14px 0; }
+.sp-rules-import-preview dt { font-size: 11px; color: #81968b; }
+.sp-rules-import-preview dd { margin: 3px 0 0; font-size: 17px; font-weight: 600; color: #446e56; }
+.sp-rules-import-note { color: #83642d; }
 .sp-button { display: inline-flex; align-items: center; justify-content: center; gap: 8px; min-height: 40px; padding: 0 16px; border: 1px solid #d9e2da; border-radius: 8px; background: #fff; font-size: 12px; font-weight: 550; white-space: nowrap; transition: background .15s, box-shadow .15s; }
 .sp-button:hover { background: #f4f8f5; }
 .sp-primary { background: var(--sp-teal); color: #fff !important; border-color: var(--sp-teal); box-shadow: 0 3px 5px #0c887a13; }
@@ -295,7 +311,7 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
   .sp-current-month { min-height: 44px; padding: 0 7px; }
   .sp-top-actions { grid-column: 2; grid-row: 1; }
   .sp-breadcrumb { gap: 6px; font-size: 12px; }.sp-breadcrumb > span, .sp-breadcrumb > svg { display: none; }
-  .sp-top-actions { gap: 0; }.sp-build-version { gap: 5px; }.sp-build-version > span { display: none; }.sp-build-version code { font-size: 10px; padding: 5px 6px; }
+  .sp-top-actions { gap: 5px; }.sp-build-version { gap: 5px; }.sp-build-version > span { display: none; }.sp-build-version code { font-size: 10px; padding: 5px 6px; }
   .sp-content { padding: 18px 12px; }.sp-page-heading { gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }.sp-page-heading h1 { font-size: 23px; }
   .sp-heading-actions { width: 100%; }.sp-heading-actions .sp-button { flex: 1; min-height: 42px; }
   .sp-overview { margin-bottom: 16px; }.sp-overview > div { padding: 12px 10px; gap: 5px; }.sp-overview dt { font-size: 11px; }.sp-overview dd { font-size: 22px; }.sp-overview > div > span { font-size: 10px; }
@@ -329,3 +345,12 @@ summary:focus-visible { outline: 3px solid #86ccbf; outline-offset: 3px; }
 .sp-edit-allowance small { color: #9b855b; font-size: 11px; }
 @media(min-width:900px) { .sp-schedule-table .sp-allowance-col { position: sticky; right: 0; z-index: 2; box-shadow: -3px 0 6px #a7935310; } }
 @media(max-width:720px) { .sp-allowance-legend { padding: 11px 13px; } }
+
+.sp-external-change { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 18px; padding: 17px 19px; border: 1px solid #ead8b8; border-radius: 11px; background: #fff8eb; color: #80613a; }
+.sp-external-change > svg { flex-shrink: 0; margin-top: 2px; }
+.sp-external-change > div { min-width: 0; }
+.sp-external-change strong { font-size: 13px; }
+.sp-external-change p { margin: 7px 0 0; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.sp-external-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.sp-external-actions .sp-button { min-height: 36px; font-size: 12px; }
+@media (max-width: 760px) { .sp-external-change { padding: 14px; gap: 9px; }.sp-external-actions .sp-button { min-height: 44px; } }

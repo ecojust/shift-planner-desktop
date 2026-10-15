@@ -5,6 +5,9 @@ import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import IntegrationSettings from './IntegrationSettings.vue'
 import { useIntegrations } from './integrations'
+import { configurationFields, withChangeProvenance } from './dataProvenance'
+import { formatChangeTime } from './changeTime'
+import SourceBadge from './SourceBadge.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import MonthPicker from './MonthPicker.vue'
 import AppSelect from './AppSelect.vue'
@@ -20,6 +23,7 @@ import type { SolverRequest, SolverPhase } from './DesktopSolver'
 import { BUILD_VERSION } from './buildInfo'
 import { minimumMonthHours, monthlyHoursByEmployee } from './hours.ts'
 import { createSolverRequest, solverDebugJSON, solverDebugFileName } from './solverDebug'
+import { parseRulesImport } from './rulesImport'
 import { withSolverGuidance, diagnosticActionLabel } from './solverGuidance'
 import './planner.css'
 
@@ -77,25 +81,37 @@ let disposed = false
 const importer = ref<HTMLInputElement | null>(null)
 const settingsPanel = ref<InstanceType<typeof SettingsPanel> | null>(null)
 const importCandidate = ref<Document | null>(null)
+const rulesImporter = ref<HTMLInputElement | null>(null)
+const readingRules = ref(false)
+const rulesImportError = ref('')
+const rulesImportCandidate = ref<{ parsed: ReturnType<typeof parseRulesImport>; revision: number; name: string } | null>(null)
+let rulesImportRequest = 0
+let rulesImportRevision = 0
 const editing = ref<{ employee: Employee; date: string; shiftId: string; locked: boolean } | null>(null)
 const calendarDate = ref('')
 const calendarKind = ref<DayKind>('workday')
 const calendarReset = ref<{ date: string; revision: number } | null>(null)
 const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]>; source: string }[]>([])
 const savedAt = ref('')
+let acceptingProvenance = false
+function acceptProvenance(update: () => void) {
+  acceptingProvenance = true
+  try { update() } finally { acceptingProvenance = false }
+}
 const integration = useIntegrations(
   () => state.value,
-  document => {
+  (document, source) => {
     const next = { ...createPayrollConfig(), ...document } as Document
     saveLocal(next)
-    state.value = next
+    acceptProvenance(() => { state.value = next })
     savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
     saveError.value = ''
     history.value = []
-    scheduleSource.value = '已通过 MCP / HTTP 更新'
-    flash('外部排班修改已保存')
+    solverFeedback.value = null
+    scheduleSource.value = `已通过 ${source.toUpperCase()} 更新`
+    flash(`${source.toUpperCase()} 修改已保存，请核对配置来源和排班检查结果`)
   },
-  () => !!saveError.value || generating.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || !!monthDeletion.value || !!calendarReset.value || section.value !== 'calendar',
+  () => !!saveError.value || generating.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || readingRules.value || !!rulesImportCandidate.value || !!monthDeletion.value || !!calendarReset.value || section.value !== 'calendar',
 )
 
 const navigation: { key: Section; label: string; icon: string }[] = [
@@ -113,6 +129,17 @@ const assignments = computed(() => new Map(state.value.assignments.map(a => [`${
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
 const monthEntryCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(`${state.value.month}-`)).length)
 const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
+const externalChange = computed(() => state.value.provenance?.pendingExternalChange)
+const scheduleUpdate = computed(() => state.value.provenance?.scheduleUpdates?.[state.value.month])
+async function reviewExternalChanges() {
+  chooseSection('calendar')
+  showIssues.value = true
+  await nextTick()
+  document.querySelector('.sp-issues')?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+}
+function acknowledgeExternalChanges() {
+  acceptProvenance(() => { if (state.value.provenance) delete state.value.provenance.pendingExternalChange })
+}
 const payrollCalculation = computed<{ result: PayrollResult; error: string }>(() => {
   try { return { result: calculatePayroll(state.value, { payroll: state.value.payroll, calendar: state.value.calendar }), error: '' } }
   catch (error) {
@@ -398,6 +425,80 @@ async function exportRules(attempt: Attempt | null = null) {
     if (await download(data, solverDebugFileName(request, source), 'application/json')) flash(attempt ? '已导出失败当次的排班设置，可用于排查问题' : '已导出当前成员、班次、规则和相关排班记录')
   } catch (e) { flash(e instanceof Error ? e.message : String(e)) }
 }
+function cancelRulesImport() {
+  rulesImportRequest++
+  readingRules.value = false
+  rulesImportCandidate.value = null
+  rulesImportError.value = ''
+  if (rulesImporter.value) rulesImporter.value.value = ''
+}
+function previewRulesImport(contents: string, name: string, request: number) {
+  if (request !== rulesImportRequest || disposed) return
+  if (revision !== rulesImportRevision || generating.value || section.value !== 'calendar') {
+    throw new Error('选择文件期间排班数据已变化，请重新导入并核对。')
+  }
+  rulesImportCandidate.value = { parsed: parseRulesImport(contents), revision, name }
+}
+async function openRulesImport() {
+  if (generating.value || readingRules.value || rulesImportCandidate.value) return
+  rulesImportError.value = ''
+  rulesImportRevision = revision
+  const request = ++rulesImportRequest
+  readingRules.value = true
+  if (!desktop) { rulesImporter.value?.click(); return }
+  try {
+    const contents = await importDesktopBackup().catch(() => { throw new Error('规则文件读取失败，请选择可以访问的 JSON 文件，大小不超过 8 MB。') })
+    if (contents !== null) previewRulesImport(contents, '已选择的规则文件', request)
+  } catch (error) {
+    if (request === rulesImportRequest) rulesImportError.value = error instanceof Error ? error.message : '规则文件读取失败，请重新选择。'
+  } finally { if (request === rulesImportRequest) readingRules.value = false }
+}
+async function selectRulesImport(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  const request = rulesImportRequest
+  try {
+    if (!file) return
+    if (file.size > MAX_BACKUP_BYTES) throw new Error('规则文件不能超过 8 MB。')
+    previewRulesImport(await file.text(), file.name, request)
+  } catch (error) {
+    if (request === rulesImportRequest) rulesImportError.value = error instanceof Error ? error.message : '规则文件读取失败，请重新选择。'
+  } finally {
+    input.value = ''
+    if (request === rulesImportRequest) readingRules.value = false
+  }
+}
+function confirmRulesImport() {
+  const candidate = rulesImportCandidate.value
+  if (!candidate) return
+  if (candidate.revision !== revision || generating.value || section.value !== 'calendar') {
+    cancelRulesImport()
+    rulesImportError.value = '排班数据已变化，请重新导入并核对。'
+    return
+  }
+  try {
+    const document = clone(candidate.parsed.document)
+    // Rule exports deliberately omit photos. Keep local photos only for the
+    // same identified member, without copying any submitted source history.
+    for (const employee of document.employees) {
+      const current = state.value.employees.find(item => item.id === employee.id && item.name === employee.name)
+      if (employee.avatar === undefined && current?.avatar !== undefined) employee.avatar = current.avatar
+    }
+    const next = withChangeProvenance(state.value, { ...createPayrollConfig(), ...document }, 'manual') as Document
+    // Validate and persist the complete replacement before changing the UI.
+    try { saveLocal(next) } catch { throw new Error('导入未保存，当前数据未替换。请检查存储空间，或先导出完整备份后重试。') }
+    acceptProvenance(() => { state.value = next })
+    window.clearTimeout(saveTimer)
+    if (candidate.parsed.timeLimitSeconds !== undefined) solveTimeLimit.value = candidate.parsed.timeLimitSeconds
+    savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    saveError.value = ''
+    history.value = []; weekIndex.value = 0; employeeQuery.value = ''; groupFilter.value = ''
+    solverFeedback.value = null; expandedFeedback.value = false
+    scheduleSource.value = '已导入规则文件中的排班'
+    cancelRulesImport()
+    flash('规则文件已导入，修改来源已记录为手动修改，请核对排班检查结果')
+  } catch (error) { rulesImportError.value = error instanceof Error ? error.message : '导入失败，请重新选择规则文件。' }
+}
 async function openDiagnostic(issue: Issue) {
   if (!issue.target) return
   chooseSection(issue.target)
@@ -428,11 +529,28 @@ async function selectImport(event: Event) {
   catch (e) { flash(e instanceof Error ? e.message : '文件读取失败') }
   input.value = ''; showBackup.value = false
 }
-function confirmImport() { if (!importCandidate.value) return; state.value = importCandidate.value; importCandidate.value = null; history.value = []; weekIndex.value = 0; saveError.value = ''; scheduleSource.value = '已导入备份排班'; solverFeedback.value = null; flash('备份已导入') }
+function confirmImport() { if (!importCandidate.value) return; const imported = importCandidate.value; acceptProvenance(() => { state.value = imported }); importCandidate.value = null; history.value = []; weekIndex.value = 0; saveError.value = ''; scheduleSource.value = '已导入备份排班'; solverFeedback.value = null; flash('备份已导入') }
 function jumpToIssue(date?: string) { if (!date) return; if (!date.startsWith(state.value.month)) changeMonth(date.slice(0, 7)); weekIndex.value = weekOf(date); view.value = 'week' }
 let noticeTimer = 0
 let saveTimer = 0
-watch(state, () => { revision++; if (monthDeletion.value) closeMonthDeletion(false); calendarReset.value = null; if (solverFeedback.value && !solverFeedback.value.success) solverFeedback.value.stale = true; window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
+let recordingProvenance = false
+let provenanceSnapshot = clone({ ...state.value, assignments: [] })
+watch(state, () => {
+  if (recordingProvenance) return
+  const configurationChanged = JSON.stringify(configurationFields(provenanceSnapshot)) !== JSON.stringify(configurationFields(state.value))
+  recordingProvenance = true
+  try {
+    if (!acceptingProvenance) {
+      const provenance = withChangeProvenance(provenanceSnapshot, state.value, 'manual').provenance
+      if (JSON.stringify(provenance) !== JSON.stringify(state.value.provenance)) state.value.provenance = provenance
+    }
+    provenanceSnapshot = clone({ ...state.value, assignments: [] })
+  } finally { recordingProvenance = false }
+  revision++
+  if (monthDeletion.value) closeMonthDeletion(false)
+  calendarReset.value = null
+  if (solverFeedback.value && (configurationChanged || !solverFeedback.value.success)) solverFeedback.value.stale = true
+  window.clearTimeout(saveTimer); saveTimer = window.setTimeout(() => {
   if (saveError.value.startsWith('原有数据读取失败')) return
   try { saveLocal(state.value); savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }); saveError.value = '' }
   catch { saveError.value = '自动保存失败，请导出 JSON 备份，避免刷新丢失。' }
@@ -463,6 +581,9 @@ onUnmounted(() => { disposed = true; unlistenProgress?.(); unlistenProgress = nu
 watch([editing, calendarDate, showGenerate, showBackup, showHelp, importCandidate], async () => { await nextTick(); (document.querySelector('.sp-modal input, .sp-modal select, .sp-modal button') as HTMLElement | null)?.focus() })
 watch(monthDeletion, async target => { if (target) { await nextTick(); cancelMonthDeletionButton.value?.focus({ preventScroll: true }) } })
 watch([generating, section, importCandidate], () => { if (monthDeletion.value) closeMonthDeletion(false); calendarReset.value = null }, { flush: 'sync' })
+watch([generating, section], () => {
+  if ((generating.value || section.value !== 'calendar') && (readingRules.value || rulesImportCandidate.value)) cancelRulesImport()
+}, { flush: 'sync' })
 watch(calendarDate, () => { calendarReset.value = null }, { flush: 'sync' })
 watch([generating, cancelling], async () => {
   await nextTick()
@@ -490,18 +611,31 @@ watch([generating, cancelling], async () => {
           <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
           <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
         </div>
-        <div class="sp-top-actions"><button class="sp-button" aria-haspopup="dialog" @click="showIntegrationSettings = true">⚙ Setting</button><span class="sp-save-indicator" :class="{ error: saveError }"><i></i>{{ saveError ? '保存异常' : savedAt ? `${savedAt} 已保存` : '本地保存' }}</span><span class="sp-build-version" title="北京时间 · 本次软件构建时间" :aria-label="`构建版本 ${BUILD_VERSION}`"><span>构建</span><code>{{ BUILD_VERSION }}</code></span></div>
+        <div class="sp-top-actions"><span class="sp-save-indicator" :class="{ error: saveError }"><i></i>{{ saveError ? '保存异常' : savedAt ? `${savedAt} 已保存` : '本地保存' }}</span><span class="sp-build-version" title="北京时间 · 本次软件构建时间" :aria-label="`构建版本 ${BUILD_VERSION}`"><span>构建</span><code>{{ BUILD_VERSION }}</code></span><button type="button" class="sp-icon-button sp-settings-trigger" aria-label="设置" title="设置" aria-haspopup="dialog" @click="showIntegrationSettings = true"><Icon name="settings" :size="19" /></button></div>
       </header>
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
-        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
-        <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
-        <div v-if="section === 'calendar' && solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success }" role="status">
-          <Icon :name="solverFeedback.success ? 'shield' : 'info'" :size="20" />
+        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span v-if="scheduleUpdate" class="sp-schedule-update" :data-schedule-source="scheduleUpdate.source" aria-label="本月最近外部排班生成或更新时间"><span>最近 {{ scheduleUpdate.source.toUpperCase() }} 排班生成 / 更新：</span><time :datetime="scheduleUpdate.at" title="软件成功保存该月份外部排班数据的时间（本机时间）">{{ formatChangeTime(scheduleUpdate.at) }}</time><small>本机时间</small></span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" :disabled="generating || readingRules || !!rulesImportCandidate" title="导入之前导出的规则文件" @click="openRulesImport"><Icon name="upload" :size="17" />{{ readingRules ? '正在读取…' : '导入规则' }}</button><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
+        <div v-if="rulesImportError && !rulesImportCandidate" class="sp-rules-import-error" role="alert"><span>{{ rulesImportError }}</span><button type="button" aria-label="关闭规则导入提示" @click="rulesImportError = ''">×</button></div>
+        <section v-if="externalChange" class="sp-external-change" role="status" aria-label="外部配置变更提醒">
+          <Icon name="info" :size="20" />
           <div>
-            <strong>{{ solverFeedback.message }}</strong>
-            <p v-if="!solverFeedback.success && solverFeedback.stale" class="sp-diagnostic-stale">设置已更改，下方提示仍对应上一次排班；请重新生成以检查修改。</p>
+            <strong>外部修改了配置，请核对现有排班</strong>
+            <p>最近修改来自 {{ externalChange.source.toUpperCase() }} · {{ formatChangeTime(externalChange.at) }}。待核对：{{ externalChange.categories.join('、') }}。</p>
+            <p>配置修改不会自动重新排班。{{ issues.length ? `当前月份检查出 ${issues.length} 项冲突或提醒，请查看并按需重新生成。` : '当前月份未发现规则冲突，请确认其他月份和配置是否符合预期。' }}</p>
+            <div class="sp-external-actions">
+              <button class="sp-button" @click="reviewExternalChanges">查看排班检查</button>
+              <button class="sp-button" :disabled="generating" @click="acknowledgeExternalChanges">已核对变更</button>
+            </div>
+          </div>
+        </section>
+        <div v-if="section === 'calendar' && desktop && engineState !== 'ready'" class="sp-engine-strip" :class="{ 'is-error': engineState === 'error' }"><span role="status"><Icon name="info" :size="16" />{{ engineInfo }}</span><button v-if="engineState === 'error'" class="sp-link" @click="showGenerate = true">检测与重试</button></div>
+        <div v-if="section === 'calendar' && solverFeedback" class="sp-solve-result" :class="{ 'is-warning': !solverFeedback.success || solverFeedback.stale }" role="status">
+          <Icon :name="solverFeedback.success && !solverFeedback.stale ? 'shield' : 'info'" :size="20" />
+          <div>
+            <strong>{{ solverFeedback.stale ? '配置已更改，上次排班结果需要重新检查' : solverFeedback.message }}</strong>
+            <p v-if="solverFeedback.stale" class="sp-diagnostic-stale">设置已更改，下方提示仍对应上一次排班；请重新生成以检查修改。</p>
             <p v-for="(detail,index) in solverFeedback.details" :key="index">{{ detail }}</p>
             <ol v-if="solverFeedback.issues.length" class="sp-conflict-list">
               <li v-for="(issue,index) in (expandedFeedback ? solverFeedback.issues : solverFeedback.issues.slice(0,5))" :key="`${issue.id}-${index}`">
@@ -574,6 +708,7 @@ watch([generating, cancelling], async () => {
     </div>
 
     <input v-if="!desktop" ref="importer" class="sp-hidden" type="file" accept=".json,application/json" @change="selectImport" />
+    <input v-if="!desktop" ref="rulesImporter" class="sp-hidden" type="file" accept=".json,application/json" aria-label="导入规则文件" @change="selectRulesImport" @cancel="cancelRulesImport" />
     <div v-if="notice" class="sp-toast" role="status"><Icon name="info" :size="18" />{{ notice }}<button aria-label="关闭提示" @click="notice = ''"><Icon name="close" :size="15" /></button></div>
 
     <div v-if="monthDeletion" class="sp-overlay" @click.self="closeMonthDeletion()">
@@ -590,7 +725,7 @@ watch([generating, cancelling], async () => {
 
     <div v-if="editing" class="sp-overlay" @click.self="editing = null"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-edit-title"><div class="sp-modal-heading"><div><h2 id="sp-edit-title">调整班次</h2><p>{{ editing.employee.name }} · {{ editing.date }} · 周{{ weekday(editing.date) }}</p></div><button class="sp-icon-button" aria-label="关闭班次编辑" @click="editing = null"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="s in state.shifts" :key="s.id" :disabled="!editing.employee.eligibleShiftIds.includes(s.id)" :class="{ selected: editing.shiftId === s.id }" @click="editing.shiftId = s.id"><span class="sp-shift-swatch" :style="{ background: s.color }">{{ s.shortName }}</span><span><strong>{{ s.name }}</strong><small>{{ s.start }}–{{ s.end }} · {{ shiftHours(s) }} 小时{{ editing.employee.eligibleShiftIds.includes(s.id) ? '' : ' · 未获得该班资格' }}</small></span><Icon v-if="editing.shiftId === s.id" name="check" /></button><button :class="{ selected: editing.shiftId === 'off' }" @click="editing.shiftId = 'off'"><span class="sp-shift-swatch">休</span><span><strong>安排休息</strong><small>锁定后，自动排班不会占用这一天</small></span></button><button :class="{ selected: editing.shiftId === 'leave' }" @click="editing.shiftId = 'leave'"><span class="sp-shift-swatch sp-leave-swatch">假</span><span><strong>全天请假</strong><small>作为不可排班日期保存</small></span></button></div><div class="sp-edit-allowance" role="note"><strong>已保存排班的当日津贴</strong><p>{{ allowanceDescription(editing.employee.id, editing.date) }}</p><small>保存班次调整后会重新计算。</small></div><label v-if="editing.shiftId !== 'leave'" class="sp-lock-toggle"><input v-model="editing.locked" type="checkbox" /><Icon name="lock" :size="15" /><span>锁定本次安排，重新排班时保留</span></label><div class="sp-modal-actions"><button class="sp-button" @click="editing = null">取消</button><button class="sp-button sp-primary" @click="saveCell">保存安排</button></div></section></div>
 
-    <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" :disabled="!Object.hasOwn(state.calendar, calendarDate)" @click="requestCalendarReset">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
+    <div v-if="calendarDate" class="sp-overlay" @click.self="calendarDate = ''"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-date-title"><div class="sp-modal-heading"><div><h2 id="sp-date-title">{{ calendarDate }} · 日期类型</h2><p>该设置用于日历与自动月参考工时；日期类型不会改变固定津贴。</p><SourceBadge :state="state" :path="`calendar.${calendarDate}`" /></div><button class="sp-icon-button" aria-label="关闭日期设置" @click="calendarDate = ''"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="option in [{kind:'workday',label:'正常工作日 / 调休补班',note:'计入月参考工时的工作日天数'},{kind:'restday',label:'休息日',note:'不计入月参考工时的工作日天数'},{kind:'statutory',label:'法定节假日',note:'仅标记日期类型，不自动增加津贴'}]" :key="option.kind" :class="{ selected: calendarKind === option.kind }" @click="calendarKind = option.kind as DayKind"><span><strong>{{ option.label }}</strong><small>{{ option.note }}</small></span><Icon v-if="calendarKind === option.kind" name="check" /></button></div><p class="sp-modal-note">{{ info(calendarDate).verified ? '当前日期已采用库内日历或人工确认。' : '该日期待核对，请核对工作日安排后设置。' }}{{ info(calendarDate).source }}</p><div class="sp-modal-actions"><button class="sp-button" :disabled="!Object.hasOwn(state.calendar, calendarDate)" @click="requestCalendarReset">恢复默认</button><button class="sp-button sp-primary" @click="saveCalendar()">确认日期类型</button></div></section></div>
 
     <div v-if="showGenerate" class="sp-overlay" @click.self="!generating && (showGenerate = false)">
       <section class="sp-modal sp-generate-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title" tabindex="-1">
@@ -636,6 +771,27 @@ watch([generating, cancelling], async () => {
 
     <div v-if="showBackup" class="sp-overlay" @click.self="showBackup = false"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-backup-title"><div class="sp-modal-heading"><div><h2 id="sp-backup-title">备份与恢复</h2><p>数据保存在{{ storageLocation }}，不会自动云同步。</p></div><button class="sp-icon-button" aria-label="关闭备份面板" @click="showBackup = false"><Icon name="close" /></button></div><div class="sp-shift-options"><button @click="exportBackup"><Icon name="download" /><span><strong>导出完整备份</strong><small>JSON 文件，可在另一台设备恢复</small></span><Icon name="arrow" :size="16" /></button><button @click="openImport"><Icon name="upload" /><span><strong>导入备份文件</strong><small>确认后替换当前工作空间，建议先导出备份</small></span><Icon name="arrow" :size="16" /></button></div></section></div>
 
+    <ConfirmDialog v-if="rulesImportCandidate" title="导入这个规则文件？" description="将用文件中的成员、班次、排班规则和所有月份排班替换当前工作空间。日期类型、月参考工时和津贴设置也按文件恢复。" confirm-label="确认导入" @confirm="confirmRulesImport" @cancel="cancelRulesImport">
+      <div class="sp-rules-import-preview">
+        <p class="sp-rules-import-file">{{ rulesImportCandidate.name }}</p>
+        <strong>{{ rulesImportCandidate.parsed.document.teamName }} · {{ rulesImportCandidate.parsed.document.month }}</strong>
+        <dl>
+          <div><dt>成员</dt><dd>{{ rulesImportCandidate.parsed.document.employees.length }} 人</dd></div>
+          <div><dt>班次</dt><dd>{{ rulesImportCandidate.parsed.document.shifts.length }} 种</dd></div>
+          <div><dt>所有月份排班</dt><dd>{{ rulesImportCandidate.parsed.document.assignments.length }} 条</dd></div>
+          <div><dt>其中锁定安排</dt><dd>{{ rulesImportCandidate.parsed.document.assignments.filter(item => item.locked).length }} 条</dd></div>
+        </dl>
+        <p>班间休息至少 {{ rulesImportCandidate.parsed.document.rules.minRestHours }} 小时，连续工作最多 {{ rulesImportCandidate.parsed.document.rules.maxConsecutiveDays }} 天。</p>
+        <p>班次不相连 {{ rulesImportCandidate.parsed.document.rules.nonConsecutiveShifts?.length ?? 0 }} 条 · 周班次限制 {{ rulesImportCandidate.parsed.document.rules.weeklyShiftLimits?.length ?? 0 }} 条 · 人员互斥 {{ rulesImportCandidate.parsed.document.rules.separationGroups?.length ?? 0 }} 组 · 上班权重{{ rulesImportCandidate.parsed.document.rules.weekdayWeights ? '开启' : '关闭' }}。</p>
+        <p v-if="rulesImportCandidate.parsed.timeLimitSeconds !== undefined">自动排班等待时长：{{ rulesImportCandidate.parsed.timeLimitSeconds }} 秒。</p>
+      </div>
+      <p v-if="rulesImportCandidate.parsed.source === 'attempt'">这是当次自动排班使用的设置和原有安排，导入后可重新生成排班。</p>
+      <p v-if="rulesImportCandidate.parsed.document.calendar === undefined || rulesImportCandidate.parsed.document.payroll === undefined">该文件缺少的日期类型或津贴设置将使用默认值。</p>
+      <p>规则导出不含头像，仍对应的成员会保留本机头像。有变化的配置将记录为手动修改及本次导入时间。</p>
+      <p class="sp-rules-import-note">导入后请查看排班检查结果，需要时重新生成排班。</p>
+      <p v-if="rulesImportError" class="sp-rules-import-error" role="alert">{{ rulesImportError }}</p>
+    </ConfirmDialog>
+
     <div v-if="importCandidate" class="sp-overlay"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-import-title"><h2 id="sp-import-title">确认恢复这个工作空间？</h2><p class="sp-modal-copy">{{ importCandidate.teamName }} · {{ importCandidate.month }}<br />{{ importCandidate.employees.length }} 位成员、{{ importCandidate.shifts.length }} 种班次。导入将替换当前数据。</p><div class="sp-modal-actions"><button class="sp-button" @click="importCandidate = null">取消</button><button class="sp-button sp-primary" @click="confirmImport">确认导入</button></div></section></div>
 
     <div v-if="showHelp" class="sp-overlay" @click.self="showHelp = false">
@@ -646,7 +802,7 @@ watch([generating, cancelling], async () => {
           <li><strong>定义班次和规则</strong><p>设置班次时间及每日人数：选“最少”可增派，选“固定”须恰好满足。再设置休息间隔与连续工作天数；也可逐条指定不连续的班次及每人每周次数上限。</p></li>
           <li><strong>选择月份，自动生成</strong><p>顶部月份在所有面板共用。点击日历格子调整或锁定安排，冲突会显示在表格下方。</p></li>
           <li><strong>设置班次津贴</strong><p>在「班次设置」填写每人每班的固定津贴。排一次领取一份，跨夜只计一次；排班表金色金额与右侧月汇总实时更新。</p></li>
-          <li><strong>导出 Excel 和备份</strong><p>Excel 用于查看分享，完整备份用于恢复全部设置。“导出规则”保存当前排班设置，失败提示里的“导出本次规则”保留失败当次的设置，便于排查问题。首次进入展示的是可编辑示例团队。</p></li>
+          <li><strong>导入规则、导出 Excel 和备份</strong><p>“导入规则”可恢复之前“导出规则”或“导出本次规则”保存的成员、班次、设置和排班记录。导入前会显示预览，确认后替换当前工作空间。Excel 用于查看分享，包含头像的完整迁移请使用备份与恢复。首次进入展示的是可编辑示例团队。</p></li>
         </ol>
         <figure class="sp-help-qrcode">
           <img :src="helpQrCodeUrl" alt="公众号二维码" width="258" height="258" />

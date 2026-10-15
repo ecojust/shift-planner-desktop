@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
-import type { Employee } from './domain.ts'
+import type { Employee, PlannerState } from './domain.ts'
 import ConfirmDialog from './ConfirmDialog.vue'
+import SourceBadge from './SourceBadge.vue'
 
-const props = defineProps<{ employee: Employee; initialMonth: string }>()
+const props = defineProps<{ employee: Employee; initialMonth: string; state?: PlannerState }>()
 const emit = defineEmits<{ save: [dates: string[]]; close: [] }>()
 const titleId = useId()
 const descriptionId = useId()
@@ -26,6 +27,10 @@ function civilDate(value: string) { return new Date(`${value}T00:00:00Z`) }
 const initialMonth = validMonth(props.initialMonth) ? props.initialMonth : new Date().toISOString().slice(0, 7)
 const month = ref(initialMonth)
 const selected = ref(new Set(props.employee.unavailableDates))
+const selectionPending = computed(() => {
+  const original = new Set(props.employee.unavailableDates)
+  return selected.value.size !== original.size || [...selected.value].some(date => !original.has(date))
+})
 const pendingRemoval = ref<{ kind: 'date'; date: string } | { kind: 'month'; month: string; count: number } | null>(null)
 const focusedDate = ref(`${initialMonth}-01`)
 const monthLabel = computed(() => `${Number(month.value.slice(0, 4))} 年 ${Number(month.value.slice(5))} 月`)
@@ -185,7 +190,7 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="sp-leave-summary">
-            <p aria-live="polite">本月 <strong>{{ monthCount }}</strong> 天<span>累计 {{ selected.size }} 天</span></p>
+            <div class="sp-leave-selection"><p aria-live="polite">本月 <strong>{{ monthCount }}</strong> 天<span>累计 {{ selected.size }} 天</span></p><SourceBadge v-if="state" :state="state" :path="`employees.${employee.id}.unavailableDates`" :pending="selectionPending" /></div>
             <button type="button" class="sp-leave-clear" :disabled="monthCount === 0" @click="clearMonth">清空本月</button>
           </div>
           <p class="sp-leave-hint">{{ otherMonthCount ? `其他月份的 ${otherMonthCount} 天请假会一并保留。` : '切换月份可继续选择，保存后统一生效。' }}已有排班会保留，请按冲突提示调整。</p>
@@ -225,6 +230,7 @@ onBeforeUnmount(() => {
 .sp-leave-day.is-selected { color: #fff; background: #245b4e; border-color: #245b4e; }
 .sp-leave-day-mark { height: 13px; font-size: 9px; line-height: 13px; }
 .sp-leave-summary { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 12px; }
+.sp-leave-selection { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
 .sp-leave-summary p { margin: 0; font-size: 13px; }
 .sp-leave-summary strong { color: #245b4e; font-weight: 650; }
 .sp-leave-summary p > span { display: inline-block; margin-left: 10px; color: #6d7f73; font-size: 12px; }

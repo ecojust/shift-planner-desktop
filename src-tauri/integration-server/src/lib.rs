@@ -44,10 +44,19 @@ pub struct ServerInfo {
     pub service_id: String,
 }
 
+/// Set by the transport route, never taken from client arguments or headers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeSource {
+    Mcp,
+    Http,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BridgeRequest {
     pub request_id: String,
+    pub source: BridgeSource,
     pub method: String,
     pub args: Value,
     pub expires_at: u64,
@@ -100,6 +109,7 @@ impl Shared {
 
     async fn call(
         self: &Arc<Self>,
+        source: BridgeSource,
         method: &str,
         args: Value,
         expires_at: u64,
@@ -123,6 +133,7 @@ impl Shared {
         };
         (self.emit)(BridgeRequest {
             request_id,
+            source,
             method: method.into(),
             args,
             expires_at,
@@ -376,10 +387,10 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
         return error_response(failure(400, "Unsupported MCP protocol version"));
     }
     if path == "/api/state" && method == Method::GET {
-        return dispatch(&shared, "get_state", json!({}), expires_at).await;
+        return dispatch_http(&shared, "get_state", json!({}), expires_at).await;
     }
     if path == "/api/validate" && method == Method::GET {
-        return dispatch(&shared, "validate_schedule", json!({}), expires_at).await;
+        return dispatch_http(&shared, "validate_schedule", json!({}), expires_at).await;
     }
     if path == "/mcp" && method != Method::POST {
         let mut response = error_response(failure(405, "Stateless MCP: use POST"));
@@ -409,7 +420,7 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
     if !body.is_object() {
         return error_response(failure(400, "请求必须为对象"));
     }
-    dispatch(
+    dispatch_http(
         &shared,
         if path == "/api/state" {
             "replace_state"
@@ -422,8 +433,16 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
     .await
 }
 
-async fn dispatch(shared: &Arc<Shared>, method: &str, args: Value, expires_at: u64) -> Response {
-    match shared.call(method, args, expires_at).await {
+async fn dispatch_http(
+    shared: &Arc<Shared>,
+    method: &str,
+    args: Value,
+    expires_at: u64,
+) -> Response {
+    match shared
+        .call(BridgeSource::Http, method, args, expires_at)
+        .await
+    {
         Ok(result) => Json(result).into_response(),
         Err(error) => error_response(error),
     }
@@ -470,7 +489,7 @@ async fn mcp(shared: Arc<Shared>, body: Value, expires_at: u64) -> Response {
             } else {
                 "2025-03-26"
             };
-            json!({"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "shift-schedule-expert", "version": env!("CARGO_PKG_VERSION")}, "instructions": "Read get_state before writing. All writes require its current revision. Changes are saved directly in the open application."})
+            json!({"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "shift-schedule-expert", "version": env!("CARGO_PKG_VERSION")}, "instructions": "Read get_state before writing. All writes require its current revision. Changes are saved directly in the open application. MCP and HTTP share the write permissions in desktop Setting; by default only members may be changed. Disallowed writes return MCP tool errors or HTTP 403. Read-only fields must remain unchanged."})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools": tool_definitions()}),
@@ -491,7 +510,7 @@ async fn mcp(shared: Arc<Shared>, body: Value, expires_at: u64) -> Response {
             if !args.is_object() {
                 return rpc_error(id, -32602, "Tool arguments must be an object");
             }
-            match shared.call(name, args, expires_at).await {
+            match shared.call(BridgeSource::Mcp, name, args, expires_at).await {
                 Ok(result) => json!({"content": [{"type": "text", "text": result.to_string()}]}),
                 Err(error) => {
                     json!({"isError": true, "content": [{"type": "text", "text": error.message}]})
@@ -508,7 +527,7 @@ fn tool_definitions() -> Value {
     json!([
         {"name": "get_state", "description": "Read all members, shifts, rules, assignments and the current revision.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
         {"name": "validate_schedule", "description": "Check current schedule for rule violations without changing it.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
-        {"name": "replace_state", "description": "Replace the complete planner document. Read first and preserve unchanged fields. All data is validated before saving.", "inputSchema": {"type": "object", "properties": {"revision": revision, "state": {"type": "object", "additionalProperties": true}}, "required": ["revision", "state"], "additionalProperties": false}},
-        {"name": "set_assignment", "description": "Set one employee/date assignment. shiftId:off means rest; remove:true deletes. Locked assignments require unlock:true.", "inputSchema": {"type": "object", "properties": {"revision": revision, "employeeId": {"type": "string"}, "date": {"type": "string"}, "shiftId": {"type": "string"}, "locked": {"type": "boolean"}, "remove": {"type": "boolean"}, "unlock": {"type": "boolean"}}, "required": ["revision", "employeeId", "date"], "additionalProperties": false}}
+        {"name": "replace_state", "description": "Replace the complete planner document. Read first and preserve unchanged fields. All data is validated before saving. Only types allowed for MCP in desktop Setting may change; by default only members are allowed. Changes to a forbidden type return a tool error.", "inputSchema": {"type": "object", "properties": {"revision": revision, "state": {"type": "object", "additionalProperties": true}}, "required": ["revision", "state"], "additionalProperties": false}},
+        {"name": "set_assignment", "description": "Set one employee/date assignment. shiftId:off means rest; remove:true deletes. Locked assignments require unlock:true. Requires permission to modify assignments for MCP in desktop Setting; by default only members are allowed, so this tool returns a tool error until assignment changes are enabled.", "inputSchema": {"type": "object", "properties": {"revision": revision, "employeeId": {"type": "string"}, "date": {"type": "string"}, "shiftId": {"type": "string"}, "locked": {"type": "boolean"}, "remove": {"type": "boolean"}, "unlock": {"type": "boolean"}}, "required": ["revision", "employeeId", "date"], "additionalProperties": false}}
     ])
 }

@@ -1,3 +1,5 @@
+import type { DataProvenance } from './dataProvenance.ts'
+
 export interface Employee {
   id: string
   name: string
@@ -75,6 +77,8 @@ export interface PlannerState {
   shifts: Shift[]
   rules: Rules
   assignments: Assignment[]
+  /** Latest recorded source per configuration field; absent for untracked legacy data. */
+  provenance?: DataProvenance
 }
 
 export interface Issue {

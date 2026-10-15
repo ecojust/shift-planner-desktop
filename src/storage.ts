@@ -5,6 +5,7 @@ import type { Shift } from './domain.ts'
 import { isAvatarData } from './avatarData.ts'
 import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
 import { findWeightedWeek, weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
+import { parseDataProvenance } from './dataProvenance.ts'
 
 export const STORAGE_KEY = 'shift-planner:v1'
 export const MAX_BACKUP_BYTES = 8 * 1024 * 1024
@@ -224,6 +225,7 @@ export function parseBackup(text: string): PlannerDocument {
     }
     state.calendar = calendar
   }
+  if (root.provenance !== undefined) state.provenance = parseDataProvenance(root.provenance, state)
   return state
 }
 

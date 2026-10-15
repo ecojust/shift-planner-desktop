@@ -1,6 +1,8 @@
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
-use shift_integration_server::{BridgeError, BridgeRequest, BridgeResponse, Server, ServerOptions};
+use shift_integration_server::{
+    BridgeError, BridgeRequest, BridgeResponse, BridgeSource, Server, ServerOptions,
+};
 use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -89,6 +91,8 @@ async fn http_forwards_current_data_reads_writes_and_validation() {
     ] {
         let pending = send(fixture.request(verb, path).json(&args));
         let event = fixture.event().await;
+        assert_eq!(event.source, BridgeSource::Http);
+        assert_eq!(serde_json::to_value(&event).unwrap()["source"], "http");
         assert_eq!(event.method, method);
         assert_eq!(event.args, args);
         assert_eq!(event.service_id, fixture.server.info().service_id);
@@ -105,6 +109,123 @@ async fn http_forwards_current_data_reads_writes_and_validation() {
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["cache-control"], "no-store");
         assert_eq!(response.json::<Value>().await.unwrap(), result);
+    }
+    fixture.server.stop().await;
+}
+
+#[tokio::test]
+async fn http_source_cannot_be_forged_through_body_query_or_headers() {
+    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    for (verb, path, method) in [
+        (reqwest::Method::PUT, "/api/state", "replace_state"),
+        (reqwest::Method::POST, "/api/assignments", "set_assignment"),
+    ] {
+        let args = json!({
+            "revision": "r1", "source": "mcp", "args": {"source": "mcp"},
+            "state": {"employees": []}, "employeeId": "alice",
+            "date": "2026-10-15", "shiftId": "off"
+        });
+        let pending = send(
+            fixture
+                .request(verb, &format!("{path}?source=mcp"))
+                .header("source", "mcp")
+                .header("x-integration-source", "mcp")
+                .json(&args),
+        );
+        let event = fixture.event().await;
+        assert_eq!(event.source, BridgeSource::Http);
+        assert_eq!(event.method, method);
+        assert_eq!(event.args, args);
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(serialized["source"], "http");
+        assert_eq!(serialized["args"]["source"], "mcp");
+        fixture.respond(&event.request_id, json!({"revision": "r2"}));
+        assert_eq!(pending.await.unwrap().unwrap().status(), 200);
+    }
+    fixture.server.stop().await;
+}
+
+#[tokio::test]
+async fn mcp_source_cannot_be_forged_through_arguments_envelope_query_or_headers() {
+    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    for method in [
+        "get_state",
+        "validate_schedule",
+        "replace_state",
+        "set_assignment",
+    ] {
+        let args = json!({"revision": "r1", "source": "http", "args": {"source": "http"}});
+        let pending = send(
+            fixture
+                .request(reqwest::Method::POST, "/mcp?source=http")
+                .header("source", "http")
+                .header("x-integration-source", "http")
+                .json(&json!({
+                    "jsonrpc": "2.0", "id": method, "method": "tools/call", "source": "http",
+                    "params": {"name": method, "source": "http", "arguments": args}
+                })),
+        );
+        let event = fixture.event().await;
+        assert_eq!(event.source, BridgeSource::Mcp);
+        assert_eq!(event.method, method);
+        assert_eq!(event.args, args);
+        let serialized = serde_json::to_value(&event).unwrap();
+        assert_eq!(serialized["source"], "mcp");
+        assert_eq!(serialized["args"]["source"], "http");
+        fixture.respond(&event.request_id, json!({"revision": "r2"}));
+        let response = pending.await.unwrap().unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.json::<Value>().await.unwrap()["id"], method);
+    }
+    fixture.server.stop().await;
+}
+
+#[tokio::test]
+async fn permission_denials_return_http_403_and_mcp_tool_errors() {
+    let mut fixture = Fixture::new(Duration::from_secs(5)).await;
+    let message = "Setting 未允许修改排班";
+    for source in [BridgeSource::Http, BridgeSource::Mcp] {
+        let args = json!({"revision": "r1", "employeeId": "alice", "date": "2026-10-15", "shiftId": "off"});
+        let request = match source {
+            BridgeSource::Http => fixture
+                .request(reqwest::Method::POST, "/api/assignments")
+                .json(&args),
+            BridgeSource::Mcp => fixture.request(reqwest::Method::POST, "/mcp").json(&json!({
+                "jsonrpc": "2.0", "id": "denied", "method": "tools/call",
+                "params": {"name": "set_assignment", "arguments": args}
+            })),
+        };
+        let pending = send(request);
+        let event = fixture.event().await;
+        assert_eq!(event.source, source);
+        fixture
+            .server
+            .respond(
+                &event.request_id,
+                BridgeResponse {
+                    result: None,
+                    error: Some(BridgeError {
+                        status: 403,
+                        message: message.into(),
+                    }),
+                },
+            )
+            .unwrap();
+        let response = pending.await.unwrap().unwrap();
+        match source {
+            BridgeSource::Http => {
+                assert_eq!(response.status(), 403);
+                assert_eq!(response.json::<Value>().await.unwrap()["error"], message);
+            }
+            BridgeSource::Mcp => {
+                assert_eq!(response.status(), 200);
+                let body = response.json::<Value>().await.unwrap();
+                assert_eq!(body["id"], "denied");
+                assert_eq!(body["result"]["isError"], true);
+                assert_eq!(body["result"]["content"][0]["text"], message);
+                assert!(body.get("error").is_none());
+            }
+        }
     }
     fixture.server.stop().await;
 }
@@ -274,6 +395,8 @@ async fn mcp_tools_return_data_and_business_errors_without_losing_rpc_id() {
     let mut fixture = Fixture::new(Duration::from_secs(5)).await;
     let pending = send(fixture.request(reqwest::Method::POST, "/mcp").json(&json!({"jsonrpc": "2.0", "id": "read", "method": "tools/call", "params": {"name": "get_state"}})));
     let event = fixture.event().await;
+    assert_eq!(event.source, BridgeSource::Mcp);
+    assert_eq!(serde_json::to_value(&event).unwrap()["source"], "mcp");
     assert_eq!(event.method, "get_state");
     fixture.respond(
         &event.request_id,
