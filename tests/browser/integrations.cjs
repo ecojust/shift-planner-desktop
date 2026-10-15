@@ -6,6 +6,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
+const { assertCurrentMonthStatus } = require('./helpers/month-picker.cjs')
 const url = process.env.INTEGRATIONS_TEST_URL || 'http://127.0.0.1:5190/'
 const out = path.resolve(__dirname, '../../test-results/integrations')
 const fixture = {
@@ -112,10 +113,7 @@ async function snapshot(page, source = 'mcp') {
 async function copied(page) { return page.evaluate(() => window.__clipboardWrites.at(-1)) }
 async function stored(page) { return page.evaluate(() => JSON.parse(localStorage.getItem('shift-planner:v1'))) }
 async function monthStatus(page, expected) {
-  const status = page.getByRole('status', { name: '本月排班状态', exact: true })
-  await status.waitFor()
-  assert.equal(await status.getAttribute('data-schedule-status'), expected)
-  assert.equal(await status.innerText(), { scheduled: '已排班', invalid: '规则已修改，排班已失效', empty: '未排班' }[expected])
+  await assertCurrentMonthStatus(page, expected)
 }
 async function closeSettings(page) {
   const dialog = page.getByRole('dialog', { name: '设置', exact: true })
@@ -646,6 +644,15 @@ async function main() {
     await section(page, '排班日历')
     record('legacy member cards with no saved history hide provenance badges entirely')
     const initial = await snapshot(page)
+    const beforeCollapse = await stored(page)
+    await page.getByRole('button', { name: '折叠侧边栏', exact: true }).click()
+    assert.equal(await page.evaluate(() => localStorage.getItem('shift-planner:sidebar-collapsed:v1')), 'true')
+    assert.deepEqual(await snapshot(page), initial, 'A layout preference must not invalidate an external data revision')
+    assert.deepEqual(await stored(page), beforeCollapse)
+    await page.getByRole('button', { name: '展开侧边栏', exact: true }).click()
+    assert.deepEqual(await snapshot(page), initial)
+    assert.deepEqual(await stored(page), beforeCollapse)
+    record('desktop sidebar preferences use independent storage and preserve the exact MCP document revision')
     await monthStatus(page, 'scheduled')
     await scheduleTime(page)
     assert.equal(initial.state.employees[0].name, fixture.employees[0].name)

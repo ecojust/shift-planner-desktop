@@ -7,6 +7,7 @@ const fs = require('node:fs/promises')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
+const { assertCurrentMonthStatus, assertMonthChoiceStatus, openMonthPicker } = require('./helpers/month-picker.cjs')
 const root = path.resolve(__dirname, '../..')
 const out = path.join(root, 'test-results/external-generation')
 const url = process.env.EXTERNAL_GENERATION_TEST_URL || 'http://127.0.0.1:5194/'
@@ -233,6 +234,7 @@ async function main() {
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } : {}) })
   try {
     await prepare()
+    await assertCurrentMonthStatus(page, 'invalid')
     const initial = await snapshot()
     const denied = await request('generate_schedule', { revision: initial.revision })
     assert.equal(denied.response.error?.status, 403)
@@ -268,6 +270,12 @@ async function main() {
       if (source === 'mcp') assert.deepEqual(outcome.state.provenance.invalidatedSchedules['2026-11'], stamp)
       assert.equal((await page.evaluate(() => window.__generationBridge.claims)).at(-1).requestId, id)
       await released()
+      await assertCurrentMonthStatus(page, 'scheduled')
+      const picker = await openMonthPicker(page, month)
+      await assertMonthChoiceStatus(picker, '2026-10', 'scheduled')
+      await assertMonthChoiceStatus(picker, '2026-11', source === 'mcp' ? 'invalid' : 'scheduled')
+      await assertMonthChoiceStatus(picker, '2026-12', 'empty')
+      await page.keyboard.press('Escape')
       await shot(`real-${source}-generation-saved`)
       record(`${source} runs real CP-SAT, validates complete coverage and locks/history, saves source/time and preserves the viewed month`, { targetMonth: month, status: outcome.status })
     }

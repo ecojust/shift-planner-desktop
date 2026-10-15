@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
+const { assertCurrentMonthStatus, assertMonthChoiceStatus, openMonthPicker } = require('./helpers/month-picker.cjs')
 const url = process.env.GENERATION_FRESHNESS_TEST_URL || 'http://127.0.0.1:5190/'
 const out = path.resolve(__dirname, '../../test-results/generation-freshness')
 const fixture = {
@@ -102,10 +103,7 @@ async function freshness(page, stale, message) {
   else { assert.doesNotMatch(text, /配置已更改|设置已更改/); if (message) assert.match(text, message) }
 }
 async function monthStatus(page, expected) {
-  const badge = page.getByRole('status', { name: '本月排班状态', exact: true })
-  await badge.waitFor()
-  assert.equal(await badge.getAttribute('data-schedule-status'), expected)
-  assert.equal(await badge.innerText(), { scheduled: '已排班', invalid: '规则已修改，排班已失效', empty: '未排班' }[expected])
+  await assertCurrentMonthStatus(page, expected)
 }
 async function moveMonth(page, direction, month, expected) {
   await page.getByRole('button', { name: direction > 0 ? '下个月' : '上个月', exact: true }).click()
@@ -295,10 +293,15 @@ async function main() {
     await screenshot(editing.page, 'persistent-invalid-schedule-desktop')
     await editing.page.setViewportSize({ width: 320, height: 640 })
     await monthStatus(editing.page, 'invalid')
-    const statusBounds = await editing.page.locator('.sp-month-schedule-status').boundingBox()
+    const monthDialog = await openMonthPicker(editing.page, '2026-10')
+    await assertMonthChoiceStatus(monthDialog, '2026-09', 'invalid')
+    await assertMonthChoiceStatus(monthDialog, '2026-10', 'invalid')
+    await assertMonthChoiceStatus(monthDialog, '2026-11', 'empty')
+    const statusBounds = await monthDialog.boundingBox()
     assert.ok(statusBounds && statusBounds.x >= 0 && statusBounds.x + statusBounds.width <= 321)
     assert.equal(await editing.page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
     await screenshot(editing.page, 'persistent-invalid-schedule-320')
+    await editing.page.keyboard.press('Escape')
     record('single-cell replacement and undo cannot erase later calendar configuration invalidity; deleting and undoing restores the prior month status')
     await editing.page.close()
 

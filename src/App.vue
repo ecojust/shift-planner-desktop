@@ -41,6 +41,13 @@ const state = ref<Document>({ ...makeInitial(), ...((initial || {}) as Partial<D
 function makeInitial(): Document { return { ...(initial || makeDefaultState()), ...createPayrollConfig() } }
 const section = ref<Section>('calendar')
 const mobileNav = ref(false)
+const sidebarPreferenceKey = 'shift-planner:sidebar-collapsed:v1'
+const sidebarCollapsed = ref(false)
+try { sidebarCollapsed.value = localStorage.getItem(sidebarPreferenceKey) === 'true' } catch { /* UI preferences are optional when storage is unavailable. */ }
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  try { localStorage.setItem(sidebarPreferenceKey, String(sidebarCollapsed.value)) } catch { /* Keep the current view usable without persistence. */ }
+}
 const view = ref<'week' | 'month'>('week')
 const today = (() => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}` })()
 function weekOf(date: string) { const offset = (new Date(`${date.slice(0, 7)}-01T12:00:00`).getDay() + 6) % 7; return Math.floor((Number(date.slice(8)) - 1 + offset) / 7) }
@@ -211,12 +218,19 @@ const employees = computed(() => state.value.employees.filter(e => (!groupFilter
 const assignments = computed(() => new Map(state.value.assignments.map(a => [`${a.employeeId}:${a.date}`, a])))
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
 const monthEntryCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(`${state.value.month}-`)).length)
-const monthScheduleInvalidation = computed(() => state.value.provenance?.invalidatedSchedules?.[state.value.month])
-const monthScheduleStatus = computed(() => !monthEntryCount.value ? 'empty' : monthScheduleInvalidation.value ? 'invalid' : 'scheduled')
-const monthScheduleLabel = computed(() => ({ empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效' })[monthScheduleStatus.value])
-const monthScheduleDescription = computed(() => monthScheduleStatus.value === 'invalid'
-  ? `成员、班次或规则已于 ${formatChangeTime(monthScheduleInvalidation.value!.at)} 修改。已有排班记录仍保留，请按当前配置重新生成。`
-  : monthScheduleStatus.value === 'scheduled' ? '本月已有排班记录。' : '本月尚无排班记录。')
+const monthScheduleStatuses = computed(() => {
+  const statuses: Record<string, { status: 'scheduled' | 'invalid'; description?: string }> = Object.create(null)
+  for (const assignment of state.value.assignments) {
+    const month = assignment.date.slice(0, 7)
+    if (Object.hasOwn(statuses, month)) continue
+    const invalidation = state.value.provenance?.invalidatedSchedules?.[month]
+    statuses[month] = invalidation ? {
+      status: 'invalid',
+      description: `成员、班次或规则已于 ${formatChangeTime(invalidation.at)} 修改。已有排班记录仍保留，请按当前配置重新生成。`,
+    } : { status: 'scheduled' }
+  }
+  return statuses
+})
 const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
 const externalChange = computed(() => state.value.provenance?.pendingExternalChange)
 const scheduleUpdate = computed(() => state.value.provenance?.scheduleUpdates?.[state.value.month])
@@ -762,19 +776,19 @@ watch([generating, cancelling], async () => {
 
 <template>
   <IntegrationSettings v-if="showIntegrationSettings" :integration="integration" @close="showIntegrationSettings = false" />
-  <div class="sp-app">
+  <div class="sp-app" :class="{ 'is-sidebar-collapsed': sidebarCollapsed }">
     <button v-if="mobileNav" class="sp-nav-scrim" aria-label="关闭导航" @click="mobileNav = false"></button>
-    <aside class="sp-sidebar" :class="{ 'is-open': mobileNav }">
-      <a class="sp-brand" href="#" aria-label="Shift Schedule Expert" @click.prevent="chooseSection('calendar')"><img :src="brandMarkUrl" alt="" width="40" height="40" /><span class="sp-brand-name"><strong>Shift Schedule</strong><b>Expert</b></span></a>
-      <nav aria-label="应用导航"><button v-for="item in navigation" :key="item.key" :class="{ active: section === item.key }" :aria-current="section === item.key ? 'page' : undefined" @click="chooseSection(item.key)"><Icon :name="item.icon" /><span>{{ item.label }}</span><span v-if="item.key === 'team'" class="sp-nav-count">{{ state.employees.length }}</span></button></nav>
-      <div class="sp-sidebar-bottom"><button class="sp-help" @click="showBackup = true; mobileNav = false"><Icon name="file" :size="18" />备份与恢复</button><button class="sp-help" @click="showHelp = true; mobileNav = false"><Icon name="info" :size="18" />使用帮助</button></div>
+    <aside id="sp-app-sidebar" class="sp-sidebar" :class="{ 'is-open': mobileNav }">
+      <a class="sp-brand" href="#" aria-label="Shift Schedule Expert" title="Shift Schedule Expert" @click.prevent="chooseSection('calendar')"><img :src="brandMarkUrl" alt="" width="40" height="40" /><span class="sp-brand-name"><strong>Shift Schedule</strong><b>Expert</b></span></a>
+      <nav aria-label="应用导航"><button v-for="item in navigation" :key="item.key" :class="{ active: section === item.key }" :aria-label="item.label" :title="item.key === 'team' ? `${item.label}（${state.employees.length} 人）` : item.label" :aria-current="section === item.key ? 'page' : undefined" @click="chooseSection(item.key)"><Icon :name="item.icon" /><span class="sp-nav-label">{{ item.label }}</span><span v-if="item.key === 'team'" class="sp-nav-count">{{ state.employees.length }}</span></button></nav>
+      <div class="sp-sidebar-bottom"><button class="sp-help" aria-label="备份与恢复" title="备份与恢复" @click="showBackup = true; mobileNav = false"><Icon name="file" :size="18" /><span class="sp-nav-label">备份与恢复</span></button><button class="sp-help" aria-label="使用帮助" title="使用帮助" @click="showHelp = true; mobileNav = false"><Icon name="info" :size="18" /><span class="sp-nav-label">使用帮助</span></button></div>
     </aside>
     <div class="sp-main">
       <header class="sp-topbar">
-        <div class="sp-breadcrumb"><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" @click="mobileNav = true"><Icon name="menu" /></button><strong>{{ sectionLabel }}</strong></div>
+        <div class="sp-breadcrumb"><button type="button" class="sp-sidebar-toggle sp-icon-button" :aria-label="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" :title="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" :aria-expanded="!sidebarCollapsed" aria-controls="sp-app-sidebar" @click="toggleSidebar"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path :d="sidebarCollapsed ? 'm13 9 3 3-3 3' : 'm16 9-3 3 3 3'"/></svg></button><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" :aria-expanded="mobileNav" aria-controls="sp-app-sidebar" @click="mobileNav = true"><Icon name="menu" /></button><strong>{{ sectionLabel }}</strong></div>
         <div class="sp-global-month" role="group" aria-label="所有面板共用排班月份">
           <button class="sp-icon-button" aria-label="上个月" :disabled="state.month === '0001-01'" @click="navigateMonth(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button>
-          <MonthPicker :model-value="state.month" @update:model-value="changeMonth" />
+          <MonthPicker :model-value="state.month" :schedule-statuses="monthScheduleStatuses" @update:model-value="changeMonth" />
           <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
           <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
         </div>
@@ -783,7 +797,7 @@ watch([generating, cancelling], async () => {
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
-        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span class="sp-month-schedule-status" :class="`is-${monthScheduleStatus}`" :data-schedule-status="monthScheduleStatus" role="status" aria-label="本月排班状态" :title="monthScheduleDescription"><Icon :name="monthScheduleStatus === 'invalid' ? 'info' : monthScheduleStatus === 'scheduled' ? 'check' : 'calendar'" :size="14" />{{ monthScheduleLabel }}</span><span class="sp-schedule-action">{{ scheduleSource }}</span><span v-if="scheduleUpdate" class="sp-schedule-update" :data-schedule-source="scheduleUpdate.source" aria-label="本月最近外部排班生成或更新时间"><span>最近 {{ scheduleUpdate.source.toUpperCase() }} 排班生成 / 更新：</span><time :datetime="scheduleUpdate.at" title="软件成功保存该月份外部排班数据的时间（本机时间）">{{ formatChangeTime(scheduleUpdate.at) }}</time><small>本机时间</small></span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" :disabled="generating || readingRules || !!rulesImportCandidate" title="导入之前导出的规则文件" @click="openRulesImport"><Icon name="upload" :size="17" />{{ readingRules ? '正在读取…' : '导入规则' }}</button><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
+        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span class="sp-schedule-action">{{ scheduleSource }}</span><span v-if="scheduleUpdate" class="sp-schedule-update" :data-schedule-source="scheduleUpdate.source" aria-label="本月最近外部排班生成或更新时间"><span>最近 {{ scheduleUpdate.source.toUpperCase() }} 排班生成 / 更新：</span><time :datetime="scheduleUpdate.at" title="软件成功保存该月份外部排班数据的时间（本机时间）">{{ formatChangeTime(scheduleUpdate.at) }}</time><small>本机时间</small></span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" :disabled="generating || readingRules || !!rulesImportCandidate" title="导入之前导出的规则文件" @click="openRulesImport"><Icon name="upload" :size="17" />{{ readingRules ? '正在读取…' : '导入规则' }}</button><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
         <div v-if="rulesImportError && !rulesImportCandidate" class="sp-rules-import-error" role="alert"><span>{{ rulesImportError }}</span><button type="button" aria-label="关闭规则导入提示" @click="rulesImportError = ''">×</button></div>
         <section v-if="externalChange" class="sp-external-change" role="status" aria-label="外部配置变更提醒">
           <Icon name="info" :size="20" />

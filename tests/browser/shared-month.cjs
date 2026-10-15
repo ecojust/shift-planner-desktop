@@ -3,7 +3,7 @@
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const assert = require('node:assert/strict')
-const { selectGlobalMonth, readGlobalMonth } = require('./helpers/month-picker.cjs')
+const { selectGlobalMonth, readGlobalMonth, openMonthPicker, assertCurrentMonthStatus, assertMonthChoiceStatus } = require('./helpers/month-picker.cjs')
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
 const url = process.env.STAFFING_TEST_URL || 'http://127.0.0.1:5197'
 const output = path.resolve(process.env.SHARED_MONTH_TEST_OUTPUT || 'test-results/shared-month-ui')
@@ -24,7 +24,9 @@ function fixture() {
       { employeeId: 'month-1', date: '2026-10-01', shiftId: 'day', locked: true },
       { employeeId: 'month-2', date: '2026-11-01', shiftId: 'night', locked: true },
       { employeeId: 'month-1', date: '2026-12-01', shiftId: 'day', locked: true },
+      { employeeId: 'month-2', date: '2027-01-02', shiftId: 'off', locked: false },
     ],
+    provenance: { fields: {}, invalidatedSchedules: { '2026-11': { source: 'http', at: '2026-10-15T08:00:00.000Z' } } },
   }
 }
 
@@ -44,7 +46,7 @@ async function main() {
   const picker = () => page.getByRole('dialog', { name: '选择排班月份', exact: true })
   async function setMonth(value) { await selectGlobalMonth(page, value); await persisted(document => document.month === value) }
   async function importState(document, name = 'shared-month.json') {
-    await page.locator('input[type=file]').setInputFiles({ name, mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.locator('input[type=file]:not([aria-label="导入规则文件"])').setInputFiles({ name, mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     await persisted(value => value.month === document.month && value.teamName === document.teamName)
   }
@@ -68,9 +70,26 @@ async function main() {
     await page.goto(url, { waitUntil: 'networkidle' })
     const original = fixture()
     await importState(original)
+    await assertCurrentMonthStatus(page, 'scheduled')
+    await openMonthPicker(page, '2026-10')
+    assert.equal(await picker().locator('[data-month]').count(), 12)
+    for (const [value, expected] of [['2026-09', 'empty'], ['2026-10', 'scheduled'], ['2026-11', 'invalid'], ['2026-12', 'scheduled']]) await assertMonthChoiceStatus(picker(), value, expected)
+    assert.match(await picker().getByRole('button', { name: '2026 年 11 月', exact: true }).getAttribute('title'), /2026-10-15 16:00:00/)
+    await page.screenshot({ path: path.join(output, '00-month-grid-mixed-status.png') })
+    await picker().getByRole('button', { name: '下一年', exact: true }).click()
+    await assertMonthChoiceStatus(picker(), '2027-01', 'scheduled')
+    await assertMonthChoiceStatus(picker(), '2027-02', 'empty')
+    assert.equal((await state()).month, '2026-10', 'Browsing another year does not change the active month')
+    await picker().getByRole('button', { name: '2027 年 1 月', exact: true }).click()
+    await assertCurrentMonthStatus(page, 'scheduled')
+    await setMonth('2027-02')
+    await assertCurrentMonthStatus(page, 'empty')
+    await setMonth('2026-10')
+    record('month-grid-explains-each-month-across-years-including-empty-legacy-working-and-off-only-schedules')
     for (const section of ['排班日历', '成员管理', '班次设置', '排班规则']) {
       await navigate(section)
       await uniqueMonth('2026-10')
+      await assertCurrentMonthStatus(page, 'scheduled')
     }
     record('all-four-pages-share-one-visible-month-control')
 
@@ -158,6 +177,11 @@ async function main() {
     await setMonth('2026-10')
     assert.equal(await reference().inputValue(), '144')
     await saveReference(168)
+    await assertCurrentMonthStatus(page, 'invalid')
+    await openMonthPicker(page, '2026-10')
+    for (const value of ['2026-10', '2026-11', '2026-12']) await assertMonthChoiceStatus(picker(), value, 'invalid')
+    await assertMonthChoiceStatus(picker(), '2026-09', 'empty')
+    await page.keyboard.press('Escape')
     assert.equal(await personalMonth().inputValue(), '168')
     record('calendar-month-updates-member-reference-and-following-month-hours')
 
@@ -240,6 +264,7 @@ async function main() {
 
     await page.reload({ waitUntil: 'networkidle' })
     await uniqueMonth('2026-11')
+    await assertCurrentMonthStatus(page, 'invalid')
     await navigate('成员管理')
     assert.equal(await reference().inputValue(), '160')
     assert.deepEqual((await state()).monthlyReferenceHours, { '2026-10': 168, '2026-11': 160, '2026-12': 160 })
@@ -281,7 +306,7 @@ async function main() {
     await navigate('成员管理')
     record('year-boundaries-stay-within-0001-and-9999-and-current-month-shortcut-still-works')
 
-    for (const width of [1440, 1024, 768, 390, 320]) {
+    for (const width of [1440, 1024, 800, 768, 390, 320]) {
       await page.setViewportSize({ width, height: width > 390 ? 650 : 844 })
       if (await page.getByRole('button', { name: '打开导航', exact: true }).isVisible()) await page.waitForFunction(() => document.querySelector('.sp-sidebar').getBoundingClientRect().right <= 0)
       await month().scrollIntoViewIfNeeded()
@@ -318,6 +343,7 @@ async function main() {
       const panel = await picker().boundingBox()
       assert.ok(panel && panel.x >= 0 && panel.x + panel.width <= width && panel.y >= 0 && panel.y + panel.height <= (width > 390 ? 650 : 844), `${width}: picker must fit viewport: ${JSON.stringify(panel)}`)
       assert.equal(await picker().getByRole('button', { name: '2026 年 11 月', exact: true }).isVisible(), true)
+      await assertMonthChoiceStatus(picker(), '2026-11', 'invalid')
       await page.screenshot({ path: path.join(output, `03-month-picker-${width}.png`) })
       await page.keyboard.press('Escape')
       await focused(month())
@@ -330,6 +356,89 @@ async function main() {
     await uniqueMonth('2026-10')
     assert.equal(Number((await allowanceTotal().innerText()).replace(/[¥￥,\s]/g, '')), 20)
     record('mobile-shared-month-change-updates-members-and-allowances')
+
+    const beforeLayout = await state()
+    const layoutKey = 'shift-planner:sidebar-collapsed:v1'
+    const sidebar = page.locator('#sp-app-sidebar')
+    const table = page.locator('.sp-table-scroll')
+    async function layout(collapsed) {
+      await page.waitForFunction(collapsed => {
+        const width = document.querySelector('#sp-app-sidebar').getBoundingClientRect().width
+        return collapsed ? Math.abs(width - 64) < 1 : width > 190
+      }, collapsed)
+      const aside = await sidebar.boundingBox(), roster = await table.boundingBox()
+      return { sidebar: aside.width, table: roster.width }
+    }
+    for (const width of [1440, 1920, 800]) {
+      await page.setViewportSize({ width, height: 900 })
+      const expanded = await layout(false)
+      const collapse = page.getByRole('button', { name: '折叠侧边栏', exact: true })
+      await collapse.focus()
+      await page.keyboard.press('Space')
+      const collapsed = await layout(true)
+      assert.ok(collapsed.table - expanded.table > 100, `${width}px: collapsing must materially increase usable calendar width: ${JSON.stringify({ expanded, collapsed })}`)
+      const expand = page.getByRole('button', { name: '展开侧边栏', exact: true })
+      assert.equal(await expand.getAttribute('aria-expanded'), 'false')
+      assert.equal(await expand.getAttribute('aria-controls'), 'sp-app-sidebar')
+      assert.equal(await page.evaluate(key => localStorage.getItem(key), layoutKey), 'true')
+      for (const label of ['排班日历', '成员管理', '班次设置', '排班规则']) assert.equal(await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: label, exact: true }).isVisible(), true)
+      assert.deepEqual(await state(), beforeLayout, 'Changing layout must not change the scheduling document')
+      await page.screenshot({ path: path.join(output, `04-sidebar-collapsed-${width}.png`) })
+      await expand.press('Enter')
+      const restored = await layout(false)
+      assert.ok(Math.abs(restored.table - expanded.table) < 2)
+      assert.equal(await page.evaluate(key => localStorage.getItem(key), layoutKey), 'false')
+      record(`desktop-${width}-sidebar-keyboard-collapse-increases-real-roster-width-and-restores-it`, { expanded, collapsed, restored })
+    }
+    await page.getByRole('button', { name: '折叠侧边栏', exact: true }).click()
+    await layout(true)
+    await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: '成员管理', exact: true }).focus()
+    await page.keyboard.press('Enter')
+    await page.getByRole('heading', { name: '成员管理', exact: true }).waitFor()
+    assert.equal(await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: '成员管理', exact: true }).getAttribute('aria-current'), 'page')
+    await page.reload({ waitUntil: 'networkidle' })
+    await layout(true)
+    assert.equal(await page.evaluate(key => localStorage.getItem(key), layoutKey), 'true')
+    assert.deepEqual(await state(), beforeLayout)
+    await assertCurrentMonthStatus(page, 'invalid')
+    record('collapsed-navigation-remains-keyboard-accessible-and-persists-on-reload-without-changing-data')
+
+    await page.setViewportSize({ width: 320, height: 650 })
+    assert.equal(await page.getByRole('button', { name: '展开侧边栏', exact: true }).isVisible(), false)
+    await page.getByRole('button', { name: '打开导航', exact: true }).click()
+    await page.waitForFunction(() => document.querySelector('#sp-app-sidebar').getBoundingClientRect().left >= 0)
+    const drawer = await sidebar.boundingBox()
+    assert.ok(Math.abs(drawer.width - 235) < 1, 'The mobile drawer keeps its full navigation width regardless of desktop preference')
+    for (const label of ['排班日历', '成员管理', '班次设置', '排班规则']) {
+      const button = page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: label, exact: true })
+      assert.ok((await button.innerText()).includes(label), 'The mobile drawer retains visible labels')
+    }
+    await page.screenshot({ path: path.join(output, '05-mobile-full-navigation-after-desktop-collapse.png') })
+    await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: '排班日历', exact: true }).click()
+    await page.waitForFunction(() => document.querySelector('#sp-app-sidebar').getBoundingClientRect().right <= 0)
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
+    await openMonthPicker(page, '2026-10')
+    await assertMonthChoiceStatus(picker(), '2026-10', 'invalid')
+    await page.screenshot({ path: path.join(output, '06-mobile-month-status-after-desktop-collapse.png') })
+    await page.setViewportSize({ width: 320, height: 280 })
+    await page.keyboard.press('Home')
+    await page.keyboard.press('End')
+    await focused(picker().getByRole('button', { name: '2026 年 12 月', exact: true }))
+    assert.equal(await picker().getByRole('button', { name: '2026 年 12 月', exact: true }).evaluate(node => {
+      const choice = node.getBoundingClientRect(), grid = node.parentElement.getBoundingClientRect()
+      return choice.top >= grid.top - 1 && choice.bottom <= grid.bottom + 1
+    }), true, 'Keyboard focus remains inside the short month-grid scroll area')
+    const shortPanel = await picker().boundingBox()
+    assert.ok(shortPanel.y >= 0 && shortPanel.y + shortPanel.height <= 280)
+    await page.screenshot({ path: path.join(output, '07-short-month-picker-keyboard.png') })
+    await page.keyboard.press('Escape')
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await layout(true)
+    assert.equal(await page.evaluate(key => localStorage.getItem(key), layoutKey), 'true')
+    await page.getByRole('button', { name: '展开侧边栏', exact: true }).click()
+    await layout(false)
+    assert.deepEqual(await state(), beforeLayout)
+    record('desktop-collapse-preference-does-not-shrink-the-320px-mobile-drawer-and-returns-on-desktop')
     assert.deepEqual(errors, [])
     record('no-browser-console-or-page-errors')
     report.ok = true

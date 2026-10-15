@@ -6,6 +6,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs/promises')
 const path = require('node:path')
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE_PATH || 'playwright')
+const { assertCurrentMonthStatus } = require('./helpers/month-picker.cjs')
 
 const url = process.env.RULES_IMPORT_TEST_URL || 'http://127.0.0.1:5190/'
 const out = path.resolve(__dirname, '../../test-results/rules-import')
@@ -48,14 +49,7 @@ async function shot(page, name) {
 }
 async function stored(page) { return page.evaluate(key => JSON.parse(localStorage.getItem(key)), storageKey) }
 async function assertScheduleStatus(page, expected) {
-  const status = page.locator('.sp-month-schedule-status')
-  await status.waitFor()
-  assert.equal(await status.getAttribute('role'), 'status')
-  assert.equal(await status.getAttribute('aria-label'), '本月排班状态')
-  assert.equal(await status.getAttribute('data-schedule-status'), expected)
-  assert.equal((await status.innerText()).trim(), {
-    scheduled: '已排班', invalid: '规则已修改，排班已失效', empty: '未排班',
-  }[expected])
+  await assertCurrentMonthStatus(page, expected)
 }
 async function preparePage(desktop, initial = fixture) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: 'zh-CN', acceptDownloads: true })

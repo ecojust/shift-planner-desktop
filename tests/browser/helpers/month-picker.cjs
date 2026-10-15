@@ -1,4 +1,26 @@
 const assert = require('node:assert/strict')
+const statusLabels = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效' }
+
+async function assertStatusDescription(locator, expected) {
+  assert.equal(await locator.getAttribute('data-schedule-status'), expected)
+  const description = await locator.evaluate(node => (node.getAttribute('aria-describedby') || '').split(/\s+/).map(id => document.getElementById(id)?.textContent || '').join(' '))
+  assert.ok(description.includes(statusLabels[expected]), `Expected ${statusLabels[expected]} in accessible description: ${description}`)
+}
+
+async function assertCurrentMonthStatus(page, expected) {
+  const trigger = page.getByRole('button', { name: '全局排班月份', exact: true })
+  await trigger.waitFor()
+  await assertStatusDescription(trigger, expected)
+  assert.equal(await page.locator('.sp-month-schedule-status').count(), 0, 'The old calendar heading must not duplicate month status')
+}
+
+async function assertMonthChoiceStatus(dialog, month, expected) {
+  const choice = dialog.getByRole('button', { name: `${Number(month.slice(0, 4))} 年 ${Number(month.slice(5))} 月`, exact: true })
+  await assertStatusDescription(choice, expected)
+  const visibleStatus = choice.locator('.sp-month-picker-status')
+  assert.equal(await visibleStatus.isVisible(), true)
+  assert.equal((await visibleStatus.innerText()).replace(/[\s，]/g, ''), statusLabels[expected].replace('，', ''), `${month}: the month grid visibly explains its saved schedule status`)
+}
 
 async function readGlobalMonth(page) {
   const text = await page.getByRole('button', { name: '全局排班月份', exact: true }).innerText()
@@ -38,4 +60,4 @@ async function selectGlobalMonth(page, value) {
   assert.equal(await readGlobalMonth(page), value)
 }
 
-module.exports = { selectGlobalMonth, readGlobalMonth, openMonthPicker }
+module.exports = { selectGlobalMonth, readGlobalMonth, openMonthPicker, assertCurrentMonthStatus, assertMonthChoiceStatus }
