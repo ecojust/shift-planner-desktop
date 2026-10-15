@@ -64,6 +64,7 @@ async function plainInterface(page) {
   assert.doesNotMatch(await page.locator('body').innerText(), /CP-SAT|OR-Tools|启发式|命令行|原生协议|求解器|引擎|组件|Vue|TypeScript|npm run|browser-test-bridge/i);
 }
 async function fillState(page,desktop=false,state=fixture) {
+  await page.clock.setFixedTime(new Date('2026-10-15T04:00:00Z'));
   await page.addInitScript(({fixture,desktop})=>{
     localStorage.setItem('shift-planner:v1',JSON.stringify(fixture));
     if(desktop){
@@ -91,6 +92,7 @@ async function fillState(page,desktop=false,state=fixture) {
       assert.deepEqual(data.state.rules,fixture.rules);assert.deepEqual(data.state.assignments,fixture.assignments);
       assert.ok(data.state.employees.every(e=>e.minHoursPerWeek===24&&!Object.hasOwn(e,'minHoursPerMonth')));assert.equal(Object.hasOwn(data.state,'monthlyReferenceHours'),false);assert.equal(data.debug.source,'current');assert.equal(data.debug.runtime,'browser');
       assert.equal(data.options.timeLimitSeconds,15);assert.equal(data.options.allowPartial,false);assert.equal(Number.isInteger(data.options.seed),true);
+      assert.equal(data.options.referenceDate,'2026-10-15');
       report.browserFileName=d.suggestedFilename();report.browserJSONKeys=Object.keys(data);
     });
     await check('downloaded browser JSON replays against real Python --input',async()=>{const r=await runSolver(path.join(out,'browser-current.json'));assert.equal(r.status,'INFEASIBLE');report.browserReplay=r;await fs.writeFile(path.join(out,'browser-replay.json'),JSON.stringify(r,null,2));});

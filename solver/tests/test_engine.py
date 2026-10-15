@@ -28,11 +28,16 @@ def state(employees=None, shifts=None, month='2026-10', assignments=None, **rule
 
 
 def request(s, **options):
-    return dict(protocolVersion=1, requestId='test-1', state=s, options=dict(timeLimitSeconds=3, seed=1010, allowPartial=False, **options))
+    return dict(protocolVersion=1, requestId='test-1', state=s, options=dict(timeLimitSeconds=3, seed=1010, allowPartial=False, **({'referenceDate': '2030-01-01'} | options)))
 
 
 def assignment(eid, date, sid='early', locked=True):
     return dict(employeeId=eid, date=date, shiftId=sid, locked=locked)
+
+
+def confirm_months(s, *months):
+    """Fixture metadata explicitly confirms blank dates as rest for every member."""
+    s.setdefault('scheduleCoverage', {}).update({month: {'employeeIds': [e['id'] for e in s['employees']]} for month in months})
 
 
 def actual_month_minutes(s, assignments, eid, *, include_outside=False):
@@ -106,7 +111,7 @@ class SolverTest(unittest.TestCase):
         self.assertFeasible(result)
         self.assertEqual(result['assignments'], [])
         self.assertEqual(result['stats']['shortageCount'], 31)
-        self.assertEqual(len(result['issues']), 31)
+        self.assertEqual(len([item for item in result['issues'] if item['type'] == 'coverage']), 31)
 
     def test_fixed_qualification_conflict(self):
         data = request(state(shifts=[shift(), shift('night', '23:00', '07:00', 0)], assignments=[assignment('a', '2026-10-01', 'night')]))
@@ -332,7 +337,7 @@ class SolverTest(unittest.TestCase):
         for a in result['assignments']:
             counts[a['date']] = counts.get(a['date'], 0) + 1
         self.assertEqual(set(counts.values()), {2})
-        self.assertTrue(all('固定人数' in item['message'] for item in result['issues']))
+        self.assertTrue(all('固定人数' in item['message'] for item in result['issues'] if item['type'] == 'coverage'))
 
     def test_legacy_missing_mode_and_explicit_minimum_both_allow_extra_assignments(self):
         for mode in (None, 'minimum'):
@@ -383,7 +388,7 @@ class SolverTest(unittest.TestCase):
         self.assertTrue(any(i['type'] == 'weekly-min-hours' and i.get('employeeId') == 'a' for i in result['issues']))
         self.assertNotIn('assignments', result)
 
-    def test_weekly_minimum_prorates_both_month_boundaries(self):
+    def test_weekly_minimum_prorates_only_unconfirmed_historical_boundary_dates(self):
         s = state(employees=[employee('a', cap=7, minimum_week=7)], shifts=[shift(start='12:00', end='13:00')])
         s['rules']['maxConsecutiveDays'] = 31
         result = solve(request(s))
@@ -391,6 +396,8 @@ class SolverTest(unittest.TestCase):
         total, weekly = actual_month_minutes(s, result['assignments'], 'a')
         self.assertEqual(total, 31 * 60)
         self.assertEqual(weekly, {'2026-09-28': 240, '2026-10-05': 420, '2026-10-12': 420, '2026-10-19': 420, '2026-10-26': 360})
+        self.assertEqual(len(result['boundaryContext']['incompleteHistory']), 2)
+        self.assertEqual(result['boundaryPreview'], [])
 
     def test_minimum_rounding_uses_ceil_then_partial_week_ceil(self):
         # .02 hours becomes two minutes, then the first 4/7 week still
@@ -411,17 +418,19 @@ class SolverTest(unittest.TestCase):
         self.assertEqual(result['status'], 'INFEASIBLE')
         first = [i for i in result['issues'] if i['type'] == 'weekly-min-hours' and i.get('date') == '2026-09-28']
         self.assertTrue(first)
-        self.assertIn('16 小时', first[0]['message'])
-        self.assertIn('月外已排 24 小时', first[0]['message'])
-        self.assertIn('本月实际最低要求为 4 小时', first[0]['message'])
-        self.assertIn('0 小时', first[0]['message'])
+        self.assertIn('本周实际最低要求 28 小时', first[0]['message'])
+        self.assertIn('已知固定工作 24 小时', first[0]['message'])
+        self.assertIn('整周最多不超过 24 小时', first[0]['message'])
+        self.assertIn('至少相差 4 小时', first[0]['message'])
 
     def test_previous_month_night_tail_satisfies_first_partial_week_minimum(self):
-        # February 2026 begins on Sunday. One known Saturday hour leaves six
-        # of the full week's seven hours, covered by the seven-hour Sunday tail.
+        # February 2026 begins on Sunday. Confirm January so the full week's
+        # seven-hour minimum applies; one Saturday hour plus seven Sunday tail
+        # hours cover it without generating a second start on Sunday.
         leaves = [f'2026-02-{day:02d}' for day in (2, 3, 4, 5, 6)]
         fixed = [assignment('a', '2026-01-31', 'night', False), assignment('a', '2026-02-01', 'off')]
         s = state(month='2026-02', employees=[employee('a', ['night'], cap=168, minimum_week=7, leave=leaves), employee('b', ['night'], cap=168)], shifts=[shift('night', '23:00', '07:00')], assignments=fixed)
+        s['scheduleCoverage'] = {'2026-01': {'employeeIds': ['a', 'b']}}
         s['rules']['maxConsecutiveDays'] = 31
         result = solve(request(s))
         self.assertFeasible(result)
@@ -471,26 +480,41 @@ class SolverTest(unittest.TestCase):
                     self.assertGreaterEqual(actual, item['required'])
             date += dt.timedelta(days=1)
 
-    def assert_prorated_weekly_hours(self, s, assignments, eid):
-        """Independent minute totals for fixtures without previous-month history."""
+    def assert_prorated_weekly_hours(self, s, assignments, eid, *, boundary_preview=(), reference_date='2030-01-01'):
+        """Audit full-week actual minutes; only unknown past dates reduce the minimum."""
         person = next(item for item in s['employees'] if item['id'] == eid)
         first = dt.date.fromisoformat(s['month'] + '-01')
-        dates_per_week = {}
+        weeks = set()
         date = first
         while date.month == first.month:
-            week = (date - dt.timedelta(days=date.weekday())).isoformat()
-            dates_per_week[week] = dates_per_week.get(week, 0) + 1
+            weeks.add(date - dt.timedelta(days=date.weekday()))
             date += dt.timedelta(days=1)
-        _, actual = actual_month_minutes(s, assignments, eid)
-        _, full_weeks = actual_month_minutes(s, assignments, eid, include_outside=True)
+        explicit = {(item['employeeId'], item['date']) for item in s['assignments']}
+        reference = dt.date.fromisoformat(reference_date)
+        _, full_weeks = actual_month_minutes(s, list(assignments) + list(boundary_preview), eid, include_outside=True)
         minimum = math.ceil(person.get('minHoursPerWeek', 0) * 60)
         maximum = math.floor(person['maxHoursPerWeek'] * 60)
-        for week, days in dates_per_week.items():
-            self.assertGreaterEqual(actual.get(week, 0), (minimum * days + 6) // 7, (eid, week))
-        for week, minutes in full_weeks.items():
-            self.assertLessEqual(minutes, maximum, (eid, week))
+        for week in weeks:
+            days = [week + dt.timedelta(days=offset) for offset in range(7)]
+            known = sum(day.strftime('%Y-%m') == s['month'] or day >= reference
+                        or (eid, day.isoformat()) in explicit
+                        or eid in s.get('scheduleCoverage', {}).get(day.strftime('%Y-%m'), {}).get('employeeIds', [])
+                        for day in days)
+            actual = full_weeks.get(week.isoformat(), 0)
+            self.assertGreaterEqual(actual, (minimum * known + 6) // 7, (eid, week))
+            self.assertLessEqual(actual, maximum, (eid, week))
 
-    def assert_weighted_actual(self, s, assignments):
+    def test_weekly_oracle_audits_both_boundary_previews_without_persisting_them(self):
+        s = state(month='2026-11', employees=[employee('a', cap=40, minimum_week=40)], shifts=[shift(required=0)])
+        s['rules'].update(minRestHours=0, maxConsecutiveDays=31)
+        result = solve(request(s, referenceDate='2026-10-01'))
+        self.assertFeasible(result)
+        self.assertTrue(any(item['date'] < '2026-11-01' for item in result['boundaryPreview']))
+        self.assertTrue(any(item['date'] > '2026-11-30' for item in result['boundaryPreview']))
+        self.assertTrue(all(item['date'].startswith('2026-11') for item in result['assignments']))
+        self.assert_prorated_weekly_hours(s, result['assignments'], 'a', boundary_preview=result['boundaryPreview'], reference_date='2026-10-01')
+
+    def assert_weighted_actual(self, s, assignments, *, boundary_preview=(), reference_date='2030-01-01'):
         weights = s['rules']['weekdayWeights']
         chosen = set(weights['days'])
         first = dt.date.fromisoformat(s['month'] + '-01')
@@ -501,14 +525,17 @@ class SolverTest(unittest.TestCase):
             weeks.setdefault(week, []).append(date)
             date += dt.timedelta(days=1)
         employee_ids = {item['id'] for item in s['employees']}
-        previous_month = (first - dt.timedelta(days=1)).strftime('%Y-%m')
-        has_previous_history = any(item['employeeId'] in employee_ids and item['date'].startswith(previous_month + '-')
-                                   for item in s['assignments'])
-        if first.weekday() and has_previous_history:
-            start = first - dt.timedelta(days=first.weekday())
-            weeks[start.isoformat()] = [start + dt.timedelta(days=offset) for offset in range(7)]
+        explicit = {(item['employeeId'], item['date']) for item in s['assignments']}
+        reference = dt.date.fromisoformat(reference_date)
+        for week in weeks:
+            start = dt.date.fromisoformat(week)
+            days = [start + dt.timedelta(days=offset) for offset in range(7)]
+            weeks[week] = [day for day in days if day.strftime('%Y-%m') == s['month'] or day >= reference
+                           or all((eid, day.isoformat()) in explicit
+                                  or eid in s.get('scheduleCoverage', {}).get(day.strftime('%Y-%m'), {}).get('employeeIds', [])
+                                  for eid in employee_ids)]
         counts = {}
-        for item in assignments:
+        for item in list(assignments) + list(boundary_preview):
             if item['employeeId'] in employee_ids and item['shiftId'] != 'off':
                 counts[item['date']] = counts.get(item['date'], 0) + 1
         for week, days in weeks.items():
@@ -577,7 +604,7 @@ class SolverTest(unittest.TestCase):
         result = solve(request(s))
         self.assertFeasible(result)
         check = Path(__file__).resolve().parent / 'crosscheck.mjs'
-        validation = subprocess.run(['node', str(check)], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        validation = subprocess.run(['node', str(check)], input=json.dumps(dict(state=s, assignments=result['assignments'], boundaryPreview=result['boundaryPreview'], referenceDate='2030-01-01')), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
     def test_partial_targets_preserve_user_example_shares_for_a_given_full_week_total(self):
@@ -611,7 +638,7 @@ class SolverTest(unittest.TestCase):
         result = solve(request(s))
         self.assertFeasible(result)
         check = Path(__file__).resolve().parent / 'crosscheck.mjs'
-        validation = subprocess.run(['node', str(check)], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        validation = subprocess.run(['node', str(check)], input=json.dumps(dict(state=s, assignments=result['assignments'], boundaryPreview=result['boundaryPreview'], referenceDate='2030-01-01')), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
     def test_weekday_weights_boundary_weeks_keep_absent_shares_without_losing_daily_coverage(self):
@@ -658,6 +685,7 @@ class SolverTest(unittest.TestCase):
     def test_weighted_previous_month_assignments_are_preserved_and_counted_in_first_week_quota(self):
         prior = assignment('a', '2026-09-28', locked=False)
         s = state(month='2026-10', employees=[employee('a', cap=168), employee('b', cap=168), employee('c', cap=168)], assignments=[prior])
+        confirm_months(s, '2026-09')
         s['rules'].update(weekdayWeights={'days': [6, 7], 'percent': 50}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
@@ -670,6 +698,7 @@ class SolverTest(unittest.TestCase):
         prior += [assignment('b', '2026-09-01', 'off', False), assignment('a', '2026-11-01', 'off', False)]
         s = state(employees=[employee('a', cap=168), employee('b', cap=168)],
                   shifts=[shift(mode='fixed')], assignments=prior)
+        confirm_months(s, '2026-09')
         s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         original = copy.deepcopy(s)
         result = solve(request(s))
@@ -689,6 +718,7 @@ class SolverTest(unittest.TestCase):
                           for day in (28, 29, 30) for eid in ('a', 'b')[:prior_count]]
                 s = state(employees=[employee('a', cap=168), employee('b', cap=168)],
                           shifts=[shift(required=1, mode='fixed')], assignments=prior)
+                confirm_months(s, '2026-09')
                 s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
                 result = solve(request(s))
                 self.assertFeasible(result)
@@ -702,6 +732,7 @@ class SolverTest(unittest.TestCase):
         prior = [assignment('a', '2026-09-28', locked=False), assignment('b', '2026-09-28', locked=False)]
         s = state(employees=[employee('a', cap=168), employee('b', cap=168)],
                   shifts=[shift(mode='fixed')], assignments=prior)
+        confirm_months(s, '2026-09')
         s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         original = copy.deepcopy(s)
         for allow_partial in (False, True):
@@ -724,15 +755,16 @@ class SolverTest(unittest.TestCase):
         self.assertFeasible(baseline)
         self.assert_weighted_actual(s, baseline['assignments'])
         s['assignments'] += [assignment('a', f'2026-10-{day}', locked=False) for day in range(26, 32)]
+        confirm_months(s, '2026-10')
         original = copy.deepcopy(s)
         result = solve(request(s))
         self.assertEqual(result['status'], 'INFEASIBLE', result)
         self.assertNotIn('assignments', result)
         self.assertEqual(s, original)
-        self.assertTrue(any(item['type'] == 'weekday-weight-capacity' and '合并上月固定工作记录' in item['message']
+        self.assertTrue(any(item['type'] == 'weekday-weight-capacity' and '合并已确认记录' in item['message']
                             for item in result['issues']), result)
 
-    def test_weighted_previous_month_off_far_from_boundary_makes_blank_days_known_zero(self):
+    def test_weighted_remote_off_does_not_confirm_blank_days_without_explicit_coverage(self):
         s = state(employees=[employee(str(i), cap=168) for i in range(3)], shifts=[shift(required=2, mode='fixed')])
         s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         # Future and two-month-old records do not establish previous-month history.
@@ -740,10 +772,18 @@ class SolverTest(unittest.TestCase):
         baseline = solve(request(s))
         self.assertFeasible(baseline)
         self.assert_weighted_actual(s, baseline['assignments'])
-        # A single off record anywhere in September makes its empty Mon-Wed cells
-        # count as zero, which conflicts with exactly two starts on Thu-Sun.
+        # A single off record confirms only that date, not the boundary blanks.
         prior_off = assignment('2', '2026-09-01', 'off', False)
         s['assignments'].append(prior_off)
+        original = copy.deepcopy(s)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertIn(prior_off, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+        self.assertEqual(s, original)
+        # Explicit completeness makes Mon-Wed known zero, incompatible with
+        # the fixed two starts on Thu-Sun under the daily balance rule.
+        confirm_months(s, '2026-09')
         original = copy.deepcopy(s)
         result = solve(request(s))
         self.assertEqual(result['status'], 'INFEASIBLE', result)
@@ -756,18 +796,20 @@ class SolverTest(unittest.TestCase):
         s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         self.assertFeasible(solve(request(s)))
         s['assignments'] = [assignment('0', '2026-12-01', 'off', False)]
+        self.assertFeasible(solve(request(s)))
+        confirm_months(s, '2026-12')
         result = solve(request(s))
         self.assertEqual(result['status'], 'INFEASIBLE', result)
         self.assertNotIn('assignments', result)
 
-    def test_weighted_known_first_week_does_not_include_next_month_in_last_week(self):
+    def test_weighted_last_week_includes_next_month_only_when_all_members_are_confirmed(self):
         prior = [assignment(eid, f'2026-09-{day}', locked=False)
                  for day in (28, 29, 30) for eid in ('a', 'b')]
-        # Next month's Sunday has zero starts. Including it would violate the
-        # uniform rule against the final Mon-Sat's fixed count of two.
+        # One member's off record does not establish Sunday's team total.
         future_off = assignment('c', '2026-11-01', 'off', False)
         s = state(employees=[employee(eid, cap=168) for eid in ('a', 'b', 'c')],
                   shifts=[shift(required=2, mode='fixed')], assignments=prior + [future_off])
+        confirm_months(s, '2026-09')
         s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
         result = solve(request(s))
         self.assertFeasible(result)
@@ -776,6 +818,12 @@ class SolverTest(unittest.TestCase):
         self.assert_weighted_actual(s, result['assignments'])
         self.assertEqual(sum(item['shiftId'] != 'off' and '2026-10-26' <= item['date'] <= '2026-10-31'
                              for item in result['assignments']), 12)
+        # Once November is confirmed, Sunday's zero starts must participate in
+        # the same full natural week and conflict with the fixed count of two.
+        confirm_months(s, '2026-11')
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE', result)
+        self.assertNotIn('assignments', result)
 
     def test_zero_weight_partial_week_can_be_empty_only_when_daily_minimum_permits_it(self):
         locked = [assignment(str(i), '2026-02-02') for i in range(7)]
@@ -880,7 +928,7 @@ class SolverTest(unittest.TestCase):
         result = solve(r)
         self.assertFeasible(result)
         self.assertEqual(result['stats']['shortageCount'], 0)
-        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'], boundaryPreview=result['boundaryPreview'], referenceDate='2030-01-01')), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for frontend request serialization')
@@ -898,7 +946,7 @@ class SolverTest(unittest.TestCase):
         self.assert_daily_minimum(s, result['assignments'])
         for e in s['employees']:
             self.assert_prorated_weekly_hours(s, result['assignments'], e['id'])
-        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'], boundaryPreview=result['boundaryPreview'], referenceDate='2030-01-01')), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
 
     @unittest.skipUnless(shutil.which('node'), 'Node required for independent JS validation')
@@ -907,7 +955,7 @@ class SolverTest(unittest.TestCase):
         result = solve(request(s))
         self.assertFeasible(result)
         folder = Path(__file__).resolve().parent
-        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'])), text=True, encoding='utf-8', capture_output=True, check=True)
+        validation = subprocess.run(['node', str(folder / 'crosscheck.mjs')], input=json.dumps(dict(state=s, assignments=result['assignments'], boundaryPreview=result['boundaryPreview'], referenceDate='2030-01-01')), text=True, encoding='utf-8', capture_output=True, check=True)
         self.assertEqual(json.loads(validation.stdout), [])
         self.assertEqual(len(result['assignments']), 31)
         for eid in ('a', 'b'):

@@ -75,8 +75,8 @@ class DiagnosticsTest(unittest.TestCase):
         items = self.assert_failure(solve(request(s)), 'weekly-min-hours')
         self.assertEqual(items[0]['date'], '2026-10-05')
         self.assertEqual(items[0]['employeeId'], '甲')
-        self.assertIn('本月实际最低要求为 24 小时', items[0]['message'])
-        self.assertIn('本月最多不超过 8 小时', items[0]['message'])
+        self.assertIn('本周实际最低要求 24 小时', items[0]['message'])
+        self.assertIn('整周最多不超过 8 小时', items[0]['message'])
         self.assertIn('至少相差 16 小时', items[0]['message'])
         s['employees'][0]['unavailableDates'] = []
         self.assertIn(solve(request(s))['status'], ('OPTIMAL', 'FEASIBLE'))

@@ -19,7 +19,7 @@ function deferred() {
   return { promise, resolve, reject }
 }
 function response(request, overrides = {}) {
-  return { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', status: 'FEASIBLE', assignments: structuredClone(request.state.assignments), issues: [], stats: { wallTimeSeconds: 0.25, shortageCount: 0, optimal: false }, message: '可行', ...overrides }
+  return { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', status: 'FEASIBLE', assignments: structuredClone(request.state.assignments), boundaryPreview: [], issues: [], stats: { wallTimeSeconds: 0.25, shortageCount: 0, optimal: false }, message: '可行', ...overrides }
 }
 function setup(initial = fixture()) {
   let state = parseBackup(JSON.stringify(initial)), permissions = { ...allPermissions }, busy = false, epoch = 0
@@ -84,6 +84,57 @@ async function finish(app, overrides = {}, args = {}, source = 'mcp', context) {
   return pending
 }
 const statusIs = status => error => error instanceof IntegrationError && error.status === status
+
+test('successful generation confirms only the target month and never saves provisional neighboring cells', async () => {
+  const app = setup()
+  const outcome = await finish(app)
+  assert.equal(outcome.success, true)
+  assert.deepEqual(structuredClone(app.state().scheduleCoverage), { '2026-10': { employeeIds: ['e1', 'e2'] } })
+  assert.deepEqual(app.state().assignments, [])
+  assert.deepEqual(outcome.boundaryPreview, [])
+  assert.equal(outcome.boundaryContext.startDate, '2026-09-28')
+  assert.equal(outcome.boundaryContext.endDate, '2026-11-01')
+  assert.equal(outcome.boundaryContext.referenceDate, app.calls[0].request.options.referenceDate)
+  assert.ok(outcome.issues.some(issue => issue.type.startsWith('boundary-')))
+  assert.ok(!Object.hasOwn(app.state(), 'boundaryPreview'))
+  assert.ok(!Object.hasOwn(app.state(), 'boundaryContext'))
+  assert.deepEqual(parseBackup(JSON.stringify(app.state())).scheduleCoverage, app.state().scheduleCoverage)
+})
+
+test('coverage cannot be forged externally; read-only echo and omission retain trusted confirmation', async () => {
+  const app = setup()
+  await finish(app)
+  let snapshot = app.read()
+  const fake = structuredClone(snapshot.state)
+  fake.scheduleCoverage['2026-11'] = { employeeIds: ['e1', 'e2'] }
+  assert.throws(() => app.handle('replace_state', { revision: snapshot.revision, state: fake }, 'mcp'), statusIs(403))
+  const omitted = structuredClone(snapshot.state)
+  delete omitted.scheduleCoverage
+  omitted.employees[0].name = '已更新姓名'
+  app.handle('replace_state', { revision: snapshot.revision, state: omitted }, 'http')
+  assert.deepEqual(structuredClone(app.state().scheduleCoverage), { '2026-10': { employeeIds: ['e1', 'e2'] } })
+  snapshot = app.read()
+  app.handle('replace_state', { revision: snapshot.revision, state: snapshot.state }, 'mcp')
+  assert.equal(app.read().revision, snapshot.revision)
+  const removed = structuredClone(snapshot.state)
+  removed.employees = removed.employees.filter(employee => employee.id !== 'e2')
+  app.handle('replace_state', { revision: snapshot.revision, state: removed }, 'http')
+  assert.deepEqual(app.state().scheduleCoverage['2026-10'].employeeIds, ['e1'])
+})
+
+test('removing a single confirmed work cell keeps its month known, while bulk clearing revokes confirmation', async () => {
+  const app = setup()
+  await finish(app, { assignments: [assignment()] })
+  let snapshot = app.read()
+  app.handle('set_assignment', { revision: snapshot.revision, employeeId: 'e1', date: '2026-10-15', remove: true }, 'http')
+  assert.deepEqual(app.state().assignments, [])
+  assert.ok(app.state().scheduleCoverage['2026-10'])
+  snapshot = app.read()
+  app.handle('set_assignment', { revision: snapshot.revision, ...assignment(), employeeId: 'e1' }, 'http')
+  snapshot = app.read()
+  app.handle('replace_state', { revision: snapshot.revision, state: { ...snapshot.state, assignments: [] } }, 'mcp')
+  assert.equal(app.state().scheduleCoverage, undefined)
+})
 
 test('generate_schedule validates its narrow arguments before taking a lease or running the solver', async () => {
   const app = setup(), before = app.read()

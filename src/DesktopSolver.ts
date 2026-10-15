@@ -1,7 +1,8 @@
 import { invoke, isTauri } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import type { Assignment, Issue, PlannerState } from './domain.ts'
-import { validateSchedule } from './scheduler.ts'
+import { boundaryWarnings, validateBoundaryPreview } from './scheduler.ts'
+import type { WeekBoundaryContext } from './weekBoundary.ts'
 
 export const desktop = isTauri()
 export type SolverStatus = 'OPTIMAL' | 'FEASIBLE' | 'INFEASIBLE' | 'UNKNOWN' | 'MODEL_INVALID' | 'ERROR'
@@ -9,7 +10,7 @@ export interface SolverRequest {
   protocolVersion: 1
   requestId: string
   state: PlannerState
-  options: { timeLimitSeconds: number; allowPartial: boolean; seed: number }
+  options: { timeLimitSeconds: number; allowPartial: boolean; seed: number; referenceDate?: string }
 }
 export interface SolverResult {
   protocolVersion: 1
@@ -17,6 +18,9 @@ export interface SolverResult {
   engine: 'ortools-cp-sat'
   status: SolverStatus
   assignments?: Assignment[]
+  /** Temporary neighboring dates used only for independent feasibility checks. */
+  boundaryPreview?: Assignment[]
+  boundaryContext?: Omit<WeekBoundaryContext, 'weeks'>
   issues: Issue[]
   stats: { wallTimeSeconds: number; objectiveValue?: number; bestBound?: number; shortageCount: number; optimal: boolean; solutionCount?: number }
   hostDiagnostics?: { exitTimedOut?: boolean; phase?: string; code?: string }
@@ -159,11 +163,14 @@ export function checkDesktopResult(request: SolverRequest, result: SolverResult)
   const originalOtherMonths = request.state.assignments.filter(a => !a.date.startsWith(`${request.state.month}-`))
   const resultOtherMonths = result.assignments.filter(a => !a.date.startsWith(`${request.state.month}-`))
   if (originalOtherMonths.length !== resultOtherMonths.length || resultOtherMonths.some(a => !originalOtherMonths.some(b => sameAssignment(a, b)))) return reject('求解结果改变了其他月份，已拒绝覆盖原表。')
-  const checked = validateSchedule({ ...request.state, assignments: result.assignments })
+  const candidate = { ...request.state, assignments: result.assignments }
+  const boundaryIssues = validateBoundaryPreview(candidate, result.boundaryPreview, request.options.referenceDate)
+  const checked = [...boundaryIssues, ...boundaryWarnings(candidate, { referenceDate: request.options.referenceDate })]
   const hard = checked.filter(i => i.severity === 'error')
   if (hard.length) return reject(`求解结果未通过独立规则检查，原排班未改变：${hard[0]!.message}`, checked)
   if (!request.options.allowPartial && checked.some(i => i.type === 'coverage')) return reject('求解结果仍有岗位缺口，不符合本次完整排班要求；原排班未改变。', checked)
+  if (!request.options.allowPartial && checked.some(i => i.type === 'boundary-coverage')) return reject('相邻月份的预排仍有岗位缺口，无法确认跨月衔接；原排班未改变。', checked)
   const status = '排班已生成'
   const shortages = checked.filter(i => i.type === 'coverage').length
-  return { success: true, assignments: result.assignments, issues: checked.map(formatUserIssue), message: `${status}。${shortages ? `有 ${shortages} 个班次存在缺编，请查看排班提醒。` : '所有岗位已覆盖，规则检查通过。'}` }
+  return { success: true, assignments: result.assignments, issues: checked.map(formatUserIssue), message: `${status}。${shortages ? `有 ${shortages} 个班次存在缺编，请查看排班提醒。` : checked.length ? `所有岗位已覆盖，有 ${checked.length} 项跨月或排班提醒待核对。` : '所有岗位已覆盖，规则检查通过。'}` }
 }

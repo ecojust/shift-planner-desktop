@@ -13,10 +13,12 @@ import { useEmployeeReorder, type EmployeeOrderChange } from './useEmployeeReord
 import SourceBadge from './SourceBadge.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import MonthPicker from './MonthPicker.vue'
+import BoundaryWeekNotice from './BoundaryWeekNotice.vue'
 import AppSelect from './AppSelect.vue'
 import ConfirmDialog from './ConfirmDialog.vue'
 import { makeDefaultState } from './defaults'
-import { datesOfMonth, shiftHours, validateSchedule } from './scheduler'
+import { datesOfMonth, shiftHours, validateSchedule, validateBoundaryPreview } from './scheduler'
+import { clearScheduleCoverage, markScheduleCoverageComplete, pruneScheduleCoverage } from './scheduleCoverage'
 import { backupJSON, loadSaved, parseBackup, saveLocal, scheduleXLSX, MAX_BACKUP_BYTES } from './storage'
 import { calculatePayroll, createPayrollConfig, dayInfo, payrollRows } from './payroll'
 import type { DayKind, PayrollConfig, PayrollResult } from './payroll'
@@ -27,7 +29,7 @@ import { BUILD_VERSION } from './buildInfo'
 import { monthlyHoursByEmployee } from './hours.ts'
 import { createSolverRequest, solverDebugJSON, solverDebugFileName } from './solverDebug'
 import { parseRulesImport } from './rulesImport'
-import { withSolverGuidance, diagnosticActionLabel, openingWeekNotice } from './solverGuidance'
+import { withSolverGuidance, diagnosticActionLabel } from './solverGuidance'
 import './planner.css'
 
 const brandMarkUrl = `${import.meta.env.BASE_URL}brand-mark.png`
@@ -115,7 +117,7 @@ const editing = ref<{ employee: Employee; date: string; shiftId: string; locked:
 const calendarDate = ref('')
 const calendarKind = ref<DayKind>('workday')
 const calendarReset = ref<{ date: string; revision: number } | null>(null)
-const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]>; source: string; configuration: string; invalidatedSchedules: Record<string, ChangeStamp> }[]>([])
+const history = ref<{ assignments: Assignment[]; scheduleCoverage?: PlannerState['scheduleCoverage']; leaves: Record<string, string[]>; source: string; configuration: string; invalidatedSchedules: Record<string, ChangeStamp> }[]>([])
 const savedAt = ref('')
 let acceptingProvenance = false
 function acceptProvenance(update: () => void) {
@@ -152,7 +154,7 @@ const integrationGeneration: IntegrationGenerationAdapter = {
               scheduleSource.value = `${source.toUpperCase()} 已生成 ${request.state.month} 排班`
               if (state.value.month === request.state.month) showIssues.value = outcome.issues.length > 0
             }
-            feedback(outcome.success, `${prefix}${outcome.message}`, [], false, outcome.success ? [] : outcome.issues)
+            feedback(outcome.success, `${prefix}${outcome.message}`, [], false, outcome.issues)
           } else if (job.userCancelled) feedback(false, `${prefix}本次排班已取消，原排班未改变。`)
           else {
             const failure = error instanceof IntegrationError ? { message: error.message, diagnostic: false } : formatSolverError(error ?? job.abortReason)
@@ -213,7 +215,6 @@ const navigation: { key: Section; label: string; icon: string }[] = [
 const sectionLabel = computed(() => navigation.find(n => n.key === section.value)!.label)
 const dates = computed(() => datesOfMonth(state.value.month))
 const monthOffset = computed(() => (new Date(`${state.value.month}-01T12:00:00`).getDay() + 6) % 7)
-const openingWeekInfo = computed(() => openingWeekNotice(state.value))
 const weekCount = computed(() => Math.ceil((dates.value.length + monthOffset.value) / 7))
 const visibleDates = computed(() => view.value === 'month' ? dates.value : dates.value.slice(Math.max(0, weekIndex.value * 7 - monthOffset.value), Math.min(dates.value.length, weekIndex.value * 7 + 7 - monthOffset.value)))
 const groups = computed(() => [...new Set(state.value.employees.map(e => e.group).filter(Boolean))])
@@ -255,11 +256,11 @@ watch([employeeQuery, groupFilter, section, view, weekIndex, generating, editing
 const assignments = computed(() => new Map(state.value.assignments.map(a => [`${a.employeeId}:${a.date}`, a])))
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
 const monthEntryCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(`${state.value.month}-`)).length)
+const monthHasSchedule = computed(() => monthEntryCount.value > 0 || !!state.value.scheduleCoverage?.[state.value.month]?.employeeIds.length)
 const monthScheduleStatuses = computed(() => {
-  const statuses: Record<string, { status: 'scheduled' | 'invalid'; description?: string }> = Object.create(null)
-  for (const assignment of state.value.assignments) {
-    const month = assignment.date.slice(0, 7)
-    if (Object.hasOwn(statuses, month)) continue
+  const statuses: Record<string, { status: 'scheduled' | 'invalid' | 'pending' | 'conflict'; description?: string }> = Object.create(null)
+  const months = new Set([...state.value.assignments.map(assignment => assignment.date.slice(0, 7)), ...Object.keys(state.value.scheduleCoverage ?? {})])
+  for (const month of months) {
     const invalidation = state.value.provenance?.invalidatedSchedules?.[month]
     statuses[month] = invalidation ? {
       status: 'invalid',
@@ -267,6 +268,27 @@ const monthScheduleStatuses = computed(() => {
     } : { status: 'scheduled' }
   }
   return statuses
+})
+// The picker requests only its visible months. Cache their checks per document
+// revision instead of validating every historical month on each render.
+const monthScheduleStatus = computed(() => {
+  const snapshot = state.value
+  const statuses = monthScheduleStatuses.value
+  const cache = new Map<string, { status: 'empty' | 'scheduled' | 'invalid' | 'pending' | 'conflict'; description?: string }>()
+  // Assignment/coverage/configuration mutations invalidate this small cache.
+  JSON.stringify([snapshot.assignments, snapshot.scheduleCoverage, snapshot.employees, snapshot.shifts, snapshot.rules])
+  return (month: string) => {
+    if (cache.has(month)) return cache.get(month)!
+    const known = statuses[month]
+    if (!known || known.status === 'invalid') return known ?? { status: 'empty' as const }
+    const checks = validateSchedule({ ...snapshot, month })
+    const boundary = checks.filter(issue => issue.type.startsWith('boundary-') || issue.type === 'history-incomplete')
+    const conflict = checks.find(issue => issue.severity === 'error')
+    const entry = conflict ? { status: 'conflict' as const, description: conflict.message }
+      : boundary.length ? { status: 'pending' as const, description: boundary.map(issue => issue.message).join(' ') } : known
+    cache.set(month, entry)
+    return entry
+  }
 })
 const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
 const externalChange = computed(() => state.value.provenance?.pendingExternalChange)
@@ -310,6 +332,14 @@ function info(date: string) { return dayInfo(date, state.value.calendar) }
 function weekday(date: string) { return ['日', '一', '二', '三', '四', '五', '六'][new Date(`${date}T12:00:00`).getDay()] }
 function findShift(id: string): Shift | undefined { return state.value.shifts.find(s => s.id === id) }
 function entry(employeeId: string, date: string) { return assignments.value.get(`${employeeId}:${date}`) }
+function emptyCellLabel(employeeId: string, date: string) {
+  return entry(employeeId, date)?.shiftId === 'off' || state.value.scheduleCoverage?.[date.slice(0, 7)]?.employeeIds.includes(employeeId) ? '休息' : '待排'
+}
+function cellLabel(employee: Employee, date: string) {
+  if (leave(employee, date)) return '请假'
+  return findShift(entry(employee.id, date)?.shiftId || '')?.name
+    || (dayAllowance(employee.id, date)?.carriedShiftIds.length ? '跨夜续班' : emptyCellLabel(employee.id, date))
+}
 function leave(employee: Employee, date: string) { return employee.unavailableDates.includes(date) }
 function employeeHours(id: string) { return Number((actualMonthHours.value.get(id) ?? 0).toFixed(2)) }
 function employeeDays(id: string) { return monthAssignments.value.filter(a => a.employeeId === id).length }
@@ -339,7 +369,7 @@ function scheduleConfigurationKey(document: Document) {
     .sort(([a], [b]) => a.localeCompare(b)))
 }
 function remember() {
-  history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value, configuration: scheduleConfigurationKey(state.value), invalidatedSchedules: clone(state.value.provenance?.invalidatedSchedules ?? {}) })
+  history.value.push({ assignments: clone(state.value.assignments), scheduleCoverage: state.value.scheduleCoverage ? clone(state.value.scheduleCoverage) : undefined, leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value, configuration: scheduleConfigurationKey(state.value), invalidatedSchedules: clone(state.value.provenance?.invalidatedSchedules ?? {}) })
   if (history.value.length > 10) history.value.shift()
 }
 function undo() {
@@ -349,12 +379,13 @@ function undo() {
   const next = withChangeProvenance(state.value, {
     ...state.value,
     assignments: previous.assignments,
+    scheduleCoverage: previous.scheduleCoverage,
     employees: state.value.employees.map(employee => previous.leaves[employee.id] ? { ...employee, unavailableDates: previous.leaves[employee.id]! } : employee),
   }, 'manual', at) as Document
   // Restoring an older roster must not erase either its old invalidation or a
   // later configuration edit. A deleted month's marker may already be pruned.
   const invalidated = { ...previous.invalidatedSchedules, ...next.provenance?.invalidatedSchedules }
-  const months = new Set(next.assignments.map(assignment => assignment.date.slice(0, 7)))
+  const months = new Set([...next.assignments.map(assignment => assignment.date.slice(0, 7)), ...Object.keys(next.scheduleCoverage ?? {})])
   for (const month of Object.keys(invalidated)) if (!months.has(month)) delete invalidated[month]
   if (scheduleConfigurationKey(next) !== previous.configuration) {
     for (const month of months) invalidated[month] = { source: 'manual', at }
@@ -366,11 +397,11 @@ function undo() {
 }
 function commitGeneratedAssignments(assignments: Assignment[], month: string) {
   remember()
-  const next = markSchedulesCurrent(withChangeProvenance(state.value, { ...state.value, assignments }, 'manual') as Document, [month])
+  const next = markSchedulesCurrent(markScheduleCoverageComplete(withChangeProvenance(state.value, { ...state.value, assignments }, 'manual') as Document, [month]), [month])
   acceptProvenance(() => { state.value = next })
 }
 function requestMonthDeletion() {
-  if (generating.value || !monthEntryCount.value) return
+  if (generating.value || !monthHasSchedule.value) return
   monthDeletion.value = { month: state.value.month, count: monthEntryCount.value, revision }
 }
 function closeMonthDeletion(restoreFocus = true) {
@@ -387,11 +418,11 @@ function confirmMonthDeletion() {
   if (!target) return
   if (generating.value || target.month !== state.value.month || target.revision !== revision) { closeMonthDeletion(false); return }
   const remaining = state.value.assignments.filter(assignment => !assignment.date.startsWith(`${target.month}-`))
-  if (remaining.length === state.value.assignments.length) { closeMonthDeletion(); return }
+  if (remaining.length === state.value.assignments.length && !state.value.scheduleCoverage?.[target.month]) { closeMonthDeletion(); return }
   const title = deletionMonthTitle.value
   remember()
   closeMonthDeletion()
-  state.value.assignments = remaining
+  state.value = clearScheduleCoverage({ ...state.value, assignments: remaining }, [target.month])
   solverFeedback.value = null; expandedFeedback.value = false; activeAttempt = null
   showIssues.value = false; editing.value = null; calendarDate.value = ''
   scheduleSource.value = `${title}排班已删除`
@@ -558,7 +589,7 @@ async function generate() {
           commitGeneratedAssignments(checked.assignments, request.state.month); showIssues.value = checked.issues.length > 0
           scheduleSource.value = '已自动生成排班'
         }
-        feedback(checked.success, checked.message, [], false, checked.success ? [] : checked.issues)
+        feedback(checked.success, checked.message, [], false, checked.issues)
       }
     } catch (error) {
       if (isCurrent()) {
@@ -585,9 +616,10 @@ async function generate() {
         if (inputRevision !== revision) feedback(false, '排班期间设置发生变化，已保留你的修改。请按最新设置重新生成。')
         else if (error || !Array.isArray(result?.issues) || !Array.isArray(result?.assignments)) feedback(false, '排班暂时未完成，请重试；原排班未改变。')
         else {
-          const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || issue.type === 'coverage')
+          const previewIssues = validateBoundaryPreview({ ...request.state, assignments: result.assignments }, result.boundaryPreview, request.options.referenceDate)
+          const blockingIssues = [...result.issues, ...previewIssues].filter((issue: Issue) => issue.severity === 'error' || issue.type === 'coverage' || issue.type === 'boundary-coverage')
           if (result.success === false || blockingIssues.length) feedback(false, '暂未找到符合规则的排班方案，这不代表无解。原排班未改变。', ['下方是此次尝试中发现的问题，可参考调整后重试。'], false, blockingIssues)
-          else { commitGeneratedAssignments(result.assignments, request.state.month); showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过') }
+          else { commitGeneratedAssignments(result.assignments, request.state.month); showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过', [], false, result.issues) }
         }
       } catch { feedback(false, '排班结果未能读取，请重试；原排班未改变。') }
       finally { if (isCurrent()) finishGeneration() }
@@ -600,7 +632,7 @@ async function generate() {
       if (!isCurrent()) return
       feedback(false, '排班等待超时，尚未找到方案，已保留原表。'); finishGeneration()
     }, 30000)
-    worker.postMessage({ state: request.state, seed: request.options.seed, requestId: request.requestId })
+    worker.postMessage({ state: request.state, seed: request.options.seed, requestId: request.requestId, referenceDate: request.options.referenceDate })
   } catch {
     if (isCurrent()) { feedback(false, '排班暂时无法开始，请重试；原排班未改变。'); finishGeneration() }
   }
@@ -768,6 +800,13 @@ watch(state, () => {
   const configurationChanged = scheduleConfigurationKey(provenanceSnapshot) !== scheduleConfigurationKey(state.value)
   recordingProvenance = true
   try {
+    const pruned = pruneScheduleCoverage(state.value)
+    // Preserve the document identity while a child component applies related
+    // mutations (for example removing a member and their assignments).
+    if (pruned !== state.value) {
+      if (pruned.scheduleCoverage) state.value.scheduleCoverage = pruned.scheduleCoverage
+      else delete state.value.scheduleCoverage
+    }
     if (!acceptingProvenance) {
       const provenance = withChangeProvenance(provenanceSnapshot, state.value, 'manual').provenance
       if (JSON.stringify(provenance) !== JSON.stringify(state.value.provenance)) state.value.provenance = provenance
@@ -837,7 +876,7 @@ watch([generating, cancelling], async () => {
         <div class="sp-breadcrumb"><button type="button" class="sp-sidebar-toggle sp-icon-button" :aria-label="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" :title="sidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'" :aria-expanded="!sidebarCollapsed" aria-controls="sp-app-sidebar" @click="toggleSidebar"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/><path :d="sidebarCollapsed ? 'm13 9 3 3-3 3' : 'm16 9-3 3 3 3'"/></svg></button><button class="sp-mobile-toggle sp-icon-button" aria-label="打开导航" :aria-expanded="mobileNav" aria-controls="sp-app-sidebar" @click="mobileNav = true"><Icon name="menu" /></button><strong>{{ sectionLabel }}</strong></div>
         <div class="sp-global-month" role="group" aria-label="所有面板共用排班月份">
           <button class="sp-icon-button" aria-label="上个月" :disabled="state.month === '0001-01'" @click="navigateMonth(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button>
-          <MonthPicker :model-value="state.month" :schedule-statuses="monthScheduleStatuses" @update:model-value="changeMonth" />
+          <MonthPicker :model-value="state.month" :get-schedule-status="monthScheduleStatus" @update:model-value="changeMonth" />
           <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
           <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
         </div>
@@ -893,7 +932,7 @@ watch([generating, cancelling], async () => {
           <section class="sp-calendar-card" aria-label="人员排班表" tabindex="-1">
             <div class="sp-calendar-toolbar">
               <div class="sp-date-controls"><span class="sp-month-label"><Icon name="calendar" :size="19" /><span>{{ monthTitle }}</span></span><div v-if="view === 'week'" class="sp-arrows"><button class="sp-icon-button" aria-label="上一时段" title="本月上一周" :disabled="weekIndex === 0" @click="navigatePeriod(-1)"><Icon class="sp-flip" name="arrow" :size="16" /></button><button class="sp-icon-button" aria-label="下一时段" title="本月下一周" :disabled="weekIndex >= weekCount - 1" @click="navigatePeriod(1)"><Icon name="arrow" :size="16" /></button></div><span class="sp-period">{{ period }}</span></div>
-              <div class="sp-calendar-actions"><div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div><button ref="deleteMonthButton" type="button" class="sp-icon-button sp-delete-month" aria-label="删除本月排班" :title="`删除 ${monthTitle}的排班`" :disabled="generating || !monthEntryCount" @click="requestMonthDeletion"><Icon name="trash" :size="18" /></button></div>
+              <div class="sp-calendar-actions"><div class="sp-view-toggle" aria-label="日历视图"><button :class="{ active: view === 'week' }" @click="view = 'week'">周视图</button><button :class="{ active: view === 'month' }" @click="view = 'month'">月视图</button></div><button ref="deleteMonthButton" type="button" class="sp-icon-button sp-delete-month" aria-label="删除本月排班" :title="`删除 ${monthTitle}的排班`" :disabled="generating || !monthHasSchedule" @click="requestMonthDeletion"><Icon name="trash" :size="18" /></button></div>
             </div>
             <div class="sp-filterbar"><div class="sp-filters"><label class="sp-search"><Icon name="search" :size="16" /><input v-model="employeeQuery" placeholder="搜索成员" aria-label="搜索成员" /></label><AppSelect v-model="groupFilter" class="sp-group-filter" label="按工作组筛选" :options="[{ value: '', label: '全部工作组' }, ...groups.map(group => ({ value: group, label: group }))]" /></div><div class="sp-legend"><span v-for="s in state.shifts" :key="s.id"><i :style="{ background: s.color }"></i>{{ s.name }}</span><span><i class="sp-leave-dot"></i>请假</span><button class="sp-icon-button" :disabled="!history.length" aria-label="撤销上次调整" @click="undo"><Icon name="undo" :size="16" /></button></div></div>
             <p id="employee-order-help" class="sp-employee-order-assist">拖动姓名左侧手柄调整人员顺序，成员管理同步。也可聚焦手柄按空格开始，用上下方向键选择位置，回车或空格保存，Escape 取消。筛选时仅调整可见成员，其他成员位置保持。</p>
@@ -910,11 +949,11 @@ watch([generating, cancelling], async () => {
                   <tr v-for="employee in employees" :key="employee.id" :data-employee-id="employee.id" :data-drop-position="employeeReorder.dropPosition(employee.id)" :class="{ 'is-reordering': employeeReorder.sourceId.value === employee.id }">
                     <th class="sp-person-col"><div class="sp-person"><button type="button" class="sp-employee-drag-handle" :data-drag-employee-id="employee.id" :aria-label="`调整${employee.name}的显示顺序`" aria-describedby="employee-order-help" :aria-pressed="employeeReorder.sourceId.value === employee.id" title="拖动调整顺序；空格开始，上下键移动，回车保存，Escape 取消" :disabled="!canReorderEmployees || employees.length < 2" @pointerdown="employeeReorder.pointerdown(employee.id, employee.name, $event)" @keydown="employeeReorder.keydown(employee.id, employee.name, $event)" @click.stop.prevent><svg viewBox="0 0 16 20" width="16" height="20" aria-hidden="true" focusable="false"><g fill="currentColor"><circle cx="5" cy="5" r="1.4"/><circle cx="11" cy="5" r="1.4"/><circle cx="5" cy="10" r="1.4"/><circle cx="11" cy="10" r="1.4"/><circle cx="5" cy="15" r="1.4"/><circle cx="11" cy="15" r="1.4"/></g></svg></button><EmployeeAvatar class="sp-person-avatar" :name="employee.name" :color="employee.color" :avatar="employee.avatar" size="small" /><span><strong>{{ employee.name }}</strong><small>{{ employee.role }} · {{ employee.group }}</small></span></div></th>
                     <td v-for="date in visibleDates" :key="date" :class="{ 'sp-current-day': date === today }">
-                      <button class="sp-shift-cell" :class="{ 'is-off': !findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date), 'is-leave': leave(employee,date), 'has-allowance': (dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0 }" :style="findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date) ? { background: findShift(entry(employee.id,date)!.shiftId)!.color } : {}" :aria-label="`${employee.name} ${date} ${leave(employee,date) ? '请假' : findShift(entry(employee.id,date)?.shiftId || '')?.name || '休息'}，点击编辑`" :aria-description="allowanceDescription(employee.id,date)" :title="allowanceDescription(employee.id,date)" @click="openCell(employee,date)">
+                      <button class="sp-shift-cell" :class="{ 'is-off': !findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date), 'is-leave': leave(employee,date), 'has-allowance': (dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0 }" :style="findShift(entry(employee.id,date)?.shiftId || '') && !leave(employee,date) ? { background: findShift(entry(employee.id,date)!.shiftId)!.color } : {}" :aria-label="`${employee.name} ${date} ${cellLabel(employee,date)}，点击编辑`" :aria-description="allowanceDescription(employee.id,date)" :title="allowanceDescription(employee.id,date)" @click="openCell(employee,date)">
                         <template v-if="leave(employee,date)"><span>请假</span><small>全天休假</small></template>
                         <template v-else-if="findShift(entry(employee.id,date)?.shiftId || '')"><span>{{ findShift(entry(employee.id,date)!.shiftId)!.name }}<Icon v-if="entry(employee.id,date)?.locked" name="lock" :size="10" /></span><small>{{ findShift(entry(employee.id,date)!.shiftId)!.start }}–{{ findShift(entry(employee.id,date)!.shiftId)!.end }}</small></template>
                         <template v-else-if="dayAllowance(employee.id,date)?.carriedShiftIds.length"><span>跨夜续班</span><small>来自前一天排班</small></template>
-                        <template v-else><span>休息 <Icon v-if="entry(employee.id,date)?.locked" name="lock" :size="10" /></span><small class="sp-off-add">＋ 调整班次</small></template>
+                        <template v-else><span>{{ emptyCellLabel(employee.id,date) }} <Icon v-if="entry(employee.id,date)?.locked" name="lock" :size="10" /></span><small class="sp-off-add">＋ 调整班次</small></template>
                         <span v-if="(dayAllowance(employee.id,date)?.totalAllowance ?? 0) > 0" class="sp-allowance-badge" :data-allowance="dayAllowance(employee.id,date)!.totalAllowance" :data-allowance-date="date" :data-allowance-employee="employee.id">＋¥{{ money(dayAllowance(employee.id,date)!.totalAllowance) }}</span>
                       </button>
                     </td>
@@ -924,7 +963,7 @@ watch([generating, cancelling], async () => {
                   <tr v-if="!employees.length"><td :colspan="visibleDates.length+3" class="sp-empty">没有找到成员，请修改筛选条件或添加成员。</td></tr>
                 </tbody>
                 <tfoot>
-                  <tr><th class="sp-person-col">每日覆盖<small class="sp-coverage-caption"><span>已安排 / 最低人数</span><InfoTip label="最低安排人数说明"><strong>规则要求的每日最低安排人数</strong><p>将各班次的“每日最少”或“每日固定”人数相加，当前每天至少安排 {{ requiredPerDay }} 人。</p><p>实际增派只增加左侧“已安排”，不会抬高右侧最低人数。固定班次仍须恰好满足，各班次不能相互抵消缺口。</p><p>均按当天全团队统计，不随成员筛选变化。个人月／周最低工时另行检查。</p></InfoTip></small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
+                  <tr><th class="sp-person-col">每日覆盖<small class="sp-coverage-caption"><span>已安排 / 最低人数</span><InfoTip label="最低安排人数说明"><strong>规则要求的每日最低安排人数</strong><p>将各班次的“每日最少”或“每日固定”人数相加，当前每天至少安排 {{ requiredPerDay }} 人。</p><p>实际增派只增加左侧“已安排”，不会抬高右侧最低人数。固定班次仍须恰好满足，各班次不能相互抵消缺口。</p><p>均按当天全团队统计，不随成员筛选变化。个人周最低工时另行检查。</p></InfoTip></small></th><td v-for="date in visibleDates" :key="date"><span :class="dailyCovered(date) ? 'sp-text-green' : 'sp-text-amber'">{{ dailyFilled(date) }} <small>/ {{ requiredPerDay }}</small></span></td><td class="sp-hours-col">{{ totalHours }} h</td><td class="sp-allowance-col">—</td></tr>
                   <tr class="sp-allowance-footer"><th class="sp-person-col">津贴合计<small>当前筛选成员</small></th><td v-for="date in visibleDates" :key="date">¥{{ payrollError ? '—' : money(dailyAllowanceTotal(date)) }}</td><td class="sp-hours-col">当月汇总 →</td><td class="sp-allowance-col" :data-allowance-total="payrollError ? null : filteredAllowanceTotal"><strong>¥{{ payrollError ? '—' : money(filteredAllowanceTotal) }}</strong></td></tr>
                 </tfoot>
               </table>
@@ -953,7 +992,7 @@ watch([generating, cancelling], async () => {
       </section>
     </div>
 
-    <ConfirmDialog v-if="calendarReset" :title="`恢复 ${calendarReset.date} 的默认日期类型？`" description="将删除这一天的手动日期设置，恢复系统日历判定；可能改变所在月份的自动参考工时。已有排班保持不变。" confirm-label="确认恢复" @cancel="calendarReset = null" @confirm="confirmCalendarReset" />
+    <ConfirmDialog v-if="calendarReset" :title="`恢复 ${calendarReset.date} 的默认日期类型？`" description="将删除这一天的手动日期设置，恢复系统日历判定。已有排班保持不变。" confirm-label="确认恢复" @cancel="calendarReset = null" @confirm="confirmCalendarReset" />
 
     <div v-if="editing" class="sp-overlay" @click.self="editing = null"><section class="sp-modal" role="dialog" aria-modal="true" aria-labelledby="sp-edit-title"><div class="sp-modal-heading"><div><h2 id="sp-edit-title">调整班次</h2><p>{{ editing.employee.name }} · {{ editing.date }} · 周{{ weekday(editing.date) }}</p></div><button class="sp-icon-button" aria-label="关闭班次编辑" @click="editing = null"><Icon name="close" /></button></div><div class="sp-shift-options"><button v-for="s in state.shifts" :key="s.id" :disabled="!editing.employee.eligibleShiftIds.includes(s.id)" :class="{ selected: editing.shiftId === s.id }" @click="editing.shiftId = s.id"><span class="sp-shift-swatch" :style="{ background: s.color }">{{ s.shortName }}</span><span><strong>{{ s.name }}</strong><small>{{ s.start }}–{{ s.end }} · {{ shiftHours(s) }} 小时{{ editing.employee.eligibleShiftIds.includes(s.id) ? '' : ' · 未获得该班资格' }}</small></span><Icon v-if="editing.shiftId === s.id" name="check" /></button><button :class="{ selected: editing.shiftId === 'off' }" @click="editing.shiftId = 'off'"><span class="sp-shift-swatch">休</span><span><strong>安排休息</strong><small>锁定后，自动排班不会占用这一天</small></span></button><button :class="{ selected: editing.shiftId === 'leave' }" @click="editing.shiftId = 'leave'"><span class="sp-shift-swatch sp-leave-swatch">假</span><span><strong>全天请假</strong><small>作为不可排班日期保存</small></span></button></div><div class="sp-edit-allowance" role="note"><strong>已保存排班的当日津贴</strong><p>{{ allowanceDescription(editing.employee.id, editing.date) }}</p><small>保存班次调整后会重新计算。</small></div><label v-if="editing.shiftId !== 'leave'" class="sp-lock-toggle"><input v-model="editing.locked" type="checkbox" /><Icon name="lock" :size="15" /><span>锁定本次安排，重新排班时保留</span></label><div class="sp-modal-actions"><button class="sp-button" @click="editing = null">取消</button><button class="sp-button sp-primary" @click="saveCell">保存安排</button></div></section></div>
 
@@ -979,7 +1018,7 @@ watch([generating, cancelling], async () => {
         <template v-else>
         <div class="sp-generation-summary"><Icon name="spark" :size="35" /><div><strong>{{ state.employees.length }} 位成员 · {{ state.shifts.length }} 个班次</strong><p>需求 {{ coverage.total }} 个班位 · 保留 {{ lockedCount }} 项锁定安排</p></div></div>
         <p class="sp-modal-copy">按成员工时、请假和已设置规则重新安排本月未锁定班次。每日最少人数可增派；每日固定人数须恰好满足。</p>
-        <div v-if="openingWeekInfo" class="sp-opening-week-note" role="note" aria-label="月初跨周排班说明" :data-history-included="openingWeekInfo.included"><strong>{{ openingWeekInfo.title }}</strong><span v-if="openingWeekInfo.range" class="sp-opening-week-range">{{ openingWeekInfo.range }}</span><p>{{ openingWeekInfo.summary }}</p></div>
+        <BoundaryWeekNotice :state="state" />
         <template v-if="desktop">
           <div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>{{ engineState === 'ready' ? '已准备就绪' : engineState === 'error' ? '暂时无法排班' : '正在准备' }}</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div>
           <p v-if="engineDiagnostic" class="sp-solver-diagnostic">请先重试；仍然无法使用时，可重新打开应用或更新到最新版本。</p>

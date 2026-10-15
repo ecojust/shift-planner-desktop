@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeBundleScheduleFixtures, verifyScheduleFixtures } from '../../scripts/verify-desktop-bundle.mjs';
-import { datesOfMonth, generateSchedule, validateSchedule } from '../scheduler.ts';
+import { BUNDLE_REFERENCE_DATE, makeBundleScheduleFixtures, verifyScheduleFixtures } from '../../scripts/verify-desktop-bundle.mjs';
+import { datesOfMonth, generateSchedule, validateBoundaryPreview } from '../scheduler.ts';
 
 // Controlled responses exercise the verifier's acceptance rules without adding
 // a Python installation requirement to the frontend test suite. Native CI calls
@@ -9,9 +9,10 @@ import { datesOfMonth, generateSchedule, validateSchedule } from '../scheduler.t
 function response(request) {
   const common = { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', stats: { shortageCount: 0 } };
   if (request.requestId.endsWith('-reference')) return { ...common, status: 'INFEASIBLE', issues: [{ type: 'weekly-fixed-capacity' }] };
-  const schedule = generateSchedule(request.state, 1010);
+  assert.equal(request.options.referenceDate, BUNDLE_REFERENCE_DATE);
+  const schedule = generateSchedule(request.state, 1010, undefined, { referenceDate: request.options.referenceDate });
   assert.equal(schedule.success, true);
-  return { ...common, status: 'FEASIBLE', assignments: schedule.assignments };
+  return { ...common, status: 'FEASIBLE', assignments: schedule.assignments, boundaryPreview: schedule.boundaryPreview, boundaryContext: schedule.boundaryContext };
 }
 function runner(change = () => {}) {
   return async request => {
@@ -32,7 +33,11 @@ test('bundle fixtures distinguish minimum staffing from genuinely impossible wee
   assert.equal(weighted.employees.length, 2);
   assert.ok(weighted.employees.every(employee => employee.minHoursPerWeek === 14));
   assert.deepEqual(weighted.rules.weekdayWeights, { days: [6, 7], percent: 40 });
-  for (const state of [coverage, reference, weighted]) assert.deepEqual(state.assignments, []);
+  for (const state of [coverage, reference]) assert.deepEqual(state.assignments, []);
+  assert.deepEqual(coverage.scheduleCoverage['2026-09'].employeeIds, coverage.employees.map(employee => employee.id));
+  assert.equal(weighted.assignments.length, 5);
+  assert.equal(weighted.assignments.filter(item => item.date === '2026-11-01').length, 2);
+  for (const month of ['2026-09', '2026-11']) assert.deepEqual(weighted.scheduleCoverage[month].employeeIds, weighted.employees.map(employee => employee.id));
 });
 
 test('bundle verifier checks daily staffing minimums and actual weighted totals rather than fixed capacity', async () => {
@@ -44,6 +49,9 @@ test('bundle verifier checks daily staffing minimums and actual weighted totals 
     }
   }
   assert.deepEqual(checked.independentRuleIssues, []);
+  assert.equal(checked.constraintChecks.futureBoundary.referenceDate, BUNDLE_REFERENCE_DATE);
+  assert.ok(checked.constraintChecks.futureBoundary.provisionalAssignmentCount >= 5);
+  assert.equal(checked.constraintChecks.futureBoundary.persistedOutsideAssignmentCount, 0);
   assert.equal(checked.constraintChecks.defaultReference.status, 'INFEASIBLE');
   assert.equal(checked.constraintChecks.defaultReference.fixtureKind, 'impossible-weekly-fixed-capacity');
   assert.equal(checked.constraintChecks.defaultReference.minimumWeeklyHoursPerEmployee, 40);
@@ -57,11 +65,9 @@ test('bundle verifier checks daily staffing minimums and actual weighted totals 
     assert.ok(week.fullWeekCountCandidates.length > 0);
     assert.equal(week.totalTarget, week.assignmentCount);
     assert.equal(week.selectedTarget, week.selectedCount);
-    // Complete weeks apply the configured percentage to the actual total.
-    if (['2026-10-05', '2026-10-12', '2026-10-19'].includes(week.week)) {
-      assert.equal(week.selectedCount, Math.ceil(week.assignmentCount * .4));
-      assert.ok(week.fullWeekCountCandidates.includes(week.assignmentCount));
-    }
+    // Every touching week, including both month boundaries, is complete.
+    assert.equal(week.selectedCount, Math.ceil(week.assignmentCount * .4));
+    assert.deepEqual(week.fullWeekCountCandidates, [week.assignmentCount]);
   }
   assert.equal(weighted.weeklyHours.length, 10);
   assert.ok(weighted.weeklyHours.every(week => week.minutes >= week.minimumMinutes && week.minutes <= week.maximumMinutes));
@@ -85,7 +91,7 @@ test('infeasible reference models cannot return a replacement roster', async () 
 test('a claimed weighted success is rejected when returned assignments violate employee rules', async () => {
   await assert.rejects(verifyScheduleFixtures(runner((request, result) => {
     if (request.requestId.endsWith('-weighted')) {
-      result.assignments = result.assignments.map(item => ({ ...item, employeeId: request.state.employees[0].id }));
+      result.assignments = result.assignments.map(item => item.date.startsWith(`${request.state.month}-`) ? { ...item, employeeId: request.state.employees[0].id } : item);
     }
   }), 'regression'), /Actual app schedule must pass independent TypeScript rules/);
 });
@@ -99,7 +105,7 @@ test('bundle verifier accepts an otherwise valid assignment above a daily minimu
         for (const employee of request.state.employees) {
           const assignment = { employeeId: employee.id, date, shiftId: shift.id, locked: false };
           const assignments = [...result.assignments, assignment];
-          if (!validateSchedule({ ...request.state, assignments }).length) {
+          if (!validateBoundaryPreview({ ...request.state, assignments }, result.boundaryPreview, request.options.referenceDate).length) {
             result.assignments = assignments;
             added = assignment;
             return;
@@ -113,6 +119,26 @@ test('bundle verifier accepts an otherwise valid assignment above a daily minimu
   const shift = checked.state.shifts.find(item => item.id === added.shiftId);
   assert.ok(checked.result.assignments.filter(item => item.date === added.date && item.shiftId === added.shiftId).length > shift.required);
   assert.deepEqual(checked.independentRuleIssues, []);
+});
+
+test('future provisional coverage must be present and independently valid', async () => {
+  for (const change of [result => { delete result.boundaryPreview; }, result => { result.boundaryPreview = []; }]) {
+    await assert.rejects(verifyScheduleFixtures(runner((request, result) => {
+      if (request.requestId.endsWith('-coverage')) change(result);
+    }), 'regression'), /boundary preview|independent TypeScript rules/);
+  }
+});
+
+test('provisional neighboring assignments cannot be published in the saved result', async () => {
+  await assert.rejects(verifyScheduleFixtures(runner((request, result) => {
+    if (request.requestId.endsWith('-coverage')) result.assignments.push(result.boundaryPreview[0]);
+  }), 'regression'), /must never be published/);
+});
+
+test('confirmed next-month work remains immutable during complete-week validation', async () => {
+  await assert.rejects(verifyScheduleFixtures(runner((request, result) => {
+    if (request.requestId.endsWith('-weighted')) result.assignments = result.assignments.filter(item => item.date !== '2026-11-01');
+  }), 'regression'), /must never be published/);
 });
 
 test('an adequate monthly total cannot hide a missing daily shift', async () => {

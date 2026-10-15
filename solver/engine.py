@@ -138,7 +138,7 @@ def _hours_text(minutes: int):
 
 
 def weekday_targets(config, days, full_total):
-    """Project a variable full-week budget into this month, without renormalizing."""
+    """Project a full-week budget onto known/plannable days, without renormalizing."""
     chosen = set(config['days'])
     selected = [day for day in days if dt.date.fromordinal(day).weekday() + 1 in chosen]
     others = [day for day in days if day not in selected]
@@ -164,12 +164,13 @@ def validate_request(request):
     first = _date(month + '-01')
     d = dt.date.fromordinal(first)
     dates = list(range(first, first + calendar.monthrange(d.year, d.month)[1]))
+    horizon_length = len(dates) + d.weekday() + 6 - dt.date.fromordinal(dates[-1]).weekday()
     employees = _list(state.get('employees'), '员工', MAX_EMPLOYEES)
     shifts = _list(state.get('shifts'), '班次', MAX_SHIFTS)
     assignments = _list(state.get('assignments'), '排班记录', MAX_ASSIGNMENTS)
     if not employees or not shifts:
         raise InvalidInput('请至少设置一名员工和一个班次。')
-    if len(employees) * len(shifts) * len(dates) > MAX_VARIABLES:
+    if len(employees) * len(shifts) * horizon_length > MAX_VARIABLES:
         raise InvalidInput('模型规模超过上限，请缩减员工或班次数量。')
     rules = _obj(state.get('rules'), '规则')
     _num(rules.get('minRestHours'), '最短休息小时数', 0, 168)
@@ -248,7 +249,7 @@ def validate_request(request):
             raise InvalidInput('互斥分组含不存在或重复的员工。')
         if any(not isinstance(x, str) or x not in shift_ids for x in selected) or len(set(selected)) != len(selected):
             raise InvalidInput('互斥分组含不存在或重复的班次。')
-        group_budget += len(members) * max(1, len(selected) or len(shifts)) * len(dates)
+        group_budget += len(members) * max(1, len(selected) or len(shifts)) * horizon_length
     if group_budget > 2_000_000:
         raise InvalidInput('互斥分组约束过多，请合并重复分组。')
     for assignment in assignments:
@@ -260,7 +261,20 @@ def validate_request(request):
         _date(assignment.get('date'))
         if not isinstance(assignment.get('locked'), bool):
             raise InvalidInput('排班锁定标记必须为布尔值。')
+    coverage = _obj(state.get('scheduleCoverage', {}), '排班确认范围')
+    if len(coverage) > 3612:
+        raise InvalidInput('排班确认月份过多。')
+    for key, item in coverage.items():
+        if not isinstance(key, str) or len(key) != 7:
+            raise InvalidInput('排班确认月份必须为 YYYY-MM。')
+        _date(key + '-01')
+        _obj(item, '排班确认范围')
+        ids = _list(item.get('employeeIds'), '已确认成员', MAX_EMPLOYEES)
+        if any(not isinstance(eid, str) or eid not in employee_ids for eid in ids) or len(set(ids)) != len(ids):
+            raise InvalidInput('排班确认范围含不存在或重复的成员。')
     options = _obj(request.get('options', {}), '求解选项')
+    if 'referenceDate' in options:
+        _date(options['referenceDate'])
     _num(options.get('timeLimitSeconds', 15), '求解时限', 0.01, 60)
     _num(options.get('seed', 1010), '随机种子', 0, 2147483647, True)
     if not isinstance(options.get('allowPartial', False), bool):
@@ -271,6 +285,9 @@ def validate_request(request):
 def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) -> dict:
     began = time.monotonic()
     solution_counter = None
+    boundary_context = None
+    boundary_preview = []
+    boundary_issues = []
     request_id = request.get('requestId', '') if isinstance(request, dict) else ''
     if not isinstance(request_id, str):
         request_id = ''
@@ -285,6 +302,23 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
         result = {'protocolVersion': 1, 'requestId': request_id, 'engine': ENGINE, 'status': status, 'issues': issues or [], 'stats': stats, 'message': message}
         if assignments is not None:
             result['assignments'] = assignments
+            result['boundaryPreview'] = boundary_preview
+            result['boundaryContext'] = boundary_context
+            result['issues'].extend(boundary_issues)
+            preview_counts = defaultdict(int)
+            for record in assignments + boundary_preview:
+                if record['shiftId'] != 'off':
+                    preview_counts[(record['date'], record['shiftId'])] += 1
+            for day in coverage_dates:
+                if day in active:
+                    continue
+                date = dt.date.fromordinal(day).isoformat()
+                for shift in shifts:
+                    missing = shift['required'] - preview_counts[(date, shift['id'])]
+                    if missing > 0:
+                        result['issues'].append({'id': f'boundary-coverage-{date}-{shift["id"]}',
+                            'type': 'boundary-coverage', 'severity': 'warning', 'date': date,
+                            'message': f'{date} 的月外临时衔接安排中，{shift.get("name", shift["id"])}仍缺 {missing} 人；本次已允许缺员，临时安排未写入相邻月份。'})
         return result
 
     try:
@@ -305,54 +339,85 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
         weekly_minimums = {e['id']: _minutes(e.get('minHoursPerWeek', 0), ROUND_CEILING) for e in employees}
         active = set(dates)
         month_start, month_end = dates[0] * DAY, (dates[-1] + 1) * DAY
-        week_days = defaultdict(int)
-        week_dates = defaultdict(list)
-        for day in dates:
-            week = day - dt.date.fromordinal(day).weekday()
-            week_days[week] += 1
-            week_dates[week].append(day)
+        reference_day = _date(options.get('referenceDate', dt.date.today().isoformat()))
         first_week = dates[0] - dt.date.fromordinal(dates[0]).weekday()
-        previous_month_end = dt.date.fromordinal(dates[0]) - dt.timedelta(days=1)
-        previous_month_start = previous_month_end.replace(day=1).toordinal()
-        has_previous_month = any(a['employeeId'] in emap and previous_month_start <= _date(a['date']) < dates[0]
-                                 for a in state['assignments'])
-        complete_first_week = first_week < dates[0] and has_previous_month
-        # Known prior-month cells, including rest, make the first natural week
-        # complete. Sparse historical blanks stay zero and are never variables.
-        weighted_week_dates = {week: list(days) for week, days in week_dates.items()}
-        if complete_first_week:
-            weighted_week_dates[first_week] = list(range(first_week, first_week + 7))
+        last_week = dates[-1] - dt.date.fromordinal(dates[-1]).weekday()
+        planning_dates = list(range(first_week, last_week + 7))
+        planning = set(planning_dates)
+        week_dates = {week: list(range(week, week + 7)) for week in range(first_week, last_week + 1, 7)}
+        fixed = [copy.deepcopy(a) for a in state['assignments'] if a['locked'] or _date(a['date']) not in active]
+        existing_cells = {(a['employeeId'], _date(a['date'])) for a in fixed}
+        confirmed = {month: set(item['employeeIds']) for month, item in state.get('scheduleCoverage', {}).items()}
+        unknown_history = {eid: set() for eid in emap}
+        variable_dates = {eid: set(dates) for eid in emap}
+        known_blank_cells = set()
+        incomplete = []
+        for eid in emap:
+            for day in planning_dates:
+                if day in active or (eid, day) in existing_cells:
+                    continue
+                month_key = dt.date.fromordinal(day).strftime('%Y-%m')
+                if eid in confirmed.get(month_key, set()):
+                    known_blank_cells.add((eid, day))
+                elif day >= reference_day:
+                    variable_dates[eid].add(day)
+                else:
+                    unknown_history[eid].add(day)
+            for week, days in week_dates.items():
+                missing = sorted(unknown_history[eid].intersection(days))
+                if missing:
+                    incomplete.append({'employeeId': eid, 'weekStart': dt.date.fromordinal(week).isoformat(),
+                                       'unknownDates': [dt.date.fromordinal(day).isoformat() for day in missing]})
+        boundary_context = {'startDate': dt.date.fromordinal(first_week).isoformat(),
+                            'endDate': dt.date.fromordinal(last_week + 6).isoformat(),
+                            'referenceDate': dt.date.fromordinal(reference_day).isoformat(),
+                            'incompleteHistory': incomplete}
+        for item in incomplete:
+            boundary_issues.append({'id': f'history-incomplete-{item["employeeId"]}-{item["weekStart"]}',
+                'type': 'history-incomplete', 'severity': 'warning', 'employeeId': item['employeeId'], 'date': item['weekStart'],
+                'message': f'{emap[item["employeeId"]].get("name", item["employeeId"])}在 {item["weekStart"]} 起的自然周有 {len(item["unknownDates"])} 天历史排班未知；没有将这些日期当作休息或补排。周最低仅按可核对天数折算，此周尚未通过完整周校验。'})
+        # Unknown past cells cannot be invented. Team weekday counts require a
+        # fully known/plannable day; individual known work still counts below.
+        weighted_week_dates = {week: [day for day in days if not any(day in unknown_history[eid] for eid in emap)]
+                               for week, days in week_dates.items()}
+        coverage_dates = [day for day in planning_dates if day in active or day >= reference_day]
+        coverage_active = set(coverage_dates)
         weights = state['rules'].get('weekdayWeights')
         non_consecutive_shifts = state['rules'].get('nonConsecutiveShifts', [])
         weekly_shift_limits = state['rules'].get('weeklyShiftLimits', [])
         allow_partial = options.get('allowPartial', False)
         weighted_weeks = {week: weekday_targets(weights, days, 0)[:2] for week, days in weighted_week_dates.items()} if weights else {}
-        weekly_prorated_targets = {eid: {week: (minutes * days + 6) // 7 for week, days in week_days.items()} for eid, minutes in weekly_minimums.items()}
-        fixed = [copy.deepcopy(a) for a in state['assignments'] if a['locked'] or _date(a['date']) not in active]
+        weekly_targets = {eid: {week: (minutes * (7 - len(unknown_history[eid].intersection(days))) + 6) // 7
+                               for week, days in week_dates.items()} for eid, minutes in weekly_minimums.items()}
+        # Records beyond this context are preserved, but unrelated historic
+        # errors cannot make this month's generation infeasible. A full next
+        # week is retained for Sunday's overnight upper-bound accounting.
+        context_days = max(consecutive, (rest + DAY - 1) // DAY + 1, 7)
+        relevant_fixed = [a for a in fixed if first_week - context_days <= _date(a['date']) <= last_week + 6 + context_days]
         fixed_cells = {}
         fixed_work = defaultdict(list)
         fixed_days = defaultdict(set)
         fixed_weeks = defaultdict(lambda: defaultdict(int))
-        fixed_month_weeks = defaultdict(lambda: defaultdict(int))
         fixed_current_minutes = defaultdict(int)
         fixed_coverage = defaultdict(set)
         fixed_shift_days = defaultdict(set)
         fixed_weekly_shift_counts = defaultdict(int)
+        fixed_relevant_weeks = {eid: set(week_dates) for eid in emap}
         conflicts = []
-        for a in fixed:
+        for a in relevant_fixed:
             eid, sid, day = a['employeeId'], a['shiftId'], _date(a['date'])
             cell = (eid, day)
-            if cell in fixed_cells:
+            if cell in fixed_cells and day in planning:
                 conflicts.append(problem('duplicate', f'{a["date"]} {emap[eid].get("name", eid)}有多条固定排班（含锁定休息）。', '在排班日历保留该员工当天的一条安排，解除或删除重复固定记录。', 'calendar', date=a['date'], employeeId=eid))
             fixed_cells[cell] = a
             if sid == 'off':
                 continue
             start_clock, duration = shift_times[sid]
             start, end = day * DAY + start_clock, day * DAY + start_clock + duration
-            if sid not in emap[eid]['eligibleShiftIds']:
+            if day in planning and sid not in emap[eid]['eligibleShiftIds']:
                 conflicts.append(problem('qualification', f'{a["date"]} {emap[eid].get("name", eid)}已固定上{smap[sid].get("name", sid)}，但该成员未勾选此班次资格。', '确认成员可上班次，或在排班日历解除/更换此固定安排；月外历史也会参与校验。', 'team', date=a['date'], employeeId=eid, shiftId=sid))
             overlapping_leave = [dt.date.fromordinal(x).isoformat() for x in range(start // DAY, (end - 1) // DAY + 1) if x in leave[eid]]
-            if overlapping_leave:
+            if overlapping_leave and (day in planning or day + 1 in planning):
                 conflicts.append(problem('unavailable', f'{a["date"]} {emap[eid].get("name", eid)}的固定{smap[sid].get("name", sid)}与 {"、".join(overlapping_leave)} 的整日请假重叠（包含跨夜部分）。', '核实请假日期，或解除/调整与请假重叠的固定班次。', 'team', date=a['date'], employeeId=eid, shiftId=sid))
             fixed_work[eid].append((start, end, a))
             fixed_days[eid].add(day)
@@ -363,46 +428,33 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                 fixed_shift_days[(eid, sid)].add(day)
             for week, minutes in week_parts(start, end):
                 fixed_weeks[eid][week] += minutes
+                if day in planning:
+                    fixed_relevant_weeks[eid].add(week)
             fixed_current_minutes[eid] += overlap_minutes(start, end, month_start, month_end)
-            for week, minutes in week_parts(max(start, month_start), min(end, month_end)):
-                fixed_month_weeks[eid][week] += minutes
-        # Complete the first natural week's minimum when prior-month data is
-        # known. Other month boundaries keep the partial-month allowance.
-        # The two minute totals split every fixed interval exactly: a carry-in
-        # tail is current-month work, not a second outside credit. Candidates'
-        # outgoing overnight tails cannot change this precomputed requirement.
-        known_outside_week_minutes = {eid: {week: fixed_weeks[eid][week] - fixed_month_weeks[eid][week]
-                                           for week in week_days} for eid in emap}
-        weekly_targets = {eid: {week: (max(0, weekly_minimums[eid] - known_outside_week_minutes[eid][week])
-                                      if complete_first_week and week == first_week else
-                                      min(prorated, max(0, weekly_minimums[eid] - known_outside_week_minutes[eid][week])))
-                                for week, prorated in weekly_prorated_targets[eid].items()} for eid in emap}
+        for eid, day in known_blank_cells:
+            fixed_cells[(eid, day)] = {'employeeId': eid, 'date': dt.date.fromordinal(day).isoformat(), 'shiftId': 'off', 'locked': False}
 
         def weekly_requirement(eid, week):
-            context = ('上月已有排班记录，首自然周按完整周补足最低工时（不再以本月折算值封顶）；'
-                       if complete_first_week and week == first_week else
-                       '未找到上月排班记录，首周保留按本月天数折算的最低工时；'
-                       if week == first_week and first_week < dates[0] else '')
-            return (context + f'周最低 {_hours_text(weekly_minimums[eid])} 小时，本月 {week_days[week]} 天原折算 '
-                    f'{_hours_text(weekly_prorated_targets[eid][week])} 小时（按分钟向上取整）；'
-                    f'该周月外已排 {_hours_text(known_outside_week_minutes[eid][week])} 小时，'
-                    f'因此本月实际最低要求为 {_hours_text(weekly_targets[eid][week])} 小时')
+            missing = len(unknown_history[eid].intersection(week_dates[week]))
+            context = (f'有 {missing} 天历史未知，仅按其余 {7 - missing} 天折算，不能视为完整周通过；' if missing else
+                       '按周一至周日完整自然周校验，合并相邻月份已确认安排与临时预排；')
+            return context + f'周最低 {_hours_text(weekly_minimums[eid])} 小时，本周实际最低要求 {_hours_text(weekly_targets[eid][week])} 小时，已知固定工作 {_hours_text(fixed_weeks[eid][week])} 小时'
 
         for eid in emap:
             work = sorted(fixed_work[eid], key=lambda item: (item[0], item[1]))
             for previous, current in zip(work, work[1:]):
-                if current[0] < previous[1] + rest:
+                if current[0] < previous[1] + rest and (_date(previous[2]['date']) in planning or _date(current[2]['date']) in planning):
                     interval = current[0] - previous[1]
                     gap = f'间隔仅 {_hours_text(interval)} 小时' if interval >= 0 else f'时间重叠 {_hours_text(-interval)} 小时'
                     conflicts.append(problem('rest', f'{emap[eid].get("name", eid)}的固定安排 {previous[2]["date"]} {smap[previous[2]["shiftId"]].get("name", previous[2]["shiftId"])} → {current[2]["date"]} {smap[current[2]["shiftId"]].get("name", current[2]["shiftId"])}，{gap}，要求至少休息 {_hours_text(rest)} 小时。', '调整这两次安排中的至少一次；先核对时间与锁定记录，确实允许更短休息时再修改休息规则。', 'calendar', employeeId=eid, date=current[2]['date']))
             for week, value in fixed_weeks[eid].items():
-                if value > caps[eid]:
+                if week in fixed_relevant_weeks[eid] and value > caps[eid]:
                     conflicts.append(problem('weekly-hours', f'{emap[eid].get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，固定安排已有 {_hours_text(value)} 小时，超过周上限 {_hours_text(caps[eid])} 小时（含跨月实际工时）。', f'至少减少该周 {_hours_text(value - caps[eid])} 小时的固定工作，或确认并调整成员周最高工时。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
             run, last = 0, -10000
             for day in sorted(fixed_days[eid]):
                 run = run + 1 if day == last + 1 else 1
-                if run == consecutive + 1:
-                    conflicts.append(problem('consecutive-days', f'{emap[eid].get("name", eid)}在 {dt.date.fromordinal(day - consecutive).isoformat()} 至 {dt.date.fromordinal(day).isoformat()} 已连续固定上班 {run} 天，上限为 {consecutive} 天。', '在这段连续安排中解除至少一天固定工作并安排休息，或核实连续工作日上限。', 'calendar', employeeId=eid, date=dt.date.fromordinal(day).isoformat()))
+                if (run == consecutive + 1 or day == first_week and run > consecutive) and day >= first_week and day - consecutive <= last_week + 6:
+                    conflicts.append(problem('consecutive-days', f'{emap[eid].get("name", eid)}在 {dt.date.fromordinal(day - run + 1).isoformat()} 至 {dt.date.fromordinal(day).isoformat()} 已连续固定上班 {run} 天，上限为 {consecutive} 天。', '在这段连续安排中解除至少一天固定工作并安排休息，或核实连续工作日上限。', 'calendar', employeeId=eid, date=dt.date.fromordinal(day).isoformat()))
                 last = day
             # Shift-count rules use calendar start dates, including an overnight
             # Sunday's shift in Sunday's week. They intentionally do not share
@@ -411,7 +463,7 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                 sid = rule['shiftId']
                 shift_days = fixed_shift_days[(eid, sid)]
                 for day in sorted(shift_days):
-                    if day + 1 not in shift_days or (day not in active and day + 1 not in active):
+                    if day + 1 not in shift_days or (day not in planning and day + 1 not in planning):
                         continue
                     first_date = dt.date.fromordinal(day).isoformat()
                     second_date = dt.date.fromordinal(day + 1).isoformat()
@@ -433,13 +485,13 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             selected = set(group['shiftIds']) or set(smap)
             for (day, sid), staff in fixed_coverage.items():
                 overlap = staff & members
-                if sid in selected and len(overlap) > 1:
+                if day in planning and sid in selected and len(overlap) > 1:
                     names = '、'.join(str(emap[eid].get('name', eid))[:80] for eid in sorted(overlap)[:5]) + (f'等 {len(overlap)} 人' if len(overlap) > 5 else '')
                     group_name = str(group.get('name', group['id']))[:120]
                     conflicts.append(problem('separation', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}已固定安排 {names}，互斥组“{group_name}”要求他们同班最多 1 人。', '解除这些成员的同班锁定，或核对互斥分组的成员及适用班次。', 'rules', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
         for (day, sid), staff in fixed_coverage.items():
-            if day in active and smap[sid].get('staffingMode', 'minimum') == 'fixed' and len(staff) > smap[sid]['required']:
-                conflicts.append(problem('overstaffed', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}锁定排班有 {len(staff)} 人，超过每日固定人数 {smap[sid]["required"]}；允许缺员也不能突破固定人数上限。', f'解除至少 {len(staff) - smap[sid]["required"]} 人的该班锁定，或修改此班固定人数/人数模式。', 'calendar', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
+            if day in coverage_active and smap[sid].get('staffingMode', 'minimum') == 'fixed' and len(staff) > smap[sid]['required']:
+                conflicts.append(problem('overstaffed', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}固定排班有 {len(staff)} 人，超过每日固定人数 {smap[sid]["required"]}；允许缺员也不能突破固定人数上限。', f'解除至少 {len(staff) - smap[sid]["required"]} 人的该班锁定，或修改此班固定人数/人数模式。', 'calendar', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
@@ -451,7 +503,6 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
         cells = defaultdict(list)
         coverage = defaultdict(list)
         weekly = defaultdict(lambda: defaultdict(list))
-        month_weekly = defaultdict(lambda: defaultdict(list))
         total_minutes = defaultdict(list)
         shift_counts = defaultdict(list)
         fixed_current_shifts = defaultdict(int)
@@ -459,13 +510,12 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             check_time()
             eid = e['id']
             intervals = []
-            possible_weeks = dict(fixed_month_weeks[eid])
+            possible_weeks = dict(fixed_weeks[eid])
             for start, end, a in fixed_work[eid]:
-                intervals.append(model.new_fixed_size_interval_var(start, end - start + rest, f'fixed_{eid}_{a["date"]}'))
                 day = _date(a['date'])
                 if day in active:
                     fixed_current_shifts[(eid, a['shiftId'])] += 1
-            for day in dates:
+            for day in sorted(variable_dates[eid]):
                 if (eid, day) in fixed_cells:
                     continue
                 day_week_maximums = defaultdict(int)
@@ -490,11 +540,10 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                     coverage[(day, sid)].append(var)
                     month_minutes = overlap_minutes(start, end, month_start, month_end)
                     total_minutes[eid].append(month_minutes * var)
-                    shift_counts[(eid, sid)].append(var)
+                    if day in active:
+                        shift_counts[(eid, sid)].append(var)
                     for week, minutes in parts:
                         weekly[eid][week].append(minutes * var)
-                    for week, minutes in week_parts(max(start, month_start), min(end, month_end)):
-                        month_weekly[eid][week].append(minutes * var)
                         day_week_maximums[week] = max(day_week_maximums[week], minutes)
                     intervals.append(model.new_optional_fixed_size_interval_var(start, duration + rest, var, f'i_{eid}_{day}_{sid}'))
                 for week, minutes in day_week_maximums.items():
@@ -505,7 +554,7 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                 model.add_no_overlap(intervals)
             for rule in non_consecutive_shifts:
                 sid = rule['shiftId']
-                for day in range(dates[0] - 1, dates[-1] + 1):
+                for day in range(first_week - 1, last_week + 7):
                     terms = [x[(eid, candidate, sid)] for candidate in (day, day + 1) if (eid, candidate, sid) in x]
                     if not terms:
                         continue
@@ -532,57 +581,59 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             # Account for the whole week's cap, even if isolated candidates
             # would each fit. This remains an upper bound, not a promise that
             # rest/consecutive constraints allow all of these minutes.
-            possible_weeks = {week: min(possible_weeks.get(week, 0), max(0, caps[eid] - fixed_weeks[eid][week] + fixed_month_weeks[eid][week])) for week in week_days}
+            possible_weeks = {week: min(possible_weeks.get(week, 0), caps[eid]) for week in week_dates}
             for week, target in weekly_targets[eid].items():
                 if possible_weeks.get(week, 0) < target:
-                    conflicts.append(problem('weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，{weekly_requirement(eid, week)}，但现有班次、请假、固定安排和周上限下，本月最多不超过 {_hours_text(possible_weeks.get(week, 0))} 小时，至少相差 {_hours_text(target - possible_weeks.get(week, 0))} 小时。', '核对该成员这一周的可上班次、请假、锁定安排及最低/最高工时；月外已排工时已用于减去整周最低的剩余要求，也仍计入周上限。月内跨夜片段只计为本月完成量。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
-                diagnostics.track(model.add(sum(month_weekly[eid][week]) + fixed_month_weeks[eid][week] >= target), f'weekly-min-{eid}-{week}', problem(
+                    conflicts.append(problem('weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，{weekly_requirement(eid, week)}，但现有班次、请假、固定安排和周上限下，整周最多不超过 {_hours_text(possible_weeks.get(week, 0))} 小时，至少相差 {_hours_text(target - possible_weeks.get(week, 0))} 小时。', '核对该成员这一周的可上班次、请假、相邻月份已确认安排及最低/最高工时；相邻月份固定记录不会自动改写。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
+                diagnostics.track(model.add(sum(weekly[eid][week]) + fixed_weeks[eid][week] >= target), f'weekly-min-{eid}-{week}', problem(
                     'weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，{weekly_requirement(eid, week)}。',
-                    ('首周已有上月记录，本月须补足整周最低扣除月外已排后的非负余额；' if complete_first_week and week == first_week else
-                     '本月要求取原折算值与整周最低扣除月外已排后的非负余额中的较小值；') +
-                    '核对该成员可用班次与固定安排，完整班次不能拆成零散小时。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
-            for first_day in range(dates[0] - consecutive, dates[-1] + 1):
+                    '核对该成员可用班次与固定安排，完整班次不能拆成零散小时；月外临时预排仅用于验证可衔接性。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
+            for first_day in range(first_week - consecutive, last_week + 7):
                 last_day = first_day + consecutive
-                terms = [var for day in dates if first_day <= day <= last_day for var in cells[(eid, day)]]
+                terms = [var for day in planning_dates if first_day <= day <= last_day for var in cells[(eid, day)]]
                 prior = sum(first_day <= day <= last_day for day in fixed_days[eid])
                 if terms:
                     diagnostics.track(model.add(sum(terms) + prior <= consecutive), f'consecutive-{eid}', problem(
-                        'consecutive-days', f'{e.get("name", eid)}最多连续上班 {consecutive} 天；本月及相邻月份的固定工作日一并计入。',
+                        'consecutive-days', f'{e.get("name", eid)}最多连续上班 {consecutive} 天；本月、相邻月份的固定记录与临时预排一并计入。',
                         '为该成员留出休息日、让其他成员分担连续日期的需求，或核实连续工作天数上限。此条与同列要求组合冲突。', 'rules', employeeId=eid))
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
             return response('INFEASIBLE', '员工周最低工时无法达到，原排班未修改；允许缺员也不会放宽周最低工时。', conflicts)
         check_time()
-        conflicts = daily_capacity_issues(employees, shifts, dates, x, fixed_coverage, fixed_cells, leave, shift_times, fixed_work, fixed_weeks, caps, rest, state['rules'].get('separationGroups', []), allow_partial, check_time)
+        conflicts = daily_capacity_issues(employees, shifts, coverage_dates, x, fixed_coverage, fixed_cells, leave, shift_times, fixed_work, fixed_weeks, caps, rest, state['rules'].get('separationGroups', []), allow_partial, check_time)
         if not conflicts:
-            conflicts = weekday_capacity_issues(weights, weighted_week_dates, employees, shifts, x, fixed_coverage, allow_partial, weekday_targets, check_time, active)
+            conflicts = weekday_capacity_issues(weights, weighted_week_dates, employees, shifts, x, fixed_coverage, allow_partial, weekday_targets, check_time, coverage_active)
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
+                if item.get('date') and _date(item['date']) not in active and item['type'] != 'weekday-weight-capacity':
+                    item['message'] += ' 这是相邻月份的衔接日期；已有确认安排保持不变，不能自动补写已确认的休息日。'
             return response('INFEASIBLE', '已定位无法满足的人员或星期人数要求，原排班未修改。', conflicts)
-        # Aggregate weekly lower bounds versus fixed coverage upper bounds.
-        # Include prior Sunday's overnight minutes and actual month carry-in.
+        # A conservative whole-week capacity proof, including confirmed work
+        # and future boundary candidates. Unknown history contributes no made-up
+        # work and its minimum has already been prorated per employee.
         if all(s.get('staffingMode', 'minimum') == 'fixed' for s in shifts):
-            for week in week_days:
+            for week in week_dates:
                 check_time()
-                lower = max(month_start, week * DAY)
-                upper = min(month_end, (week + 7) * DAY)
-                capacity = sum(overlap_minutes(day * DAY + clock, day * DAY + clock + duration, lower, upper) * smap[sid]['required'] for day in dates for sid, (clock, duration) in shift_times.items()) + sum(overlap_minutes(start, end, lower, upper) for work in fixed_work.values() for start, end, a in work if _date(a['date']) not in active)
+                lower, upper = week * DAY, (week + 7) * DAY
+                capacity = sum(fixed_weeks[eid][week] for eid in emap)
+                for day in planning_dates:
+                    for sid, (clock, duration) in shift_times.items():
+                        candidates = sum((eid, day, sid) in x for eid in emap)
+                        seats = min(candidates, max(0, smap[sid]['required'] - len(fixed_coverage[(day, sid)])))
+                        capacity += seats * overlap_minutes(day * DAY + clock, day * DAY + clock + duration, lower, upper)
                 minimum = sum(weekly_targets[eid][week] for eid in emap)
                 if minimum > capacity:
-                    prorated = sum(weekly_prorated_targets[eid][week] for eid in emap)
-                    known_outside = sum(known_outside_week_minutes[eid][week] for eid in emap)
-                    context = '上月已有排班记录，首自然周按完整周补足最低工时；' if complete_first_week and week == first_week else ''
                     return response('INFEASIBLE', '这一周的固定班次容量不足以满足成员最低工时，原排班未修改。', [problem(
-                        'weekly-fixed-capacity', context + f'{dt.date.fromordinal(week).isoformat()} 起的自然周，本月 {week_days[week]} 天原折算最低工时合计 {_hours_text(prorated)} 小时，该周月外已排合计 {_hours_text(known_outside)} 小时；逐人扣减整周最低余额后，本月实际最低要求合计 {_hours_text(minimum)} 小时，固定班次人数最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时（按实际跨夜分钟计入）。',
-                        '增加对应班次固定人数、将适合的班次改为每日最少人数，或核实成员的周最低工时。', 'shifts', date=dt.date.fromordinal(max(week, dates[0])).isoformat())])
+                        'weekly-fixed-capacity', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，成员最低工时要求合计 {_hours_text(minimum)} 小时，已确认工作及可预排固定班次最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时（按实际跨夜分钟计入）。',
+                        '增加对应班次固定人数、将适合的班次改为每日最少人数，或核实成员的周最低工时及相邻月已确认安排。', 'shifts', date=dt.date.fromordinal(max(week, dates[0])).isoformat())])
         for group in state['rules'].get('separationGroups', []):
             check_time()
             member_names = [str(emap[eid].get('name', eid))[:80] for eid in group['employeeIds'][:5]]
             member_label = '、'.join(member_names) + (f'等 {len(group["employeeIds"])} 人' if len(group['employeeIds']) > 5 else '')
             group_label = f'互斥组“{str(group.get("name", group["id"]))[:120]}”（{member_label}）'
-            for day in dates:
+            for day in planning_dates:
                 check_time()
                 for sid in group['shiftIds'] or smap:
                     terms = [x[(eid, day, sid)] for eid in group['employeeIds'] if (eid, day, sid) in x]
@@ -591,17 +642,22 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                         diagnostics.track(model.add(sum(terms) + prior <= 1), f'separation-{group["id"]}-{day}-{sid}', problem(
                             'separation', f'{dt.date.fromordinal(day).isoformat()} {smap[sid].get("name", sid)}，{group_label}最多 1 人。',
                             '核对该互斥分组的成员与适用班次，或增加组外合格人员。此条与同列要求组合冲突。', 'rules', date=dt.date.fromordinal(day).isoformat(), shiftId=sid))
-        shortages = []
-        for day in dates:
+        current_shortages = []
+        boundary_shortages = []
+        for day in coverage_dates:
             for s in shifts:
                 target = max(0, int(s['required']) - len(fixed_coverage[(day, s['id'])]))
                 terms = coverage[(day, s['id'])]
                 fixed_staffing = s.get('staffingMode', 'minimum') == 'fixed'
-                detail = problem('coverage', f'{dt.date.fromordinal(day).isoformat()} {s.get("name", s["id"])}每日{"固定" if fixed_staffing else "最少"} {s["required"]} 人，其中已固定安排 {len(fixed_coverage[(day, s["id"])])} 人。' + (' 已允许缺员，但固定人数上限仍有效。' if allow_partial and fixed_staffing else ''),
+                boundary_note = (' 相邻月份衔接日期，已有确认安排不会自动改写。' if day not in active else '')
+                detail = problem('coverage', f'{dt.date.fromordinal(day).isoformat()} {s.get("name", s["id"])}每日{"固定" if fixed_staffing else "最少"} {s["required"]} 人，其中已固定安排 {len(fixed_coverage[(day, s["id"])])} 人。' + (' 已允许缺员，但固定人数上限仍有效。' if allow_partial and fixed_staffing else '') + boundary_note,
                     '核对该班每日人数和人数模式，或增加当日符合资格、休息及工时要求的人员。此条与同列要求组合冲突。', 'shifts', date=dt.date.fromordinal(day).isoformat(), shiftId=s['id'])
                 if allow_partial:
                     shortage = model.new_int_var(0, target, f'shortage_{day}_{s["id"]}')
-                    shortages.append(shortage)
+                    if day in active:
+                        current_shortages.append(shortage)
+                    else:
+                        boundary_shortages.append(shortage)
                     if fixed_staffing:
                         # A nonnegative exact shortfall keeps the fixed ceiling
                         # hard and provides a tighter linear model than max().
@@ -617,8 +673,8 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             selected_count = len(weights['days'])
             other_count = 7 - selected_count
             for week, (selected, others) in weighted_weeks.items():
-                context = ('首周合并上月固定工作记录，历史空白按 0 人计算。' if complete_first_week and week == first_week else
-                           '月边界按当月实际包含的星期折算。')
+                context = ('完整自然周合并已确认记录与临时预排。' if len(weighted_week_dates[week]) == 7 else
+                           '有未知历史的日期不视为零人，只对可核对日期按星期组比例折算；尚未通过完整周校验。')
                 weight_detail = problem('weekday-weight', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，星期 {"、".join(str(day) for day in weights["days"])} 合计占 {weights["percent"]}%（向上取整），其余星期平摊，组内每日人数相差不超过 1；' + context,
                     '核对该周的星期比例与每日人数要求、可用人员；调整比例或有关日期的人员/班次容量。此条与同列要求组合冲突。', 'rules', date=dt.date.fromordinal(max(week, dates[0])).isoformat())
                 weight_key = f'weekday-weight-{week}'
@@ -628,8 +684,8 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
                     fixed_count = sum(len(fixed_coverage[(day, sid)]) for sid in smap)
                     model.add(count == sum(var for sid in smap for var in coverage[(day, sid)]) + fixed_count)
                     counts[day] = count
-                # Known first weeks use the actual historical prefix. Other
-                # partial weeks retain a complete-week basis for absent days.
+                # Complete weeks use confirmed/temporary actual daily totals.
+                # Unknown history retains a full-week basis for absent days.
                 full_total = model.new_int_var(0, 7 * staff, f'full_week_total_{week}')
                 full_selected = model.new_int_var(0, 7 * staff, f'full_week_selected_{week}')
                 full_other = model.new_int_var(0, 7 * staff, f'full_week_other_{week}')
@@ -685,7 +741,7 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             return response('MODEL_INVALID', '求解模型无效，原排班未修改。', [issue('model-invalid', error[:1000])])
         # Reuse one tracker across coverage, staffing and fairness. A repeated
         # roster with different phase objectives/auxiliary variables counts once.
-        solution_counter = SolutionCounter(x.values(), on_solution_count)
+        solution_counter = SolutionCounter((var for (eid, day, sid), var in x.items() if day in active), on_solution_count)
         def run(limit):
             solver = cp_model.CpSolver()
             solver.parameters.max_time_in_seconds = max(0.001, limit)
@@ -695,10 +751,13 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             status = solver.solve(model, solution_counter)
             return solver, status
         def extract(solver):
+            nonlocal boundary_preview
+            boundary_preview = []
             result = copy.deepcopy(fixed)
             for (eid, day, sid), var in x.items():
                 if solver.value(var):
-                    result.append({'employeeId': eid, 'date': dt.date.fromordinal(day).isoformat(), 'shiftId': sid, 'locked': False})
+                    record = {'employeeId': eid, 'date': dt.date.fromordinal(day).isoformat(), 'shiftId': sid, 'locked': False}
+                    (result if day in active else boundary_preview).append(record)
             return sorted(result, key=lambda a: (a['date'], a['employeeId'], a['shiftId']))
         saved_assignments = None
         shortage_count = 0
@@ -707,7 +766,9 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
         # Never add people simply to reduce a fairness score.
         phases = []
         if allow_partial:
-            phases.append(('coverage', sum(shortages)))
+            phases.append(('coverage', sum(current_shortages)))
+            if boundary_shortages:
+                phases.append(('boundary-coverage', sum(boundary_shortages)))
         phases.extend([('staffing', sum(x.values())), ('fairness', fairness)])
         status = cp_model.UNKNOWN
         for index, (phase, objective) in enumerate(phases):
@@ -722,9 +783,9 @@ def solve(request: Any, on_solution_count: Callable[[int], None] | None = None) 
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
                 break
             saved_assignments = extract(solver)
-            shortage_count = sum(solver.value(var) for var in shortages)
+            shortage_count = sum(solver.value(var) for var in current_shortages)
             if status == cp_model.FEASIBLE:
-                unresolved = {'coverage': '缺员数最少', 'staffing': '班次总数最少', 'fairness': '公平性最优'}[phase]
+                unresolved = {'coverage': '本月缺员数最少', 'boundary-coverage': '月外临时衔接缺员数最少', 'staffing': '班次总数最少', 'fairness': '公平性最优'}[phase]
                 return _success(response, saved_assignments, 'FEASIBLE', state, shortage_count, solver.objective_value, solver.best_objective_bound,
                                 f'已找到满足硬约束的可行排班；时限内尚未证明{unresolved}。')
             if index == len(phases) - 1:

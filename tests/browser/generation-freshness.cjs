@@ -27,6 +27,7 @@ async function screenshot(page, name) { const file = path.join(out, `${name}.png
 async function stored(page) { return page.evaluate(() => JSON.parse(localStorage.getItem('shift-planner:v1'))) }
 async function prepare(desktop, state = fixture) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: 'zh-CN' })
+  await page.clock.setFixedTime(new Date('2026-10-15T04:00:00Z'))
   activePage = page
   page.on('pageerror', error => report.errors.push(error.stack || String(error)))
   page.on('console', message => { if (message.type() === 'error') report.errors.push(message.text()) })
@@ -79,7 +80,19 @@ function success(request) {
     const date = `${request.state.month}-${String(day).padStart(2, '0')}`
     if (!assignments.some(item => item.date === date && item.shiftId === 'day')) assignments.push({ employeeId: `qa-${day % 2 ? 1 : 2}`, date, shiftId: 'day', locked: false })
   }
-  return { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', status: 'OPTIMAL', assignments, issues: [], stats: { wallTimeSeconds: 0.01, shortageCount: 0, optimal: true }, message: 'valid controlled response' }
+  const first = Date.parse(`${request.state.month}-01T00:00:00Z`), following = new Date(first)
+  following.setUTCMonth(following.getUTCMonth() + 1)
+  const last = +following - 86400000, boundaryPreview = []
+  const monday = first - (new Date(first).getUTCDay() + 6) % 7 * 86400000
+  const sunday = last + (6 - (new Date(last).getUTCDay() + 6) % 7) * 86400000
+  for (let time = monday; time <= sunday; time += 86400000) {
+    const date = new Date(time).toISOString().slice(0, 10)
+    if (date.startsWith(`${request.state.month}-`) || date < request.options.referenceDate || assignments.some(item => item.date === date && item.shiftId === 'day')) continue
+    const employee = request.state.employees.find(item => !assignments.some(cell => cell.employeeId === item.id && cell.date === date)
+      && !request.state.scheduleCoverage?.[date.slice(0, 7)]?.employeeIds.includes(item.id))
+    if (employee) boundaryPreview.push({ employeeId: employee.id, date, shiftId: 'day', locked: false })
+  }
+  return { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', status: 'OPTIMAL', assignments, boundaryPreview, issues: [], stats: { wallTimeSeconds: 0.01, shortageCount: 0, optimal: true }, message: 'valid controlled response' }
 }
 async function settle(page, control, mode = 'success') {
   const pending = control.pending.shift()
@@ -169,35 +182,35 @@ async function main() {
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } : {}) })
   try {
     const { page, control } = await prepare(true)
-    await monthStatus(page, 'scheduled')
-    await moveMonth(page, -1, '2026-09', 'scheduled')
-    await moveMonth(page, 1, '2026-10', 'scheduled')
+    await monthStatus(page, 'pending')
+    await moveMonth(page, -1, '2026-09', 'pending')
+    await moveMonth(page, 1, '2026-10', 'pending')
     await moveMonth(page, 1, '2026-11', 'empty')
-    await moveMonth(page, -1, '2026-10', 'scheduled')
+    await moveMonth(page, -1, '2026-10', 'pending')
     await changeRule(page, 11)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     assert.equal((await stored(page)).provenance.invalidatedSchedules, undefined)
-    record('legacy working and off-only months are scheduled, an empty month is not, and a saved no-op preserves validity')
+    record('legacy working and off-only months retain explicit boundary confirmation warnings, empty months stay empty and a saved no-op preserves validity')
     await start(page, control); await settle(page, control)
     await freshness(page, false, /排班已生成/)
     const generated = await savedGenerated(page)
     await freshness(page, false, /排班已生成/)
     assert.equal(await page.locator('.sp-solve-result').evaluate(node => node.classList.contains('is-warning')), false)
     assert.deepEqual(generated.provenance, fixture.provenance)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     await screenshot(page, 'desktop-success-fresh')
     record('desktop successful roster commit stays fresh immediately and after autosave, preserving locked/history entries and provenance')
 
     await page.getByRole('button', { name: '已核对变更', exact: true }).click()
     await page.waitForFunction(() => !JSON.parse(localStorage.getItem('shift-planner:v1')).provenance.pendingExternalChange)
     await freshness(page, false, /排班已生成/)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     record('acknowledging source metadata after success does not mark the result stale')
 
     await changeRule(page, 12, false)
     await freshness(page, false, /排班已生成/)
     assert.equal((await stored(page)).rules.minRestHours, 11)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     record('an unsaved rule draft and navigation do not invalidate the successful result')
     await changeRule(page, 12)
     await freshness(page, true)
@@ -221,20 +234,20 @@ async function main() {
 
     await start(page, control); await settle(page, control)
     await freshness(page, false, /排班已生成/)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     await page.waitForFunction(() => !JSON.parse(localStorage.getItem('shift-planner:v1')).provenance.invalidatedSchedules?.['2026-10'])
     assert.deepEqual((await stored(page)).provenance.invalidatedSchedules, { '2026-09': invalidated['2026-09'] })
     await undoAndPersist(page, generated.assignments)
     await monthStatus(page, 'invalid')
     await start(page, control); await settle(page, control)
     await freshness(page, false, /排班已生成/)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     await changeShift(page, '重排后保存的新日班')
     await monthStatus(page, 'invalid')
     await freshness(page, true)
     await start(page, control); await settle(page, control)
     await freshness(page, false, /排班已生成/)
-    await monthStatus(page, 'scheduled')
+    await monthStatus(page, 'pending')
     await changeMember(page, '手动改名后的成员')
     await freshness(page, true)
     await monthStatus(page, 'invalid')
@@ -258,18 +271,18 @@ async function main() {
 
     const editing = await prepare(true)
     await restFirstCell(editing.page)
-    await monthStatus(editing.page, 'scheduled')
+    await monthStatus(editing.page, 'pending')
     await editing.page.getByRole('button', { name: '设置 2026-10-01 日期类型', exact: true }).click()
     const dateDialog = editing.page.getByRole('dialog', { name: '2026-10-01 · 日期类型', exact: true })
     await dateDialog.getByRole('button', { name: /休息日 在日历中标记为休息日/ }).click()
     await dateDialog.getByRole('button', { name: '确认日期类型', exact: true }).click()
     await dateDialog.waitFor({ state: 'detached' })
     await editing.page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).calendar['2026-10-01'] === 'restday')
-    await monthStatus(editing.page, 'scheduled')
+    await monthStatus(editing.page, 'pending')
     assert.deepEqual((await stored(editing.page)).provenance.invalidatedSchedules ?? {}, {})
     assert.equal((await stored(editing.page)).provenance.fields['calendar.2026-10-01'].source, 'manual')
     await undoAndPersist(editing.page, fixture.assignments)
-    await monthStatus(editing.page, 'scheduled')
+    await monthStatus(editing.page, 'pending')
     record('a calendar display marker records its source without invalidating an existing schedule or its undo history')
     await changeRule(editing.page, 10)
     await monthStatus(editing.page, 'invalid')
@@ -339,7 +352,7 @@ async function main() {
       assert.equal(await web.evaluate(() => window.__freshnessWorkerCount), 1)
       if (mode === 'success') {
         await freshness(web, false, /排班已生成/)
-        await monthStatus(web, 'scheduled')
+        await monthStatus(web, 'pending')
         await savedGenerated(web)
         await freshness(web, false, /排班已生成/)
         await screenshot(web, 'real-worker-success-fresh')

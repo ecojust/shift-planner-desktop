@@ -34,7 +34,7 @@ def request(month='2026-10', employees=None, shifts=None, assignments=None, adja
                            rules=dict(minRestHours=0, maxConsecutiveDays=31,
                                       nonConsecutiveShifts=[dict(id=f'adj-{sid}', shiftId=sid) for sid in adjacency],
                                       weeklyShiftLimits=[dict(id=f'week-{sid}', shiftId=sid, maxPerWeek=cap) for sid, cap in weekly])),
-                options=dict(timeLimitSeconds=3, seed=1010, allowPartial=partial))
+                options=dict(timeLimitSeconds=3, seed=1010, allowPartial=partial, referenceDate='2030-01-01'))
 
 
 class ShiftRulesTest(unittest.TestCase):
@@ -60,9 +60,10 @@ class ShiftRulesTest(unittest.TestCase):
         first = dt.date.fromisoformat(month + '-01')
         active = {first + dt.timedelta(days=offset) for offset in range(calendar.monthrange(first.year, first.month)[1])}
         active_weeks = {day - dt.timedelta(days=day.weekday()) for day in active}
+        active = {week + dt.timedelta(days=offset) for week in active_weeks for offset in range(7)}
         starts = {}
         counts = Counter()
-        for record in result['assignments']:
+        for record in result['assignments'] + result.get('boundaryPreview', []):
             if record['shiftId'] == 'off':
                 continue
             day = dt.date.fromisoformat(record['date'])
@@ -176,9 +177,9 @@ class ShiftRulesTest(unittest.TestCase):
         self.assertFeasible(result)
         self.assertEqual(result['assignments'], data['state']['assignments'])
 
-    def test_adjacent_external_history_in_touching_week_is_not_an_active_pair(self):
+    def test_adjacent_external_history_in_touching_week_is_checked_as_full_week(self):
         data = request(assignments=[assignment('2026-09-28', locked=False), assignment('2026-09-29', locked=False)], adjacency=['early'])
-        self.assertFeasible(solve(data))
+        self.assertConflict(solve(data), 'consecutive-shift')
 
     def test_adjacency_applies_across_sunday_monday(self):
         data = request(assignments=[assignment('2026-10-04'), assignment('2026-10-05')], adjacency=['early'])

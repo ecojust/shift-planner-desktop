@@ -24,7 +24,19 @@ function fixture() {
     ],
   }
 }
-const options = () => ({ timeLimitSeconds: 15, allowPartial: false, seed: 12345 })
+const options = () => ({ timeLimitSeconds: 15, allowPartial: false, seed: 12345, referenceDate: '2026-10-15' })
+
+test('a solver snapshot freezes the local reference date and carries detached confirmed-month coverage', () => {
+  const state = fixture()
+  state.scheduleCoverage = { '2026-09': { employeeIds: ['a', 'b'] } }
+  const inputOptions = { timeLimitSeconds: 15, allowPartial: false, seed: 9 }
+  const request = createSolverRequest(state, inputOptions, 'boundary-snapshot')
+  assert.match(request.options.referenceDate, /^\d{4}-\d{2}-\d{2}$/)
+  assert.equal(Object.hasOwn(inputOptions, 'referenceDate'), false)
+  state.scheduleCoverage['2026-09'].employeeIds.pop()
+  assert.deepEqual(request.state.scheduleCoverage['2026-09'].employeeIds, ['a', 'b'])
+  assert.deepEqual(JSON.parse(solverDebugJSON(request)).options, request.options)
+})
 
 test('rules JSON is a complete solver request with resolved defaults and cross-month context', () => {
   const original = fixture(), before = structuredClone(original), solverOptions = options()

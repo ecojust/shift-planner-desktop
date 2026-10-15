@@ -102,12 +102,12 @@ function generationAdapter(fail = false) {
     acquire: () => ({ assertCurrent() {}, release() {} }),
     async solve(request) {
       calls.push(request)
-      const result = fail ? undefined : generateSchedule(request.state)
+      const result = fail ? undefined : generateSchedule(request.state, request.options.seed, undefined, { referenceDate: request.options.referenceDate })
       if (result) assert.equal(result.success, true)
       return { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat',
         status: fail ? 'INFEASIBLE' : 'FEASIBLE', issues: fail ? [{ id: 'no-room', type: 'weekly-hours', severity: 'error', message: '测试配置无解' }] : [],
         stats: { wallTimeSeconds: 0.1, shortageCount: 0, optimal: false }, message: fail ? '测试配置无解' : '已生成',
-        ...(result ? { assignments: result.assignments } : {}) }
+        ...(result ? { assignments: result.assignments, boundaryPreview: result.boundaryPreview, boundaryContext: result.boundaryContext } : {}) }
     },
   }
 }

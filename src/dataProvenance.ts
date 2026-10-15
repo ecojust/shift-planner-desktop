@@ -134,6 +134,10 @@ export function withChangeProvenance(previous: PlannerDocument, next: PlannerDoc
   const { provenance: _submitted, ...document } = next
   const trusted = previous.provenance
   const scheduledMonths = new Set(next.assignments.map(assignment => assignment.date.slice(0, 7)))
+  const employeeIds = new Set(next.employees.map(employee => employee.id))
+  for (const [month, coverage] of Object.entries(next.scheduleCoverage ?? {})) {
+    if (validMonth(month) && coverage.employeeIds.some(id => employeeIds.has(id))) scheduledMonths.add(month)
+  }
   const invalidatedSchedules: Record<string, ChangeStamp> = Object.create(null)
   for (const [month, stamp] of Object.entries(trusted?.invalidatedSchedules ?? {})) {
     if (scheduledMonths.has(month)) invalidatedSchedules[month] = { ...stamp }

@@ -6,7 +6,9 @@ import { DEFAULT_INTEGRATION_PERMISSIONS, type IntegrationPermission, type Integ
 import { configurationFields, markSchedulesCurrent, withChangeProvenance } from './dataProvenance.ts'
 import { checkDesktopResult, type SolverRequest, type SolverResult, type SolverStatus } from './DesktopSolver.ts'
 import { createSolverRequest } from './solverDebug.ts'
-import type { Issue } from './domain.ts'
+import { clearScheduleCoverage, markScheduleCoverageComplete, pruneScheduleCoverage } from './scheduleCoverage.ts'
+import { getWeekBoundaryContext, type WeekBoundaryContext } from './weekBoundary.ts'
+import type { Assignment, Issue } from './domain.ts'
 
 export type IntegrationSource = 'mcp' | 'http'
 
@@ -17,6 +19,8 @@ interface IntegrationGenerationDetails {
   issues: Issue[]
   stats: SolverResult['stats']
   revision: string
+  boundaryPreview?: Assignment[]
+  boundaryContext?: Omit<WeekBoundaryContext, 'weeks'>
 }
 export type IntegrationGenerationOutcome = IntegrationGenerationDetails & (
   | { success: false; saved: false }
@@ -146,7 +150,7 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
         ...current.state.assignments.filter(item => !item.date.startsWith(`${month}-`)),
         ...checked.assignments.filter(item => item.date.startsWith(`${month}-`)),
       ]
-      const next = parseBackup(JSON.stringify({ ...current.state, assignments }))
+      const next = parseBackup(JSON.stringify(markScheduleCoverageComplete({ ...current.state, assignments }, [month])))
       assertCurrent()
       if (context.claimCommit) await context.claimCommit()
       // No awaits are permitted between this final lifecycle/revision check and
@@ -162,7 +166,10 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
       } }
       accepted = markSchedulesCurrent(accepted, [month])
       apply(accepted, source)
-      outcome = { ...details, success: true, saved: true, ...snapshot(), generatedAt }
+      const boundary = getWeekBoundaryContext(request.state, { referenceDate: request.options.referenceDate })
+      const boundaryContext = boundary ? { startDate: boundary.startDate, endDate: boundary.endDate, referenceDate: boundary.referenceDate, incompleteHistory: boundary.incompleteHistory } : undefined
+      outcome = { ...details, success: true, saved: true, ...snapshot(), generatedAt,
+        boundaryPreview: result.boundaryPreview ?? [], ...(boundaryContext ? { boundaryContext } : {}) }
       return outcome
     } catch (error) {
       failure = error
@@ -193,8 +200,14 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
       delete candidate.provenance
       // Older clients may echo retired limits; they do not reactivate them.
       delete candidate.monthlyReferenceHours
+      // Completeness is confirmed by generation, not by an external caller's
+      // assertion. Echoing this read-only metadata is allowed; omission retains it.
+      if (Object.hasOwn(candidate, 'scheduleCoverage') && !equalData(candidate.scheduleCoverage, current.state.scheduleCoverage)) {
+        throw new IntegrationError('排班完整性由软件生成时确认，外部接口不能直接修改 scheduleCoverage', 403)
+      }
+      delete candidate.scheduleCoverage
       const currentDocument = current.state as unknown as Record<string, unknown>
-      next = parseBackup(JSON.stringify(candidate))
+      next = pruneScheduleCoverage({ ...parseBackup(JSON.stringify(candidate)), ...(current.state.scheduleCoverage ? { scheduleCoverage: current.state.scheduleCoverage } : {}) })
       // Reject unsupported top-level fields even if the backup parser would discard them.
       for (const key of Object.keys(candidate)) {
         if (key !== 'provenance' && !Object.hasOwn(fieldPermissions, key) && !equalData(candidate[key], currentDocument[key])) {
@@ -217,10 +230,12 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
       }
       next = parseBackup(JSON.stringify({ ...current.state, assignments }))
     }
+    const emptiedMonths = method === 'replace_state' ? [...changedAssignmentMonths(current.state, next)].filter(month => !next.assignments.some(item => item.date.startsWith(`${month}-`))) : []
+    next = clearScheduleCoverage(next, emptiedMonths)
     const currentDocument = current.state as unknown as Record<string, unknown>
     const nextDocument = next as unknown as Record<string, unknown>
     const changed = [...new Set([...Object.keys(currentDocument), ...Object.keys(nextDocument)])]
-      .filter(key => key !== 'provenance' && !equalData(currentDocument[key], nextDocument[key]))
+      .filter(key => key !== 'provenance' && key !== 'scheduleCoverage' && !equalData(currentDocument[key], nextDocument[key]))
     const permissions = readPermissions()
     const denied = new Set<string>()
     for (const key of changed) {

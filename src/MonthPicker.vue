@@ -2,9 +2,9 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, useId, watch } from 'vue'
 import Icon from './Icon.vue'
 
-type ScheduleStatus = 'empty' | 'scheduled' | 'invalid'
+type ScheduleStatus = 'empty' | 'scheduled' | 'invalid' | 'pending' | 'conflict'
 type ScheduleStatusEntry = ScheduleStatus | { status: ScheduleStatus; description?: string }
-const props = defineProps<{ modelValue: string; scheduleStatuses?: Readonly<Record<string, ScheduleStatusEntry>> }>()
+const props = defineProps<{ modelValue: string; scheduleStatuses?: Readonly<Record<string, ScheduleStatusEntry>>; getScheduleStatus?: (month: string) => ScheduleStatusEntry }>()
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 const id = useId()
 const trigger = ref<HTMLButtonElement | null>(null)
@@ -22,9 +22,9 @@ const years = computed(() => Array.from({ length: Math.min(12, 10000 - yearPage.
 const position = ref({ left: '12px', top: '12px' })
 const formattedYear = (value: number) => String(value).padStart(4, '0')
 const title = computed(() => `${formattedYear(selectedYear.value)} 年 ${selectedMonth.value} 月`)
-const statusLabels: Record<ScheduleStatus, string> = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效' }
+const statusLabels: Record<ScheduleStatus, string> = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效', pending: '已排班 · 跨月待确认', conflict: '排班有冲突，需重新检查' }
 function statusInfo(value: string) {
-  const entry = props.scheduleStatuses?.[value]
+  const entry = props.getScheduleStatus?.(value) ?? props.scheduleStatuses?.[value]
   const status = typeof entry === 'string' ? entry : entry?.status ?? 'empty'
   const label = statusLabels[status]
   const detail = typeof entry === 'object' ? entry.description : undefined
@@ -167,7 +167,7 @@ onUnmounted(() => {
       <div v-if="mode === 'months'" class="sp-month-picker-grid" role="group" :aria-label="`${year} 年的月份`">
         <button v-for="choice in monthChoices" :key="choice.month" type="button" class="sp-month-picker-choice" :data-month="choice.month" :data-schedule-status="choice.status" :tabindex="choice.month === focusedMonth ? 0 : -1" :aria-label="`${year} 年 ${choice.month} 月`" :aria-describedby="`${id}-month-${choice.month}-status`" :title="choice.description" :aria-pressed="year === selectedYear && choice.month === selectedMonth" @focus="focusedMonth = choice.month" @keydown="monthKey($event, choice.month)" @click="chooseMonth(choice.month)">
           <span class="sp-month-picker-name">{{ choice.month }} 月</span>
-          <span class="sp-month-picker-status" :class="`is-${choice.status}`" aria-hidden="true"><Icon :name="choice.status === 'invalid' ? 'info' : choice.status === 'scheduled' ? 'check' : 'calendar'" :size="12" /><span class="sp-month-picker-status-copy"><template v-if="choice.status === 'invalid'"><span>规则已修改</span><span>排班已失效</span></template><span v-else>{{ choice.label }}</span></span></span>
+          <span class="sp-month-picker-status" :class="`is-${choice.status}`" aria-hidden="true"><Icon :name="['invalid', 'pending', 'conflict'].includes(choice.status) ? 'info' : choice.status === 'scheduled' ? 'check' : 'calendar'" :size="12" /><span class="sp-month-picker-status-copy"><template v-if="choice.status === 'invalid'"><span>规则已修改</span><span>排班已失效</span></template><template v-else-if="choice.status === 'pending'"><span>已排班</span><span>跨月待确认</span></template><template v-else-if="choice.status === 'conflict'"><span>排班有冲突</span><span>需重新检查</span></template><span v-else>{{ choice.label }}</span></span></span>
           <span :id="`${id}-month-${choice.month}-status`" class="sp-month-picker-sr-only">{{ choice.description }}</span>
         </button>
       </div>
@@ -203,12 +203,20 @@ onUnmounted(() => {
 .sp-month-picker-status-copy { display: flex; flex-direction: column; align-items: center; white-space: nowrap; }
 .sp-month-picker-status.is-scheduled { color: #28745a; }
 .sp-month-picker-status.is-invalid { color: #91591b; }
+.sp-month-picker-status.is-pending { color: #586b96; }
+.sp-month-picker-status.is-conflict { color: #a54336; }
 .sp-month-picker-choice[data-schedule-status="scheduled"] { background: #f0f7f2; border-color: #dfebe3; }
 .sp-month-picker-choice[data-schedule-status="invalid"] { background: #fff7e9; border-color: #eedcbd; }
 .sp-month-picker-choice[data-schedule-status="invalid"]:hover { background: #ffefd5; }
+.sp-month-picker-choice[data-schedule-status="pending"] { background: #f1f4fa; border-color: #dde3f0; }
+.sp-month-picker-choice[data-schedule-status="pending"]:hover { background: #e8edf7; }
+.sp-month-picker-choice[data-schedule-status="conflict"] { background: #fff1ee; border-color: #f1d7d0; }
+.sp-month-picker-choice[data-schedule-status="conflict"]:hover { background: #ffe7df; }
 .sp-month-picker-grid button[aria-pressed="true"] { background: #245b4e; color: #fff; font-weight: 600; }
 .sp-month-picker-choice[aria-pressed="true"] .sp-month-picker-status { color: #e4f4e9; }
 .sp-month-picker-choice[aria-pressed="true"] .sp-month-picker-status.is-invalid { color: #ffe4a7; }
+.sp-month-picker-choice[aria-pressed="true"] .sp-month-picker-status.is-pending { color: #e0e8ff; }
+.sp-month-picker-choice[aria-pressed="true"] .sp-month-picker-status.is-conflict { color: #ffddd0; }
 .sp-month-picker-sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (max-width: 760px) {
   .sp-month-picker { gap: 6px; }

@@ -6,6 +6,7 @@ import { isAvatarData } from './avatarData.ts'
 import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
 import { findWeightedWeek, weekdayWeightRuleError, weightedGroups, weightedWeeks } from './weekday-weights.ts'
 import { parseDataProvenance } from './dataProvenance.ts'
+import { MAX_SCHEDULE_COVERAGE_EMPLOYEES, MAX_SCHEDULE_COVERAGE_MONTHS } from './scheduleCoverage.ts'
 
 export const STORAGE_KEY = 'shift-planner:v1'
 export const MAX_BACKUP_BYTES = 8 * 1024 * 1024
@@ -123,6 +124,22 @@ export function parseBackup(text: string): PlannerDocument {
   const state: PlannerDocument = {
     version: 1, teamName: string(root.teamName, 100, '团队名称'), month: monthValue(root.month), employees, shifts, assignments,
     rules: { minRestHours: number(r.minRestHours, 0, 48, '最短休息小时'), maxConsecutiveDays: number(r.maxConsecutiveDays, 1, 31, '最多连续工作天数', true) },
+  }
+  if (root.scheduleCoverage !== undefined) {
+    const raw = object(root.scheduleCoverage, '排班覆盖')
+    if (Object.keys(raw).length > MAX_SCHEDULE_COVERAGE_MONTHS) fail('排班覆盖最多保存 1200 个月')
+    const coverage: NonNullable<PlannerDocument['scheduleCoverage']> = Object.create(null)
+    for (const [month, value] of Object.entries(raw)) {
+      monthValue(month)
+      const entry = object(value, '排班覆盖月份')
+      if (Object.keys(entry).some(key => key !== 'employeeIds')) fail('排班覆盖月份包含未知字段')
+      const coveredIds = list(entry.employeeIds, MAX_SCHEDULE_COVERAGE_EMPLOYEES, '排班覆盖成员').map(value => id(value, '排班覆盖成员 ID'))
+      unique(coveredIds, '排班覆盖成员')
+      // Removing a member must not make an otherwise valid workspace unsavable.
+      const remaining = coveredIds.filter(id => employeeIds.has(id))
+      if (remaining.length) coverage[month] = { employeeIds: remaining }
+    }
+    if (Object.keys(coverage).length) state.scheduleCoverage = coverage
   }
   // Retire the former sample label in saved workspaces and imported backups.
   if (state.teamName === '星河服务团队') state.teamName = '我的排班'
@@ -303,7 +320,7 @@ export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Ce
   }
   if (safe.rules.weekdayWeights) {
     const rule = safe.rules.weekdayWeights
-    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班的最少或固定人数要求，各组内每日差不超过 1 班。月初有上月排班时，匹配完整周基准为含上月同周记录的实际总数，均摊也计入历史日期。无上月记录及月末不足整周时，基准仅表示可满足本月星期份额的周总量。人数要求只核对本月日期。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', ...safe.shifts.map(s => s.name + '实际班次')])
+    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班的最少或固定人数要求，各组内每日差不超过 1 班。同一自然周中，上月或下月全员已确认的日期一并核对；完整性来自逐日记录或已完成生成的月份，单条记录不会把其余空白视为休息。尚有未确认日期时，完整周基准仅用于匹配已确认日期的星期份额。人数要求只核对本月日期，临时边界预排不写入本表。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', ...safe.shifts.map(s => s.name + '实际班次')])
     for (const week of weightedWeeks(safe)) {
       const assignments = safe.assignments.filter(item => week.dates.includes(item.date) && item.shiftId !== 'off')
       const selectedActual = assignments.filter(item => week.selectedDates.includes(item.date)).length
@@ -324,7 +341,7 @@ export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Ce
       }
       const problems = [minimumGap ? '最低覆盖不足' : '', fixedGap ? '固定人数不足' : '', fixedExcess ? '固定人数超额' : '', !matched ? '星期比例未匹配' : '', !evenGroups ? '同组日期分布不均' : ''].filter(Boolean)
       rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, assignments.length, selectedActual, otherActual, matched?.fullTotal ?? '未匹配', minimumGap + fixedGap, fixedExcess, problems.join('；') || '通过', ...safe.shifts.map(shift => assignments.filter(item => item.shiftId === shift.id).length)])
-      if (week.history) rows[1]!.push(['跨月周历史', week.id, `已计入 ${week.history.dates[0]} 至 ${week.history.dates.at(-1)} 的上月排班`, '上月选中星期班次', week.history.selectedTotal, '上月其余星期班次', week.history.otherTotal, '上月记录保持不变；本段实际班次列仅统计本月。'])
+      if (week.history) rows[1]!.push(['跨月周历史', week.id, `已计入 ${week.history.dates[0]} 至 ${week.history.dates.at(-1)} 范围内已确认日期的相邻月排班`, '相邻月选中星期班次', week.history.selectedTotal, '相邻月其余星期班次', week.history.otherTotal, '相邻月记录保持不变；本段实际班次列仅统计本月。'])
     }
   }
   if (rows.some(items => items.length > 100000 || items.some(row => row.length > 256))) throw new Error('Excel 导出数据量超出限制')

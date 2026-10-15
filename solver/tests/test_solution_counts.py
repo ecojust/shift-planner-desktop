@@ -142,6 +142,21 @@ class SolutionCountTests(unittest.TestCase):
                     self.assert_count(result, 1)
                     self.assertEqual(counts, [1])
 
+    def test_boundary_only_choices_do_not_inflate_target_roster_count(self):
+        fixed = [assignment('a', f'2026-11-{day:02}') for day in range(1, 31)]
+        data = request(state(month='2026-11', employees=[employee('a', cap=168), employee('b', cap=168)], assignments=fixed),
+                       referenceDate='2026-10-01')
+        # Both sides have genuine undecided future cells. The target month is
+        # fixed, so all optimization callbacks represent one target roster.
+        data['state']['rules'].update(minRestHours=0, maxConsecutiveDays=366)
+        counts = []
+        result = engine.solve(data, on_solution_count=counts.append)
+        self.assertEqual(result['status'], 'OPTIMAL', result)
+        self.assertEqual(len(result['boundaryPreview']), 12)
+        self.assertCountEqual(result['assignments'], fixed)
+        self.assertEqual(counts, [1])
+        self.assert_count(result, 1)
+
     def test_auxiliary_variable_changes_do_not_create_another_roster(self):
         model = cp_model.CpModel()
         scheduled = model.new_bool_var('scheduled')

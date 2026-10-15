@@ -1,5 +1,5 @@
 const assert = require('node:assert/strict')
-const statusLabels = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效' }
+const statusLabels = { empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效', pending: '已排班 · 跨月待确认', conflict: '排班有冲突，需重新检查' }
 
 async function assertStatusDescription(locator, expected) {
   assert.equal(await locator.getAttribute('data-schedule-status'), expected)
@@ -19,7 +19,7 @@ async function assertMonthChoiceStatus(dialog, month, expected) {
   await assertStatusDescription(choice, expected)
   const visibleStatus = choice.locator('.sp-month-picker-status')
   assert.equal(await visibleStatus.isVisible(), true)
-  assert.equal((await visibleStatus.innerText()).replace(/[\s，]/g, ''), statusLabels[expected].replace('，', ''), `${month}: the month grid visibly explains its saved schedule status`)
+  assert.equal((await visibleStatus.innerText()).replace(/[\s，·]/g, ''), statusLabels[expected].replace(/[\s，·]/g, ''), `${month}: the month grid visibly explains its saved schedule status`)
 }
 
 async function readGlobalMonth(page) {

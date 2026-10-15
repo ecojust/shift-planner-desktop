@@ -66,6 +66,11 @@ export interface Assignment {
   locked: boolean
 }
 
+export interface ScheduleMonthCoverage {
+  /** Every date in this month is confirmed for these members; blanks mean rest. */
+  employeeIds: string[]
+}
+
 export interface PlannerState {
   version: 1
   teamName: string
@@ -77,6 +82,8 @@ export interface PlannerState {
   shifts: Shift[]
   rules: Rules
   assignments: Assignment[]
+  /** Trusted completeness metadata; absent legacy months retain unknown blank days. */
+  scheduleCoverage?: Record<string, ScheduleMonthCoverage>
   /** Latest recorded source per configuration field; absent for untracked legacy data. */
   provenance?: DataProvenance
 }

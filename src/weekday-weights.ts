@@ -1,5 +1,5 @@
 import type { PlannerState } from './domain.ts'
-import { getPreviousWeekContext } from './weekBoundary.ts'
+import { getWeekBoundaryContext, type BoundaryOptions } from './weekBoundary.ts'
 
 export interface WeightedWeek {
   id: string
@@ -11,7 +11,7 @@ export interface WeightedWeek {
   otherTarget: number
   /** Complete seven-day baseline; examples do not constrain the solver. */
   fullTotal: number
-  /** Retained previous-month starts; the primary dates and targets stay in-month. */
+  /** Retained known starts on either side of the selected month. */
   history?: {
     dates: string[]
     selectedDates: string[]
@@ -44,9 +44,8 @@ function ceilShare(value: number, numerator: number, denominator: number) {
 }
 function targets(week: WeekDates, rule: WeightRule, fullTotal: number): WeightedWeek {
   const selectedFull = ceilShare(fullTotal, rule.percent, 100)
-  const selectedTarget = week.history ? selectedFull - week.history.selectedTotal : ceilShare(selectedFull, week.selectedDates.length, rule.days.length)
-  const otherTarget = week.history ? fullTotal - selectedFull - week.history.otherTotal
-    : rule.days.length === 7 ? 0 : ceilShare(fullTotal - selectedFull, week.otherDates.length, 7 - rule.days.length)
+  const selectedTarget = ceilShare(selectedFull, week.selectedDates.length + (week.history?.selectedDates.length ?? 0), rule.days.length) - (week.history?.selectedTotal ?? 0)
+  const otherTarget = rule.days.length === 7 ? 0 : ceilShare(fullTotal - selectedFull, week.otherDates.length + (week.history?.otherDates.length ?? 0), 7 - rule.days.length) - (week.history?.otherTotal ?? 0)
   return { ...week, fullTotal, selectedTarget, otherTarget, totalTarget: selectedTarget + otherTarget }
 }
 
@@ -57,46 +56,41 @@ export function weightedWeekTargets(week: WeightedWeek, rule: WeightRule, fullTo
 
 /**
  * Preview only: fullTotal is an explicit seven-day example, not a fixed staffing quota.
- * Unknown missing weekdays retain their shares outside the month. Known previous
- * weekdays consume their actual portion of the complete first week's budget.
+ * Unknown missing weekdays retain their shares outside the month. Known adjacent-month
+ * weekdays consume their actual portion of the same natural week's budget.
  * The default example uses minimum daily coverage × 7; it may not meet the weights.
  */
-export function weightedWeeks(state: PlannerState, fullTotal = state.shifts.reduce((sum, shift) => sum + shift.required, 0) * 7): WeightedWeek[] {
+export interface WeightedWeekOptions extends BoundaryOptions { planning?: boolean; boundaryState?: PlannerState }
+export function weightedWeeks(state: PlannerState, fullTotal = state.shifts.reduce((sum, shift) => sum + shift.required, 0) * 7, options: WeightedWeekOptions = {}): WeightedWeek[] {
   const rule = state.rules.weekdayWeights
   if (!rule || weekdayWeightRuleError(rule) || !Number.isSafeInteger(fullTotal) || fullTotal < 0) return []
-  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(state.month) || Number(state.month.slice(0, 4)) < 1) return []
-  const first = Date.parse(`${state.month}-01T00:00:00Z`)
-  if (!Number.isFinite(first)) return []
-  const context = getPreviousWeekContext(state)
-  let history: WeightedWeek['history']
-  if (context) {
-    const employeeIds = new Set(state.employees.map(employee => employee.id))
-    const shiftIds = new Set(state.shifts.map(shift => shift.id))
-    const dates = new Set(context.historyDates)
-    const keys = new Map(context.historyDates.map(date => [date, new Set<string>()]))
-    for (const assignment of state.assignments) {
-      if (dates.has(assignment.date) && employeeIds.has(assignment.employeeId) && shiftIds.has(assignment.shiftId)) keys.get(assignment.date)!.add(`${assignment.employeeId}\0${assignment.shiftId}`)
+  const context = getWeekBoundaryContext(options.boundaryState ?? state, options)
+  if (!context) return []
+  const employeeIds = new Set(state.employees.map(employee => employee.id))
+  const shiftIds = new Set(state.shifts.map(shift => shift.id))
+  return context.weeks.map(week => {
+    // A missing historical cell cannot be silently counted as rest for team
+    // weights. Exclude that whole outside day from the prorated group budget.
+    const knownOutside = week.outsideDates.filter(date => week.employees.every(employee => employee.knownDates.includes(date)))
+    const planningOutside = options.planning ? week.outsideDates.filter(date => week.employees.every(employee => !employee.unknownPastDates.includes(date))) : []
+    const dates = [...week.monthDates, ...planningOutside.filter(date => !knownOutside.includes(date))].sort()
+    const selectedDates = dates.filter(date => rule.days.includes(isoDay(date)))
+    const otherDates = dates.filter(date => !rule.days.includes(isoDay(date)))
+    let history: WeightedWeek['history']
+    if (knownOutside.length) {
+      const keys = new Map(knownOutside.map(date => [date, new Set<string>()]))
+      for (const assignment of state.assignments) {
+        if (keys.has(assignment.date) && employeeIds.has(assignment.employeeId) && shiftIds.has(assignment.shiftId)) keys.get(assignment.date)!.add(`${assignment.employeeId}\0${assignment.shiftId}`)
+      }
+      const counts = Object.fromEntries([...keys].map(([date, entries]) => [date, entries.size]))
+      const selected = knownOutside.filter(date => rule.days.includes(isoDay(date)))
+      const other = knownOutside.filter(date => !rule.days.includes(isoDay(date)))
+      history = { dates: knownOutside, selectedDates: selected, otherDates: other, counts,
+        selectedTotal: selected.reduce((sum, date) => sum + counts[date]!, 0),
+        otherTotal: other.reduce((sum, date) => sum + counts[date]!, 0) }
     }
-    const counts = Object.fromEntries([...keys].map(([date, entries]) => [date, entries.size]))
-    const selectedDates = context.historyDates.filter(date => rule.days.includes(isoDay(date)))
-    const otherDates = context.historyDates.filter(date => !rule.days.includes(isoDay(date)))
-    history = { dates: context.historyDates, selectedDates, otherDates, counts,
-      selectedTotal: selectedDates.reduce((sum, date) => sum + counts[date]!, 0),
-      otherTotal: otherDates.reduce((sum, date) => sum + counts[date]!, 0) }
-  }
-  const groups = new Map<string, string[]>()
-  for (let time = first; new Date(time).toISOString().slice(0, 7) === state.month; time += DAY) {
-    const date = new Date(time).toISOString().slice(0, 10)
-    const monday = new Date(time - (isoDay(date) - 1) * DAY).toISOString().slice(0, 10)
-    if (!groups.has(monday)) groups.set(monday, [])
-    groups.get(monday)!.push(date)
-  }
-  return [...groups].map(([id, dates]) => targets({
-    id, dates,
-    selectedDates: dates.filter(date => rule.days.includes(isoDay(date))),
-    otherDates: dates.filter(date => !rule.days.includes(isoDay(date))),
-    ...(context?.weekStart === id && history ? { history } : {}),
-  }, rule, fullTotal))
+    return targets({ id: week.weekStart, dates, selectedDates, otherDates, ...(history ? { history } : {}) }, rule, fullTotal)
+  })
 }
 
 /**
@@ -110,7 +104,7 @@ export function findWeightedWeek(state: PlannerState, week: WeightedWeek, select
   if (!rule || weekdayWeightRuleError(rule) || !Number.isSafeInteger(selectedActual) || selectedActual < 0 || !Number.isSafeInteger(otherActual) || otherActual < 0) return null
   if (selectedActual > week.selectedDates.length * state.employees.length || otherActual > week.otherDates.length * state.employees.length) return null
   const max = state.employees.length * 7
-  const full = week.dates.length === 7 || !!week.history
+  const full = week.dates.length + (week.history?.dates.length ?? 0) === 7
   const start = full ? selectedActual + otherActual + (week.history ? week.history.selectedTotal + week.history.otherTotal : 0) : 0
   const end = full ? Math.min(start, max) : max
   for (let total = start; total <= end; total++) {

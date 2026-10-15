@@ -1,6 +1,7 @@
 import type { PlannerState } from './domain.ts'
 import type { SolverRequest } from './DesktopSolver.ts'
 import { resolveHoursState } from './hours.ts'
+import { schedulingReferenceDate } from './weekBoundary.ts'
 
 const MAX_INPUT_BYTES = 8 * 1024 * 1024
 
@@ -27,7 +28,7 @@ export function createSolverRequest(state: PlannerState, options: SolverRequest[
   // debug requests; they remain intact in the live document and full backups.
   const current = resolveHoursState(state)
   const employees = current.employees.map(({ avatar: _avatar, ...employee }) => employee)
-  const snapshot = JSON.parse(stringify({ state: { ...current, employees }, options })) as { state: PlannerState; options: SolverRequest['options'] }
+  const snapshot = JSON.parse(stringify({ state: { ...current, employees }, options: { ...options, referenceDate: options.referenceDate ?? schedulingReferenceDate() } })) as { state: PlannerState; options: SolverRequest['options'] }
   return { protocolVersion: 1, requestId, state: snapshot.state, options: snapshot.options }
 }
 

@@ -4,11 +4,12 @@ import { checkDesktopResult, formatUserIssue, formatUserMessage } from '../Deskt
 import { datesOfMonth, generateSchedule } from '../scheduler.ts'
 
 function fixture(allowPartial = true) {
-  return { protocolVersion: 1, requestId: 'test-request', options: { timeLimitSeconds: 5, allowPartial, seed: 1 }, state: {
+  return { protocolVersion: 1, requestId: 'test-request', options: { timeLimitSeconds: 5, allowPartial, seed: 1, referenceDate: '2030-01-01' }, state: {
     version: 1, teamName: '本地测试', month: '2026-10',
     employees: [{ id: 'e1', name: '小林', role: '员工', group: '一组', color: '#abc', maxHoursPerWeek: 40, eligibleShiftIds: ['day'], unavailableDates: ['2026-10-02'] }],
     shifts: [{ id: 'day', name: '早班', shortName: '早', start: '08:00', end: '16:00', color: '#abc', required: 1 }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5, balanceWeekends: true }, assignments: [],
+    scheduleCoverage: { '2026-09': { employeeIds: ['e1'] }, '2026-11': { employeeIds: ['e1'] } },
   } }
 }
 function result(request, fields = {}) {
@@ -86,6 +87,7 @@ function fixedStaffingFixture(allowPartial = false, required = 1) {
   const request = fixture(allowPartial)
   request.state.shifts[0] = { ...request.state.shifts[0], required, staffingMode: 'fixed' }
   request.state.employees = ['e1', 'e2'].map(id => ({ ...request.state.employees[0], id, name: id, unavailableDates: [], maxHoursPerWeek: 168 }))
+  request.state.scheduleCoverage = { '2026-09': { employeeIds: ['e1', 'e2'] }, '2026-11': { employeeIds: ['e1', 'e2'] } }
   request.state.rules = { minRestHours: 0, maxConsecutiveDays: 31 }
   return request
 }

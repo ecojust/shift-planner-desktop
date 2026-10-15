@@ -6,13 +6,14 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { makeDefaultState } from '../src/defaults.ts';
 import { monthlyHoursByEmployee, resolveHoursState } from '../src/hours.ts';
-import { datesOfMonth, validateSchedule } from '../src/scheduler.ts';
+import { datesOfMonth, validateBoundaryPreview } from '../src/scheduler.ts';
 import { captureFrozen, parseFrozenInfo } from './frozen-process.mjs';
 import { runtimeInventory, solverSources } from './runtime-files.mjs';
 import { verifyMacSignature } from './verify-macos-signature.mjs';
 import { validateBuildVersion } from './build-version.ts';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const BUNDLE_REFERENCE_DATE = '2026-10-15';
 const platforms = {
   'x86_64-pc-windows-msvc': { id: 'windows-x64', os: 'win32', nodeArch: 'x64', nativeArch: 'x86_64' },
   'x86_64-apple-darwin': { id: 'macos-x64', os: 'darwin', nodeArch: 'x64', nativeArch: 'x86_64' },
@@ -25,6 +26,9 @@ export function makeBundleScheduleFixtures() {
   const coverage = {
     ...base,
     employees: base.employees.map(({ minHoursPerMonth: _legacy, ...employee }) => ({ ...employee, minHoursPerWeek: 0 })),
+    // The previous month is confirmed rest. The unknown next Sunday must be
+    // planned provisionally with real coverage and employee constraints.
+    scheduleCoverage: { '2026-09': { employeeIds: base.employees.map(employee => employee.id) } },
   };
   // Retain the historical fixture/report key for native-workflow consumers.
   // Weekly minima are individually valid, but fixed staffing offers only 280
@@ -41,6 +45,15 @@ export function makeBundleScheduleFixtures() {
     })),
     shifts: [{ ...base.shifts[0], id: 'day', required: 1 }],
     rules: { minRestHours: 11, maxConsecutiveDays: 5, weekdayWeights: { days: [6, 7], percent: 40 } },
+    scheduleCoverage: Object.fromEntries(['2026-09', '2026-11'].map(month => [month, { employeeIds: base.employees.slice(0, 2).map(employee => employee.id) }])),
+    // The true first/last complete weeks both have nine starts: one on each
+    // weekday and two on each weekend day. These five outside starts are fixed.
+    assignments: [
+      { employeeId: base.employees[0].id, date: '2026-09-28', shiftId: 'day', locked: false },
+      { employeeId: base.employees[1].id, date: '2026-09-29', shiftId: 'day', locked: true },
+      { employeeId: base.employees[0].id, date: '2026-09-30', shiftId: 'day', locked: false },
+      ...base.employees.slice(0, 2).map(employee => ({ employeeId: employee.id, date: '2026-11-01', shiftId: 'day', locked: false })),
+    ],
   };
   return { coverage: resolveHoursState(coverage), reference: resolveHoursState(reference), weighted: resolveHoursState(weighted) };
 }
@@ -51,7 +64,7 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
   const fixtures = makeBundleScheduleFixtures();
   async function solve(name) {
     const state = fixtures[name], requestId = `${requestIdPrefix}-${name}`;
-    const request = { protocolVersion: 1, requestId, state, options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010 } };
+    const request = { protocolVersion: 1, requestId, state, options: { timeLimitSeconds: 5, allowPartial: false, seed: 1010, referenceDate: BUNDLE_REFERENCE_DATE } };
     const execution = await runSolver(request), result = JSON.parse(execution.stdout);
     assert.equal(result.protocolVersion, 1);
     assert.equal(result.requestId, requestId);
@@ -62,6 +75,9 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
     assert.ok(['OPTIMAL', 'FEASIBLE'].includes(check.result.status), check.result.message);
     assert.ok(check.result.assignments.length >= minimumCount, 'A feasible roster must cover at least the baseline shift count');
     assert.equal(check.result.stats.shortageCount, 0);
+    assert.ok(Array.isArray(check.result.boundaryPreview), 'A feasible result must include its independently verifiable boundary preview');
+    const outside = assignments => assignments.filter(item => !item.date.startsWith(`${check.state.month}-`));
+    assert.deepEqual(outside(check.result.assignments), outside(check.state.assignments), 'Provisional neighboring work must never be published or alter saved outside assignments');
     // Check daily coverage directly, rather than relying on a fixed total count
     // or letting extra assignments on one date hide a shortage on another.
     for (const date of datesOfMonth(check.state.month)) {
@@ -70,7 +86,7 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
         assert.ok(count >= shift.required, `${date} ${shift.id}: daily minimum coverage is missing`);
       }
     }
-    const issues = validateSchedule({ ...check.state, assignments: check.result.assignments });
+    const issues = validateBoundaryPreview({ ...check.state, assignments: check.result.assignments }, check.result.boundaryPreview, BUNDLE_REFERENCE_DATE);
     assert.deepEqual(issues, [], 'Actual app schedule must pass independent TypeScript rules');
     return issues;
   }
@@ -78,6 +94,10 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
   assert.equal(coverage.state.employees.length, 12);
   assert.deepEqual(coverage.state.shifts.map(shift => shift.required), [2, 2, 1]);
   const independentRuleIssues = feasible(coverage, 155);
+  const futureSunday = coverage.result.boundaryPreview.filter(item => item.date === '2026-11-01');
+  for (const shift of coverage.state.shifts) {
+    assert.ok(futureSunday.filter(item => item.shiftId === shift.id).length >= shift.required, `Future Sunday ${shift.id}: provisional coverage is missing`);
+  }
 
   const reference = await solve('reference');
   assert.ok(reference.state.employees.every(employee => employee.minHoursPerWeek === 40 && employee.maxHoursPerWeek === 48));
@@ -97,39 +117,36 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
     weeks.set(week, [...(weeks.get(week) ?? []), date]);
   }
   const rule = weighted.state.rules.weekdayWeights;
-  const weeklyHours = [...weeks].flatMap(([week, dates]) => weighted.state.employees.map(employee => {
-    // This day-shift fixture has no outside-month history. Audit actual minutes
-    // independently, including prorated first/last weeks and the full weekly cap.
+  const fullWeekDates = week => Array.from({ length: 7 }, (_, index) => new Date(Date.parse(`${week}T00:00:00Z`) + index * 86400000).toISOString().slice(0, 10));
+  assert.deepEqual(weighted.result.boundaryPreview, [], 'Confirmed neighbors require no provisional assignments');
+  const weeklyHours = [...weeks].flatMap(([week]) => weighted.state.employees.map(employee => {
+    // All seven days are known: sum actual current and retained outside shifts,
+    // independently of the application's boundary-target implementation.
+    const dates = fullWeekDates(week);
     const minutes = weighted.result.assignments.filter(item => item.employeeId === employee.id && dates.includes(item.date) && item.shiftId === 'day').length * 8 * 60;
-    const minimumMinutes = Math.ceil(employee.minHoursPerWeek * 60 * dates.length / 7);
+    const minimumMinutes = Math.ceil(employee.minHoursPerWeek * 60);
     const maximumMinutes = Math.floor(employee.maxHoursPerWeek * 60);
     assert.ok(minutes >= minimumMinutes, `${week} ${employee.id}: weekly minimum is missing`);
     assert.ok(minutes <= maximumMinutes, `${week} ${employee.id}: weekly maximum is exceeded`);
     return { week, employeeId: employee.id, minutes, minimumMinutes, maximumMinutes };
   }));
-  const weeklyQuotas = [...weeks].map(([week, dates]) => {
+  const weeklyQuotas = [...weeks].map(([week]) => {
+    const dates = fullWeekDates(week);
     const assignments = weighted.result.assignments.filter(item => dates.includes(item.date) && item.shiftId !== 'off');
     const selectedDates = dates.filter(date => rule.days.includes((new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7 + 1));
     const otherDates = dates.filter(date => !selectedDates.includes(date));
     const selectedCount = assignments.filter(item => selectedDates.includes(item.date)).length;
     const otherCount = assignments.length - selectedCount;
-    // Independently find a full-week count W whose rounded original weekday
-    // shares match this month's segment. Do not impose per-shift weekly quotas.
-    const candidates = [];
-    for (let total = 0; total <= weighted.state.employees.length * 7; total++) {
-      const fullSelected = Math.ceil(total * rule.percent / 100);
-      const selected = Math.ceil(fullSelected * selectedDates.length / rule.days.length);
-      const other = rule.days.length === 7 ? 0 : Math.ceil((total - fullSelected) * otherDates.length / (7 - rule.days.length));
-      if (selected === selectedCount && other === otherCount) candidates.push(total);
-    }
-    assert.ok(candidates.length, `${week}: actual counts violate the configured weekday share`);
+    assert.equal(selectedCount, Math.ceil(assignments.length * rule.percent / 100), `${week}: actual complete-week counts violate the configured weekday share`);
+    assert.equal(otherCount + selectedCount, assignments.length);
     for (const group of [selectedDates, otherDates]) {
       const counts = group.map(date => assignments.filter(item => item.date === date).length);
       if (counts.length) assert.ok(Math.max(...counts) - Math.min(...counts) <= 1, `${week}: weekday group is not evenly distributed`);
     }
-    return { week, totalTarget: assignments.length, selectedTarget: selectedCount, assignmentCount: assignments.length, selectedCount, fullWeekCountCandidates: candidates };
+    return { week, totalTarget: assignments.length, selectedTarget: selectedCount, assignmentCount: assignments.length, selectedCount, fullWeekCountCandidates: [assignments.length] };
   });
   return { ...coverage, independentRuleIssues, constraintChecks: {
+    futureBoundary: { referenceDate: BUNDLE_REFERENCE_DATE, provisionalAssignmentCount: coverage.result.boundaryPreview.length, persistedOutsideAssignmentCount: outsideCount(coverage.result.assignments, coverage.state.month) },
     defaultReference: { fixtureKind: 'impossible-weekly-fixed-capacity', status: reference.result.status, minimumWeeklyHoursPerEmployee: 40, totalMinimumWeeklyHours: 480, fixedWeeklyCapacityHours: 280, issueTypes: reference.result.issues.map(issue => issue.type), suppliedAssignments: false },
     positiveMinimumsAndWeights: { status: weighted.result.status, month: weighted.state.month, employeeCount: weighted.state.employees.length,
       minHoursPerWeek: 14, weekdayWeights: weighted.state.rules.weekdayWeights,
@@ -137,6 +154,8 @@ export async function verifyScheduleFixtures(runSolver, requestIdPrefix) {
       monthlyHours, weeklyHours, weeklyQuotas, independentRuleIssues: weightedIssues, elapsedSeconds: weighted.execution.elapsedSeconds },
   } };
 }
+
+function outsideCount(assignments, month) { return assignments.filter(item => !item.date.startsWith(`${month}-`)).length; }
 
 /** Keep target selection explicit: a Linux run cannot stand in for a native test. */
 export function targetConfiguration(target, platformId) {

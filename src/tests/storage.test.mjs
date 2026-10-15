@@ -260,6 +260,7 @@ test('Excel partial weeks show their actual counts and a matching complete-week 
 
 function carriedWeightedFixture() {
   const state = weightedFixture()
+  state.scheduleCoverage = { '2026-09': { employeeIds: state.employees.map(employee => employee.id) } }
   state.assignments = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04']
     .map(date => ({ employeeId: 'e1', date, shiftId: 'early', locked: false }))
   state.assignments.push(...['2026-10-03', '2026-10-04'].map(date => ({ employeeId: 'e2', date, shiftId: 'night', locked: false })))

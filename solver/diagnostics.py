@@ -119,7 +119,7 @@ def daily_capacity_issues(employees, shifts, dates, x, fixed_coverage, fixed_cel
                 reason = '未勾选该班次资格'
             elif (eid, day) in fixed_cells:
                 a = fixed_cells[(eid, day)]
-                reason = '已锁定休息' if a['shiftId'] == 'off' else '已有其他固定班次'
+                reason = ('已锁定休息' if a['locked'] else '相邻月份已确认休息') if a['shiftId'] == 'off' else '已有其他固定班次'
             else:
                 clock, duration = shift_times[sid]
                 start, end = day * 1440 + clock, day * 1440 + clock + duration
@@ -220,8 +220,8 @@ def weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_cov
         for day in days:
             fixed_count = sum(len(fixed_coverage[(day, s['id'])]) for s in shifts)
             if day not in active_dates:
-                # Historical staffing is immutable, including unrecorded zero
-                # days. Today's required staffing must not rewrite the past.
+                # Only explicitly known historical days reach this helper.
+                # Today's required staffing must not rewrite their counts.
                 bounds[day] = fixed_count, fixed_count
                 continue
             eligible = {e['id'] for e in employees for s in shifts if (e['id'], day, s['id']) in x}
@@ -250,10 +250,10 @@ def weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_cov
         if not viable:
             labels = '、'.join(str(d) for d in weights['days'])
             detail = '；'.join(f'{day_text(day)[5:]}：{a} 人' if a == b else f'{day_text(day)[5:]}：{a}–{b} 人' for day, (a, b) in bounds.items())
-            context = ('首周合并上月固定工作记录，历史空白按 0 人计算。' if any(day not in active_dates for day in days) else
-                       '月边界按当月实际包含的星期折算。')
+            context = ('完整自然周合并已确认记录与临时预排。' if len(days) == 7 else
+                       '未知历史日期不视为休息，仅对可核对日期按星期组比例折算。')
             return [problem('weekday-weight-capacity',
                 f'{day_text(week)} 起这一周，星期 {labels} 合计 {weights["percent"]}%（向上取整、组内均摊）的要求与每日人数范围冲突。当前可行范围：{detail}。' + context,
                 '调整所选星期或百分比，或调整相关班次固定/最少人数、人员可用日期；当前每天的人数范围内不存在满足此比例的组合。',
-                'rules', date=day_text(min(day for day in days if day in active_dates)))]
+                'rules', date=day_text(min((day for day in days if day in active_dates), default=min(days))))]
     return []

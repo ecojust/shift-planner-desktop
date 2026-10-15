@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { datesOfMonth, generateSchedule, validateSchedule } from '../scheduler.ts'
+import { datesOfMonth, generateSchedule as generate, validateSchedule as validate } from '../scheduler.ts'
+const referenceDate = '2030-01-01'
+const withoutBoundaryNotices = issues => issues.filter(issue => !['boundary-history-incomplete', 'boundary-future-unconfirmed'].includes(issue.type))
+const generateSchedule = (state, seed) => { const result = generate(state, seed, undefined, { referenceDate }); return { ...result, issues: withoutBoundaryNotices(result.issues) } }
+const validateSchedule = state => withoutBoundaryNotices(validate(state, { referenceDate }))
 import { checkDesktopResult } from '../DesktopSolver.ts'
 
 const shifts = [
@@ -206,7 +210,7 @@ test('independent native-result validation rejects forged success that violates 
     fixture({ weeklyShiftLimits: [weekly('day', 1)] }),
   ]
   for (const state of cases) for (const allowPartial of [false, true]) {
-    const request = { protocolVersion: 1, requestId: 'new-rule-validation', state, options: { allowPartial, timeLimitSeconds: 5, seed: 1 } }
+    const request = { protocolVersion: 1, requestId: 'new-rule-validation', state, options: { allowPartial, timeLimitSeconds: 5, seed: 1, referenceDate } }
     const response = { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', status: 'OPTIMAL', assignments: [assignment('2026-10-05'), assignment('2026-10-06')], issues: [], stats: { wallTimeSeconds: 0.1, shortageCount: 0, optimal: true }, message: '成功' }
     const checked = checkDesktopResult(request, response)
     assert.equal(checked.success, false)
@@ -218,11 +222,11 @@ test('independent native-result validation rejects forged success that violates 
 
 test('native-result validation accepts a cap-compliant schedule across Sunday overnight and Monday', () => {
   const state = fixture({ weeklyShiftLimits: [weekly('night', 1)] })
-  const request = { protocolVersion: 1, requestId: 'native-start-week', state, options: { allowPartial: false, timeLimitSeconds: 5, seed: 1 } }
+  const request = { protocolVersion: 1, requestId: 'native-start-week', state, options: { allowPartial: false, timeLimitSeconds: 5, seed: 1, referenceDate } }
   const assignments = [assignment('2026-10-04', 'night'), assignment('2026-10-05', 'night')]
   const response = { protocolVersion: 1, requestId: request.requestId, engine: 'ortools-cp-sat', status: 'FEASIBLE', assignments, issues: [], stats: { wallTimeSeconds: 0.1, shortageCount: 0, optimal: false }, message: '' }
   const checked = checkDesktopResult(request, response)
   assert.equal(checked.success, true)
   assert.deepEqual(checked.assignments, assignments)
-  assert.deepEqual(checked.issues, [])
+  assert.deepEqual(withoutBoundaryNotices(checked.issues), [])
 })
