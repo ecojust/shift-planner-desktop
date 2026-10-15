@@ -26,3 +26,5 @@
 满足规则后尽量均衡工作量与各班次次数。生成失败或取消时保留原表。
 
 [开发与构建](docs/DESKTOP_BUILD.md) · [工时说明](docs/HOURS.md) · [星期权重](docs/WEEKDAY_WEIGHTS.md) · [验证记录](docs/VERIFICATION.md)
+
+桌面版右上角 **Setting** 可直接开启 MCP，同时提供 HTTP API，让外部 AI 读取和修改当前排班数据。设置中会显示连接地址、访问令牌及可复制的 MCP 配置，无需安装额外工具或运行命令。[连接与接口说明](docs/INTEGRATIONS.md)

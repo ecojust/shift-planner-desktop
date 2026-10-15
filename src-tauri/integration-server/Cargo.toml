@@ -1,0 +1,17 @@
+[package]
+name = "shift-integration-server"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.90"
+
+[dependencies]
+axum = "0.8"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "time", "macros"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

@@ -86,7 +86,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
+          workspaces: |
+            src-tauri -> target
+            src-tauri/integration-server -> target
           shared-key: ${{ matrix.id }}
       - name: Verify native Node, Python and Rust architecture
         run: |
@@ -139,6 +141,8 @@ jobs:
             process.exitCode = code ?? 1;
           });
           NODE
+      - name: Test embedded MCP and HTTP service
+        run: cargo test --locked --manifest-path src-tauri/integration-server/Cargo.toml
       - name: Test Rust process lifecycle
         run: |
           node --input-type=module <<'NODE'

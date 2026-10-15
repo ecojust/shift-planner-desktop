@@ -3,6 +3,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
+import IntegrationSettings from './IntegrationSettings.vue'
+import { useIntegrations } from './integrations'
 import EmployeeAvatar from './EmployeeAvatar.vue'
 import MonthPicker from './MonthPicker.vue'
 import AppSelect from './AppSelect.vue'
@@ -44,6 +46,7 @@ const showIssues = ref(false)
 const showBackup = ref(false)
 const showGenerate = ref(false)
 const showHelp = ref(false)
+const showIntegrationSettings = ref(false)
 const monthDeletion = ref<{ month: string; count: number; revision: number } | null>(null)
 const deleteMonthButton = ref<HTMLButtonElement | null>(null)
 const cancelMonthDeletionButton = ref<HTMLButtonElement | null>(null)
@@ -80,6 +83,21 @@ const calendarKind = ref<DayKind>('workday')
 const calendarReset = ref<{ date: string; revision: number } | null>(null)
 const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]>; source: string }[]>([])
 const savedAt = ref('')
+const integration = useIntegrations(
+  () => state.value,
+  document => {
+    const next = { ...createPayrollConfig(), ...document } as Document
+    saveLocal(next)
+    state.value = next
+    savedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    saveError.value = ''
+    history.value = []
+    scheduleSource.value = '已通过 MCP / HTTP 更新'
+    flash('外部排班修改已保存')
+  },
+  () => !!saveError.value || generating.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || !!monthDeletion.value || !!calendarReset.value || section.value !== 'calendar',
+)
+
 const navigation: { key: Section; label: string; icon: string }[] = [
   { key: 'calendar', label: '排班日历', icon: 'calendar' }, { key: 'team', label: '成员管理', icon: 'people' },
   { key: 'shifts', label: '班次设置', icon: 'clock' }, { key: 'rules', label: '排班规则', icon: 'rules' },
@@ -455,6 +473,7 @@ watch([generating, cancelling], async () => {
 </script>
 
 <template>
+  <IntegrationSettings v-if="showIntegrationSettings" :integration="integration" @close="showIntegrationSettings = false" />
   <div class="sp-app">
     <button v-if="mobileNav" class="sp-nav-scrim" aria-label="关闭导航" @click="mobileNav = false"></button>
     <aside class="sp-sidebar" :class="{ 'is-open': mobileNav }">
@@ -471,7 +490,7 @@ watch([generating, cancelling], async () => {
           <button class="sp-icon-button" aria-label="下个月" :disabled="state.month === '9999-12'" @click="navigateMonth(1)"><Icon name="arrow" :size="16" /></button>
           <button class="sp-current-month" title="返回本月及今天所在周" @click="goToday">本月</button>
         </div>
-        <div class="sp-top-actions"><span class="sp-save-indicator" :class="{ error: saveError }"><i></i>{{ saveError ? '保存异常' : savedAt ? `${savedAt} 已保存` : '本地保存' }}</span><span class="sp-build-version" title="北京时间 · 本次软件构建时间" :aria-label="`构建版本 ${BUILD_VERSION}`"><span>构建</span><code>{{ BUILD_VERSION }}</code></span></div>
+        <div class="sp-top-actions"><button class="sp-button" aria-haspopup="dialog" @click="showIntegrationSettings = true">⚙ Setting</button><span class="sp-save-indicator" :class="{ error: saveError }"><i></i>{{ saveError ? '保存异常' : savedAt ? `${savedAt} 已保存` : '本地保存' }}</span><span class="sp-build-version" title="北京时间 · 本次软件构建时间" :aria-label="`构建版本 ${BUILD_VERSION}`"><span>构建</span><code>{{ BUILD_VERSION }}</code></span></div>
       </header>
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
