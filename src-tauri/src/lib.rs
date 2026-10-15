@@ -23,6 +23,7 @@ pub fn run() {
             integrations::integration_stop,
             integrations::integration_status,
             integrations::integration_respond,
+            integrations::integration_claim_request,
         ])
         .build(tauri::generate_context!())
         .expect("无法启动 Shift Schedule Expert 桌面应用");

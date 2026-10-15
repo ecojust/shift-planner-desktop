@@ -1,6 +1,6 @@
 # MCP 与 HTTP API
 
-桌面版内置 MCP 与 HTTP API 服务。外部 AI 可读取当前应用的数据，修改人员、班次、规则和排班，并检查规则冲突。
+桌面版内置 MCP 与 HTTP API 服务。外部 AI 可读取当前应用的数据，修改人员、班次、规则和排班，调用内置求解器按配置生成排班，并检查规则冲突。
 
 ## 开启与连接
 
@@ -25,7 +25,7 @@
 | 排班规则 | 关闭 | `rules`、日期设置 `calendar`、月参考工时 `monthlyReferenceHours` |
 | 排班结果 | 关闭 | `assignments`，包括新增、修改、删除排班及锁定状态 |
 
-默认仅允许修改成员。需要让 AI 安排班次时，先开启「排班结果」权限；`set_assignment`、`POST /api/assignments` 和完整文档中的排班变更都受此权限控制。
+默认仅允许修改成员。需要让 AI 安排班次时，先开启「排班结果」权限；求解器生成、`set_assignment`、`POST /api/assignments` 和完整文档中的排班变更都受此权限控制。
 
 整体替换文档也会比较实际变更的字段，不能通过 `replace_state` 或 `PUT /api/state` 绕过权限。一次请求包含任何未授权修改时，整个请求都会被拒绝，数据不会部分更新：HTTP 返回 403，MCP 返回 `isError: true`。删除成员时，如果同时需要清理该成员的排班或规则，还需开启相应类别的权限。
 
@@ -51,7 +51,7 @@ MCP／HTTP 修改使用高对比底色、图标和「MCP 修改」「HTTP 修改
 
 保存成员、班次或排班规则的变更后，包括日期类型和月参考工时，所有已有排班记录的月份都会显示「规则已修改，排班已失效」，原排班仍保留。规则导入如果改变这些配置，也会使已有排班失效。
 
-自动排班成功并保存后，仅解除当前月的失效状态。生成失败、未保存的草稿修改，以及点击「已核对变更」均不会解除失效。MCP／HTTP 的单条排班修改也不会解除；通过 `replace_state` 或 `PUT /api/state` 提交完整文档时，只有本次未修改配置、排班实际变化且检查无规则错误并满足覆盖要求的月份，才恢复为「已排班」。
+自动排班成功并保存后，仅解除生成目标月份的失效状态；通过 MCP／HTTP 调用求解器生成也遵循此规则。生成失败、未保存的草稿修改，以及点击「已核对变更」均不会解除失效。MCP／HTTP 的单条排班修改也不会解除；通过 `replace_state` 或 `PUT /api/state` 提交完整文档时，只有本次未修改配置、排班实际变化且检查无规则错误并满足覆盖要求的月份，才恢复为「已排班」。
 
 状态随数据保存，重启后保留；完整备份恢复其自身状态。旧数据已有排班记录但没有失效历史时，默认显示「已排班」。
 
@@ -59,7 +59,7 @@ MCP／HTTP 修改使用高对比底色、图标和「MCP 修改」「HTTP 修改
 
 开启「排班结果」权限后，MCP 或 HTTP 成功写入排班结果，排班日历主页会显示当前月份最近一次外部排班生成／更新时间及来源，精确到秒。此时间是软件成功保存结果的时间，由软件记录，不能由调用方指定。
 
-记录按实际受影响的月份分别保存；更新其他月份不会改变当前月份的时间。仅修改配置、读取数据、提交相同排班、请求被拒绝或保存失败时，不更新排班时间。后续手动调整仍保留最近一次外部写入时间。时间保存在 `state.provenance.scheduleUpdates`，重启和完整备份恢复后保留；没有历史记录的月份不会补造时间。
+记录按目标月份分别保存；更新其他月份不会改变当前月份的时间。调用求解器成功生成并保存时，即使结果与原排班相同，也会更新生成时间并解除该月失效状态。普通写入接口提交相同排班、仅修改配置、读取数据、请求被拒绝或保存失败时，不更新排班时间。后续手动调整仍保留最近一次外部写入时间。时间保存在 `state.provenance.scheduleUpdates`，重启和完整备份恢复后保留；没有历史记录的月份不会补造时间。
 
 ## 数据与冲突
 
@@ -71,7 +71,7 @@ MCP／HTTP 修改使用高对比底色、图标和「MCP 修改」「HTTP 修改
 
 ## HTTP
 
-先在设置中开启 **HTTP**。每个请求均需要 `Authorization: Bearer <HTTP 访问令牌>`，写入请求体为 JSON。HTTP 服务只提供下列四种接口，不提供 `/mcp`；MCP 服务地址也不提供这些 HTTP 接口。以下示例使用 HTTP 默认端口 `4319`，请按设置中的实际地址调整。
+先在设置中开启 **HTTP**。每个请求均需要 `Authorization: Bearer <HTTP 访问令牌>`，写入请求体为 JSON。HTTP 服务只提供下列五种接口，不提供 `/mcp`；MCP 服务地址也不提供这些 HTTP 接口。以下示例使用 HTTP 默认端口 `4319`，请按设置中的实际地址调整。
 
 ```bash
 curl http://127.0.0.1:4319/api/state \
@@ -83,6 +83,7 @@ curl http://127.0.0.1:4319/api/state \
 | `GET /api/state` | 返回当前文档 `{ revision, state }` |
 | `PUT /api/state` | 请求 `{ revision, state }`，按修改权限校验并整体替换文档，返回 `{ revision, state }` |
 | `POST /api/assignments` | 更新一个人一天的排班，参数见下表，返回 `{ revision, state }` |
+| `POST /api/schedules/generate` | 按当前保存配置调用内置求解器，参数及结果见下文 |
 | `GET /api/validate` | 返回 `{ revision, issues }`，检查当前排班的规则冲突 |
 
 `PUT /api/state` 接收当前文档的完整替换内容，不是局部字段补丁。先用 `GET /api/state` 获取最新的 `{ revision, state }`，在完整 `state` 中修改获授权的数据，再将两者一起提交。必须保留其他字段和所有月份的排班；只提交成员列表等部分内容会被拒绝，省略可选配置也可能被视为删除。成员、班次和规则的批量修改都使用此接口，没有独立的成员／班次／规则写入路由。
@@ -129,6 +130,33 @@ curl -X PUT http://127.0.0.1:4319/api/state \
 
 完整文档结构与应用导出的 JSON 备份一致。无效日期、未知员工或班次、重复排班等会被拒绝；规则冲突可通过 `GET /api/validate` 检查，手动排班仍允许保留待解决的规则冲突。
 
+### 按配置生成排班
+
+`POST /api/schedules/generate` 与 MCP 的 `generate_schedule` 调用桌面版内置 OR-Tools CP-SAT 求解器，读取软件已经保存的成员、班次和规则，保留锁定排班，并计入月初跨月周所需的历史记录。请求不接受调用方提供的 `state`、随机种子或局部排班选项。
+
+| 参数 | 要求与含义 |
+| --- | --- |
+| `revision` | 必填，最近一次读取返回的版本 |
+| `month` | 可选，`YYYY-MM`，年份 1900–2200；省略时使用请求开始时软件当前激活的月份 |
+| `timeLimitSeconds` | 可选，1–60 秒，默认 15 秒；求解器计算时限 |
+
+先开启「排班结果」权限并读取 revision，再提交：
+
+```bash
+curl -X POST http://127.0.0.1:4319/api/schedules/generate \
+  -H 'Authorization: Bearer <HTTP 访问令牌>' \
+  -H 'Content-Type: application/json' \
+  --data '{"revision":"<最近读取到的 revision>","timeLimitSeconds":15}'
+```
+
+指定月份时，在请求体中增加 `"month":"2026-11"`。这不会切换软件当前激活的月份。设置弹窗提供可复制的 JavaScript 示例，会先读取最新 revision 再生成。
+
+成功返回 `{ success: true, saved: true, month, status, message, issues, stats, revision, state, generatedAt }`。结果经过独立规则检查并保存后才返回成功；只替换目标月份的排班，保留锁定记录、其他月份和原配置。
+
+无解、求解器限时内没有找到结果，或结果未通过独立检查时，返回 `{ success: false, saved: false, month, status, message, issues, stats, revision }`，不修改数据。此类求解结果的 HTTP 状态仍为 200，调用方必须检查 `success`；MCP 工具同样返回结构化结果。参数错误、权限不足、数据版本冲突、服务关闭和请求超时分别使用 HTTP 400／403／409／503／504，MCP 返回错误响应。
+
+求解器启动和结果检查需要额外时间，客户端请求超时建议至少设为 `timeLimitSeconds + 155` 秒。生成期间，应用会显示目标月份、调用来源和进度，并可取消；UI、MCP、HTTP 共用一个生成任务，重复生成及其他外部写入返回 409，读取和检查仍可用。提交前会再次检查配置版本、权限和服务状态；请求取消或服务关闭发生在提交确认之前时，不保存结果。已经接受提交的请求可能在客户端断开后完成保存，客户端应重新读取状态确认，避免自动重试覆盖结果。
+
 ## MCP
 
 先在设置中开启 **MCP**。MCP 服务仅提供无会话的 Streamable HTTP 端点 `/mcp`，通过 POST JSON-RPC 返回 JSON，不提供 SSE 订阅或 `/api/*` 接口。客户端需支持自定义 Bearer 头，并使用 MCP 自己的访问令牌。可直接复制设置中的配置；以下为默认端口下的结构示例，具体字段依客户端而定：
@@ -150,6 +178,7 @@ curl -X PUT http://127.0.0.1:4319/api/state \
 | `get_state` | `{}` | 获取完整文档和 revision |
 | `replace_state` | `{ revision, state }` | 按修改权限校验、保存并替换完整数据 |
 | `set_assignment` | 同 HTTP 单条排班请求 | 新增、修改或删除单条排班 |
+| `generate_schedule` | `{ revision, month?, timeLimitSeconds? }` | 按保存配置调用求解器生成并保存目标月排班；默认当前激活月份 |
 | `validate_schedule` | `{}` | 检查当前排班冲突 |
 
 `replace_state` 与 `PUT /api/state` 使用相同的完整文档替换规则；`set_assignment` 使用上方单条排班参数。两项服务共享同一份当前排班文档、revision 和写入权限，成功写入后另一项服务读取即可获得更新。

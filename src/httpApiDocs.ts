@@ -1,5 +1,5 @@
 export type HttpApiDoc = {
-  id: 'get-state' | 'put-state' | 'set-assignment' | 'validate'
+  id: 'get-state' | 'put-state' | 'set-assignment' | 'generate-schedule' | 'validate'
   method: 'GET' | 'PUT' | 'POST'
   path: string
   title: string
@@ -34,7 +34,7 @@ export function createHttpApiDocs(base: string, token: string): HttpApiDoc[] {
     `  --header ${shellQuote(`Authorization: Bearer ${token}`)} \\`,
     `  ${shellQuote(address + path)}`,
   ].join('\n')
-  const javascriptClient = `// 保存为 .mjs 文件，使用 Node.js 18+ 运行；先替换下方 REPLACE_ 占位符。
+  const javascriptClient = `// 保存为 .mjs 文件，使用 Node.js 18+ 运行；如有 REPLACE_ 占位符，请先替换。
 const base = ${JSON.stringify(address)};
 const token = ${JSON.stringify(token)};
 
@@ -126,6 +126,33 @@ const saved = await request('/api/assignments', {
   body: JSON.stringify({ revision, employeeId, date, shiftId, locked: false, remove: false, unlock: false }),
 });
 console.log(saved); // { revision, state }：保存后的完整快照`,
+    },
+    {
+      id: 'generate-schedule', method: 'POST', path: '/api/schedules/generate', title: '按配置生成排班',
+      description: '调用软件内置求解器，按已保存的成员、班次和规则生成目标月份，需要“排班结果”写入权限。成功并通过规则检查后才保存；保留锁定安排、其他月份和软件当前显示的月份。',
+      parameters: [authorization, revision, {
+        name: 'month（string，可选）', description: '目标月份，格式 YYYY-MM，年份 1900–2200；省略时使用请求开始时软件当前激活的月份。不会切换软件月份。',
+      }, {
+        name: 'timeLimitSeconds（number，可选）', description: '求解等待时长，1–60 秒，默认 15 秒；不包含首次启动准备时间。请求会等待生成完成，客户端请预留至少此时长加 155 秒。',
+      }],
+      body: JSON.stringify({ revision: 'REPLACE_WITH_LATEST_REVISION', month: '2026-11', timeLimitSeconds: 15 }, null, 2),
+      response: '200：{ success, saved, month, status, message, issues, stats, revision }。success 与 saved 均为 true 时已保存，并返回 state、generatedAt；无解或未找到可行方案时均为 false，原排班保留，请检查 message 与 issues。400 参数无效；403 无排班写权限；409 数据变更、正在编辑或已有生成任务；503 服务已关闭；504 请求过期。失败响应为 { "error": "错误说明" }。',
+      language: 'JavaScript',
+      example: `${javascriptClient}
+const { revision } = await request('/api/state');
+const parameters = { revision, timeLimitSeconds: 15 };
+// 默认生成软件当前激活的月份。需要指定月份时，取消下一行注释：
+// parameters.month = '2026-11';
+
+const result = await request('/api/schedules/generate', {
+  method: 'POST',
+  body: JSON.stringify(parameters),
+});
+if (!result.success) {
+  console.error(result.message, result.issues); // 原排班未改变。
+} else {
+  console.log(result.month, result.generatedAt, result.state); // 已通过检查并保存。
+}`,
     },
     {
       id: 'validate', method: 'GET', path: '/api/validate', title: '检查排班问题',

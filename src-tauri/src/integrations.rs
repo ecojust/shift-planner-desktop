@@ -71,10 +71,16 @@ pub async fn integration_start(
     if existing.enabled {
         return Ok(existing);
     }
-    let server = Server::start(
+    let cancellation_app = app.clone();
+    let server = Server::start_with_cancellation(
         Arc::new(move |request| {
             // Preserve the route-owned source alongside the untrusted client arguments.
             app.emit_to("main", "integration-request", request)
+                .map_err(|error| error.to_string())
+        }),
+        Arc::new(move |cancellation| {
+            cancellation_app
+                .emit_to("main", "integration-cancelled", cancellation)
                 .map_err(|error| error.to_string())
         }),
         ServerOptions::for_service(service),
@@ -133,4 +139,23 @@ pub fn integration_respond(
         .as_ref()
         .ok_or("服务已关闭")?
         .respond(&request_id, response)
+}
+
+#[tauri::command]
+pub fn integration_claim_request(
+    window: WebviewWindow,
+    runtime: State<'_, IntegrationRuntime>,
+    service: Service,
+    service_id: String,
+    request_id: String,
+) -> Result<(), String> {
+    require_main(&window)?;
+    runtime
+        .service(service)
+        .server
+        .lock()
+        .unwrap()
+        .as_ref()
+        .ok_or("服务已关闭")?
+        .claim_request(&service_id, &request_id)
 }

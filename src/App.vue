@@ -5,6 +5,7 @@ import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import IntegrationSettings from './IntegrationSettings.vue'
 import { useIntegrations } from './integrations'
+import { IntegrationError, type IntegrationGenerationAdapter, type IntegrationSource } from './integrationData'
 import { configurationFields, markSchedulesCurrent, withChangeProvenance, type ChangeStamp } from './dataProvenance'
 import { formatChangeTime } from './changeTime'
 import SourceBadge from './SourceBadge.vue'
@@ -60,6 +61,7 @@ const solveTimeLimit = ref(15)
 const elapsedSeconds = ref(0)
 const phaseSeconds = ref(0)
 const cancellationError = ref('')
+const externalGeneration = ref<{ source: IntegrationSource; month: string; timeLimitSeconds: number } | null>(null)
 let phaseStartedAt = 0
 let discardActiveResult = false
 const engineInfo = ref('正在准备自动排班…')
@@ -68,6 +70,18 @@ const engineDiagnostic = ref(false)
 const solvePhase = ref<SolverPhase>('starting')
 type Attempt = { request: SolverRequest; originalState: PlannerState; revision: number }
 let activeAttempt: Attempt | null = null
+type ExternalGenerationJob = {
+  request: SolverRequest
+  source: IntegrationSource
+  revision: number
+  cancelled: boolean
+  userCancelled: boolean
+  running: boolean
+  abortReason?: unknown
+  removeAbort?: () => void
+  cancelPromise?: Promise<boolean>
+}
+let externalGenerationJob: ExternalGenerationJob | null = null
 const solverFeedback = ref<{ success: boolean; message: string; details: string[]; issues: Issue[]; diagnostic: boolean; attempt: Attempt | null; stale: boolean } | null>(null)
 const expandedFeedback = ref(false)
 let engineCheckPending = false
@@ -98,6 +112,73 @@ function acceptProvenance(update: () => void) {
   acceptingProvenance = true
   try { update() } finally { acceptingProvenance = false }
 }
+function integrationEditingBusy() {
+  return !!saveError.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || readingRules.value || !!rulesImportCandidate.value || !!monthDeletion.value || !!calendarReset.value || showBackup.value || section.value !== 'calendar'
+}
+const integrationGeneration: IntegrationGenerationAdapter = {
+  acquire(request, source) {
+    if (!desktop || disposed) throw new IntegrationError('桌面排班服务暂不可用', 503)
+    if (generating.value || externalGenerationJob || integrationEditingBusy()) throw new IntegrationError('应用正在编辑或生成排班，请完成操作并返回排班日历后重试', 409)
+    const originalState = { ...clone(state.value), month: request.state.month }
+    const job: ExternalGenerationJob = { request, source, revision, cancelled: false, userCancelled: false, running: false }
+    externalGenerationJob = job
+    activeAttempt = { request, originalState, revision: job.revision }
+    activeRequestId = request.requestId
+    externalGeneration.value = { source, month: request.state.month, timeLimitSeconds: request.options.timeLimitSeconds }
+    // Settings save immediately, so its focus trap can give way to progress.
+    showIntegrationSettings.value = false; showHelp.value = false
+    beginGenerationProgress()
+    return {
+      assertCurrent: () => assertExternalGeneration(job),
+      release(outcome, error) {
+        job.removeAbort?.()
+        if (externalGenerationJob !== job) return
+        if (!disposed) {
+          const prefix = `${source.toUpperCase()} · ${request.state.month}：`
+          if (outcome) {
+            // The data handler already checked and persisted this exact result.
+            // Its own apply advances revision; do not treat that as stale input.
+            if (outcome.success) {
+              scheduleSource.value = `${source.toUpperCase()} 已生成 ${request.state.month} 排班`
+              if (state.value.month === request.state.month) showIssues.value = outcome.issues.length > 0
+            }
+            feedback(outcome.success, `${prefix}${outcome.message}`, [], false, outcome.success ? [] : outcome.issues)
+          } else if (job.userCancelled) feedback(false, `${prefix}本次排班已取消，原排班未改变。`)
+          else {
+            const failure = error instanceof IntegrationError ? { message: error.message, diagnostic: false } : formatSolverError(error ?? job.abortReason)
+            feedback(false, `${prefix}${failure.message}`, [], failure.diagnostic)
+          }
+        }
+        externalGenerationJob = null
+        finishGeneration()
+      },
+    }
+  },
+  async solve(request, signal) {
+    const job = externalGenerationJob
+    if (!job || job.request !== request) throw new IntegrationError('本次排班任务已失效', 409)
+    const aborted = () => {
+      job.abortReason = signal?.reason
+      void cancelExternalGeneration(job)
+    }
+    if (signal) {
+      signal.addEventListener('abort', aborted, { once: true })
+      job.removeAbort = () => signal.removeEventListener('abort', aborted)
+      if (signal.aborted) aborted()
+    }
+    await ensureProgressListener()
+    assertExternalGeneration(job)
+    job.running = true
+    try { return await solveDesktop(request) }
+    catch (error) {
+      // Preserve lifecycle HTTP status (permission/stop/deadline) instead of
+      // replacing it with the native process's generic cancellation error.
+      if (job.cancelled) throw job.abortReason instanceof Error ? job.abortReason : new IntegrationError('本次排班已取消，原排班未改变', 409)
+      throw error
+    }
+    finally { job.running = false }
+  },
+}
 const integration = useIntegrations(
   () => state.value,
   (document, source) => {
@@ -111,7 +192,8 @@ const integration = useIntegrations(
     scheduleSource.value = `已通过 ${source.toUpperCase()} 更新`
     flash(`${source.toUpperCase()} 修改已保存，请核对配置来源和排班检查结果`)
   },
-  () => !!saveError.value || generating.value || !!editing.value || !!calendarDate.value || !!importCandidate.value || readingRules.value || !!rulesImportCandidate.value || !!monthDeletion.value || !!calendarReset.value || section.value !== 'calendar',
+  () => generating.value || integrationEditingBusy(),
+  integrationGeneration,
 )
 
 const navigation: { key: Section; label: string; icon: string }[] = [
@@ -169,6 +251,7 @@ const dayAllowances = computed(() => new Map(payroll.value.dailyRows.map(row => 
 const employeeAllowances = computed(() => new Map(payroll.value.rows.map(row => [row.employeeId, row])))
 const filteredAllowanceTotal = computed(() => employees.value.reduce((sum, employee) => sum + Math.round((employeeAllowances.value.get(employee.id)?.totalAllowance ?? 0) * 100), 0) / 100)
 const monthTitle = computed(() => `${state.value.month.slice(0, 4)} 年 ${Number(state.value.month.slice(5))} 月`)
+const generationMonthTitle = computed(() => externalGeneration.value ? `${externalGeneration.value.month.slice(0, 4)} 年 ${Number(externalGeneration.value.month.slice(5))} 月` : monthTitle.value)
 const deletionMonthTitle = computed(() => monthDeletion.value ? `${monthDeletion.value.month.slice(0, 4)} 年 ${Number(monthDeletion.value.month.slice(5))} 月` : '')
 const period = computed(() => view.value === 'month' ? '整月总览' : `${Number(visibleDates.value[0]?.slice(8))} 日 — ${Number(visibleDates.value.at(-1)?.slice(8))} 日`)
 
@@ -306,10 +389,50 @@ function confirmCalendarReset() {
 let worker: Worker | null = null
 let workerTimer = 0
 let revision = 0
+function beginGenerationProgress() {
+  showGenerate.value = true; generating.value = true; cancelling.value = false
+  cancellationError.value = ''; discardActiveResult = false
+  solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solvePhase.value = desktop ? 'starting' : 'solving'
+  const started = performance.now(); phaseStartedAt = started
+  window.clearInterval(generationTimer)
+  generationTimer = window.setInterval(() => {
+    const now = performance.now()
+    elapsedSeconds.value = Math.max(0, Math.floor((now - started) / 1000))
+    phaseSeconds.value = Math.max(0, Math.floor((now - phaseStartedAt) / 1000))
+  }, 250)
+}
+function assertExternalGeneration(job: ExternalGenerationJob) {
+  if (disposed) throw new IntegrationError('应用已关闭，本次排班已停止', 503)
+  if (externalGenerationJob !== job || activeRequestId !== job.request.requestId || !generating.value) throw new IntegrationError('本次排班任务已失效', 409)
+  if (job.cancelled || discardActiveResult) throw job.abortReason instanceof Error ? job.abortReason : new IntegrationError('本次排班已取消，原排班未改变', 409)
+  if (job.revision !== revision) throw new IntegrationError('排班期间设置或排班发生变化，已保留你的修改。请读取最新 revision 后重试', 409)
+  if (integrationEditingBusy()) throw new IntegrationError('应用正在编辑或导入数据，已保留原排班，请完成操作后重试', 409)
+}
+async function cancelExternalGeneration(job: ExternalGenerationJob) {
+  job.cancelled = true
+  if (externalGenerationJob !== job) return
+  discardActiveResult = true; cancelling.value = true; cancellationError.value = ''
+  if (!job.running) return
+  try {
+    if (!job.cancelPromise) job.cancelPromise = cancelDesktop(job.request.requestId).finally(() => { job.cancelPromise = undefined })
+    const stopped = await job.cancelPromise
+    if (!disposed && externalGenerationJob === job && !stopped) {
+      cancelling.value = false
+      cancellationError.value = '取消尚未确认，可以重试取消；本次结果不会写入排班表。'
+    }
+  } catch (error) {
+    if (!disposed && externalGenerationJob === job) {
+      cancelling.value = false
+      cancellationError.value = formatSolverError(error, 'cancel').message
+    }
+  }
+  // The lease remains locked until the handler has discarded the candidate.
+}
 function finishGeneration() {
   worker?.terminate(); worker = null
   window.clearTimeout(workerTimer); window.clearInterval(generationTimer)
   generating.value = false; cancelling.value = false; activeRequestId = null
+  externalGeneration.value = null
   showGenerate.value = false
   void nextTick(() => {
     if (!disposed && !showGenerate.value && !generating.value) document.querySelector<HTMLButtonElement>('.sp-heading-actions .sp-primary')?.focus({ preventScroll: true })
@@ -352,15 +475,8 @@ async function checkEngine() {
 }
 async function generate() {
   if (generating.value || (desktop && engineState.value !== 'ready')) return
-  showGenerate.value = true; generating.value = true; cancelling.value = false
-  cancellationError.value = ''; discardActiveResult = false; activeAttempt = null
-  solverFeedback.value = null; elapsedSeconds.value = 0; phaseSeconds.value = 0; solvePhase.value = desktop ? 'starting' : 'solving'
-  const started = performance.now(); phaseStartedAt = started
-  generationTimer = window.setInterval(() => {
-    const now = performance.now()
-    elapsedSeconds.value = Math.max(0, Math.floor((now - started) / 1000))
-    phaseSeconds.value = Math.max(0, Math.floor((now - phaseStartedAt) / 1000))
-  }, 250)
+  externalGeneration.value = null; activeAttempt = null
+  beginGenerationProgress()
   let request: SolverRequest
   const inputRevision = revision
   try {
@@ -431,6 +547,11 @@ async function generate() {
 }
 async function cancelGeneration() {
   if (!generating.value || cancelling.value) return
+  if (externalGenerationJob) {
+    externalGenerationJob.userCancelled = true
+    await cancelExternalGeneration(externalGenerationJob)
+    return
+  }
   discardActiveResult = true; cancelling.value = true; cancellationError.value = ''
   if (!desktop) { feedback(false, '本次排班已取消，原排班未改变。'); finishGeneration(); return }
   const requestId = activeRequestId
@@ -775,14 +896,15 @@ watch([generating, cancelling], async () => {
 
     <div v-if="showGenerate" class="sp-overlay" @click.self="!generating && (showGenerate = false)">
       <section class="sp-modal sp-generate-modal" role="dialog" aria-modal="true" aria-labelledby="sp-generate-title" tabindex="-1">
-        <div class="sp-modal-heading"><h2 id="sp-generate-title">为 {{ monthTitle }} 生成排班</h2><button v-if="!generating" class="sp-icon-button" aria-label="关闭自动排班" @click="showGenerate = false"><Icon name="close" /></button></div>
+        <div class="sp-modal-heading"><h2 id="sp-generate-title">为 {{ generationMonthTitle }} 生成排班</h2><button v-if="!generating" class="sp-icon-button" aria-label="关闭自动排班" @click="showGenerate = false"><Icon name="close" /></button></div>
         <template v-if="generating">
+          <p v-if="externalGeneration" class="sp-external-generation-context" role="note" aria-label="外部排班生成任务">{{ externalGeneration.source.toUpperCase() }} 正在生成 {{ externalGeneration.month }} 排班<span v-if="externalGeneration.month !== state.month"> · 当前查看月份保持不变</span></p>
           <div class="sp-solve-progress sp-generation-progress">
             <span class="sp-solve-spinner" aria-hidden="true"></span>
             <div>
               <strong role="status" aria-live="polite">{{ cancelling ? '正在取消排班…' : cancellationError ? '取消尚未完成' : solverPhaseLabels[solvePhase] }}</strong>
               <p class="sp-generation-timing" aria-live="off"><span>总计 <span data-elapsed-seconds>{{ elapsedSeconds }}</span> 秒</span><span>· 当前阶段 <span data-phase-seconds>{{ phaseSeconds }}</span> 秒</span><span>· 完成前保留原表</span></p>
-              <p>排班搜索时限 {{ desktop ? solveTimeLimit : 30 }} 秒，结束后还需返回并校验结果。</p>
+              <p>排班搜索时限 {{ externalGeneration?.timeLimitSeconds ?? (desktop ? solveTimeLimit : 30) }} 秒，结束后还需返回并校验结果。</p>
             </div>
           </div>
           <p v-if="cancellationError" class="sp-generation-cancel-error" role="alert">{{ cancellationError }}</p>
@@ -861,6 +983,7 @@ watch([generating, cancelling], async () => {
 </template>
 
 <style scoped>
+.sp-external-generation-context { margin: 0 0 14px; color: #527663; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
 .sp-opening-week-note { margin-top: 12px; padding: 10px 12px; border-left: 3px solid #94b5a2; border-radius: 5px; background: #f3f7f4; color: #5c7869; font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
 .sp-opening-week-note strong { color: #3e6753; font-size: 12px; font-weight: 600; }
 .sp-opening-week-range { display: block; font-variant-numeric: tabular-nums; }

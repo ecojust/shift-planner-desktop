@@ -28,12 +28,14 @@ use tokio::{
     net::TcpListener,
     sync::{oneshot, watch, Semaphore},
     task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 use uuid::Uuid;
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024 + 65536;
 const MAX_PENDING: usize = 64;
 const MAX_CONNECTIONS: usize = 128;
+const COMMIT_RESPONSE_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -64,7 +66,10 @@ impl Service {
     fn supports_path(self, path: &str) -> bool {
         match self {
             Self::Mcp => path == "/mcp",
-            Self::Http => matches!(path, "/api/state" | "/api/assignments" | "/api/validate"),
+            Self::Http => matches!(
+                path,
+                "/api/state" | "/api/assignments" | "/api/validate" | "/api/schedules/generate"
+            ),
         }
     }
 }
@@ -88,6 +93,14 @@ pub struct BridgeRequest {
     pub service_id: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeCancellation {
+    pub request_id: String,
+    pub source: BridgeSource,
+    pub service_id: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BridgeError {
     pub status: u16,
@@ -101,11 +114,14 @@ pub struct BridgeResponse {
 }
 
 pub type EmitRequest = Arc<dyn Fn(BridgeRequest) -> Result<(), String> + Send + Sync>;
+pub type EmitCancellation = Arc<dyn Fn(BridgeCancellation) -> Result<(), String> + Send + Sync>;
 
 pub struct ServerOptions {
     pub service: Service,
     pub port: u16,
     pub request_timeout: Duration,
+    /// Startup, native watchdog and response overhead beyond the solver budget.
+    pub generation_overhead: Duration,
 }
 
 impl Default for ServerOptions {
@@ -123,6 +139,7 @@ impl ServerOptions {
                 Service::Http => 4319,
             },
             request_timeout: Duration::from_secs(15),
+            generation_overhead: Duration::from_secs(150),
         }
     }
 }
@@ -132,15 +149,68 @@ struct Shared {
     info: ServerInfo,
     active: AtomicBool,
     emit: EmitRequest,
-    pending: Mutex<HashMap<String, oneshot::Sender<Result<Value, BridgeError>>>>,
+    emit_cancellation: EmitCancellation,
+    pending: Mutex<HashMap<String, PendingRequest>>,
     timeout: Duration,
+    generation_overhead: Duration,
+}
+
+struct PendingRequest {
+    sender: oneshot::Sender<Result<Value, BridgeError>>,
+    deadline: Instant,
+    source: BridgeSource,
+    generation: bool,
+    claimed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RequestTiming {
+    started: Instant,
+    started_ms: u64,
+}
+
+impl RequestTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            started_ms: now_ms(),
+        }
+    }
+
+    fn deadline(self, duration: Duration) -> RequestDeadline {
+        RequestDeadline {
+            instant: self.started + duration,
+            expires_at: self.started_ms.saturating_add(duration.as_millis() as u64),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RequestDeadline {
+    instant: Instant,
+    expires_at: u64,
 }
 
 impl Shared {
+    fn notify_cancelled(&self, request_id: String, pending: &PendingRequest) {
+        if pending.generation && !pending.claimed {
+            let _ = (self.emit_cancellation)(BridgeCancellation {
+                request_id,
+                source: pending.source,
+                service_id: self.info.service_id.clone(),
+            });
+        }
+    }
+
     fn cancel(&self) {
-        self.active.store(false, Ordering::SeqCst);
-        for (_, pending) in self.pending.lock().unwrap().drain() {
-            let _ = pending.send(Err(failure(503, "服务已关闭")));
+        let cancelled: Vec<_> = {
+            let mut pending = self.pending.lock().unwrap();
+            self.active.store(false, Ordering::SeqCst);
+            pending.drain().collect()
+        };
+        for (id, pending) in cancelled {
+            self.notify_cancelled(id, &pending);
+            let _ = pending.sender.send(Err(failure(503, "服务已关闭")));
         }
     }
 
@@ -149,7 +219,7 @@ impl Shared {
         source: BridgeSource,
         method: &str,
         args: Value,
-        expires_at: u64,
+        deadline: RequestDeadline,
     ) -> Result<Value, BridgeError> {
         let request_id = Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
@@ -161,7 +231,19 @@ impl Shared {
             if pending.len() >= MAX_PENDING {
                 return Err(failure(429, "请求过多，请稍后重试"));
             }
-            pending.insert(request_id.clone(), sender);
+            if Instant::now() >= deadline.instant {
+                return Err(failure(504, "请求已过期"));
+            }
+            pending.insert(
+                request_id.clone(),
+                PendingRequest {
+                    sender,
+                    deadline: deadline.instant,
+                    source,
+                    generation: method == "generate_schedule",
+                    claimed: false,
+                },
+            );
         }
         // Dropping a timed-out/disconnected request removes it, even if the UI never responds.
         let _guard = PendingGuard {
@@ -169,20 +251,34 @@ impl Shared {
             id: request_id.clone(),
         };
         (self.emit)(BridgeRequest {
-            request_id,
+            request_id: request_id.clone(),
             source,
             method: method.into(),
             args,
-            expires_at,
+            expires_at: deadline.expires_at,
             service_id: self.info.service_id.clone(),
         })
         .map_err(|_| failure(503, "无法连接应用排班数据"))?;
-        match tokio::time::timeout(
-            Duration::from_millis(expires_at.saturating_sub(now_ms())),
-            receiver,
-        )
-        .await
-        {
+        let mut receiver = receiver;
+        let mut response = tokio::time::timeout_at(deadline.instant, &mut receiver).await;
+        if response.is_err() {
+            // A successful claim is the commit acceptance point. Give its
+            // synchronous save a bounded chance to report its final outcome.
+            let claimed = self
+                .pending
+                .lock()
+                .unwrap()
+                .get(&request_id)
+                .is_some_and(|item| item.claimed);
+            if claimed {
+                response = tokio::time::timeout_at(
+                    deadline.instant + COMMIT_RESPONSE_GRACE,
+                    &mut receiver,
+                )
+                .await;
+            }
+        }
+        match response {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(failure(503, "服务已关闭")),
             Err(_) => Err(failure(504, "应用响应超时，请确认排班窗口已打开")),
@@ -196,7 +292,10 @@ struct PendingGuard {
 }
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.shared.pending.lock().unwrap().remove(&self.id);
+        let pending = self.shared.pending.lock().unwrap().remove(&self.id);
+        if let Some(pending) = pending {
+            self.shared.notify_cancelled(self.id.clone(), &pending);
+        }
     }
 }
 
@@ -208,6 +307,14 @@ pub struct Server {
 
 impl Server {
     pub async fn start(emit: EmitRequest, options: ServerOptions) -> Result<Self, io::Error> {
+        Self::start_with_cancellation(emit, Arc::new(|_| Ok(())), options).await
+    }
+
+    pub async fn start_with_cancellation(
+        emit: EmitRequest,
+        emit_cancellation: EmitCancellation,
+        options: ServerOptions,
+    ) -> Result<Self, io::Error> {
         let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, options.port)).await {
             Ok(listener) => listener,
             Err(error) if error.kind() == io::ErrorKind::AddrInUse && options.port != 0 => {
@@ -227,8 +334,10 @@ impl Server {
             },
             active: AtomicBool::new(true),
             emit,
+            emit_cancellation,
             pending: Mutex::new(HashMap::new()),
             timeout: options.request_timeout,
+            generation_overhead: options.generation_overhead,
         });
         let router = Router::new()
             .fallback(any(handle))
@@ -280,13 +389,47 @@ impl Server {
         if !self.shared.active.load(Ordering::SeqCst) {
             return Err("服务已关闭".into());
         }
-        let sender = pending.remove(request_id).ok_or("请求已过期或已完成")?;
+        let pending_request = pending.remove(request_id).ok_or("请求已过期或已完成")?;
+        drop(pending);
+        let response_deadline = pending_request.deadline
+            + if pending_request.claimed {
+                COMMIT_RESPONSE_GRACE
+            } else {
+                Duration::ZERO
+            };
+        if Instant::now() >= response_deadline {
+            self.shared
+                .notify_cancelled(request_id.into(), &pending_request);
+            let _ = pending_request.sender.send(Err(failure(504, "请求已过期")));
+            return Err("请求已过期".into());
+        }
         let result = if let Some(error) = response.error {
             Err(error)
         } else {
             Ok(response.result.unwrap_or(Value::Null))
         };
-        sender.send(result).map_err(|_| "请求已过期或已取消".into())
+        pending_request
+            .sender
+            .send(result)
+            .map_err(|_| "请求已过期或已取消".into())
+    }
+
+    /// Linearization point for a renderer-owned synchronous generated-schedule
+    /// commit. Cancellation before this claim prevents accepting that commit.
+    pub fn claim_request(&self, service_id: &str, request_id: &str) -> Result<(), String> {
+        let mut pending = self.shared.pending.lock().unwrap();
+        if !self.shared.active.load(Ordering::SeqCst) || self.shared.info.service_id != service_id {
+            return Err("服务已关闭或连接已失效".into());
+        }
+        let request = pending.get_mut(request_id).ok_or("请求已过期或已取消")?;
+        if request.sender.is_closed() || Instant::now() >= request.deadline {
+            return Err("请求已过期或已取消".into());
+        }
+        if !request.generation || request.claimed {
+            return Err("请求不可提交或已接受提交".into());
+        }
+        request.claimed = true;
+        Ok(())
     }
 
     pub async fn stop(mut self) {
@@ -393,12 +536,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     } else if !shared.active.load(Ordering::SeqCst) {
         error_response(failure(503, "服务已关闭"))
     } else {
-        let expires_at = now_ms().saturating_add(shared.timeout.as_millis() as u64);
-        match tokio::time::timeout(shared.timeout, route(shared.clone(), request, expires_at)).await
-        {
-            Ok(response) => response,
-            Err(_) => error_response(failure(504, "请求超时")),
-        }
+        route(shared.clone(), request, RequestTiming::new()).await
     };
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -417,7 +555,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     response
 }
 
-async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Response {
+async fn route(shared: Arc<Shared>, request: Request, timing: RequestTiming) -> Response {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
     if !shared.service.supports_path(&path) {
@@ -432,10 +570,10 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
         return error_response(failure(400, "Unsupported MCP protocol version"));
     }
     if path == "/api/state" && method == Method::GET {
-        return dispatch_http(&shared, "get_state", json!({}), expires_at).await;
+        return dispatch_http(&shared, "get_state", json!({}), timing).await;
     }
     if path == "/api/validate" && method == Method::GET {
-        return dispatch_http(&shared, "validate_schedule", json!({}), expires_at).await;
+        return dispatch_http(&shared, "validate_schedule", json!({}), timing).await;
     }
     if path == "/mcp" && method != Method::POST {
         let mut response = error_response(failure(405, "Stateless MCP: use POST"));
@@ -446,13 +584,22 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
     }
     if !((path == "/mcp" && method == Method::POST)
         || (path == "/api/state" && method == Method::PUT)
-        || (path == "/api/assignments" && method == Method::POST))
+        || (path == "/api/assignments" && method == Method::POST)
+        || (path == "/api/schedules/generate" && method == Method::POST))
     {
         return error_response(failure(404, "Not found"));
     }
-    let bytes = match to_bytes(request.into_body(), MAX_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => return error_response(failure(413, "请求超过大小限制或无法读取")),
+    // Even long generation requests must deliver their body within the normal
+    // request budget. Only a parsed, valid generate call gets extra solve time.
+    let bytes = match tokio::time::timeout_at(
+        timing.deadline(shared.timeout).instant,
+        to_bytes(request.into_body(), MAX_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return error_response(failure(413, "请求超过大小限制或无法读取")),
+        Err(_) => return error_response(failure(504, "请求正文读取超时")),
     };
     let body: Value = match serde_json::from_slice(&bytes) {
         Ok(body) => body,
@@ -460,7 +607,7 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
         Err(_) => return error_response(failure(400, "无效 JSON")),
     };
     if path == "/mcp" {
-        return mcp(shared, body, expires_at).await;
+        return mcp(shared, body, timing).await;
     }
     if !body.is_object() {
         return error_response(failure(400, "请求必须为对象"));
@@ -469,11 +616,13 @@ async fn route(shared: Arc<Shared>, request: Request, expires_at: u64) -> Respon
         &shared,
         if path == "/api/state" {
             "replace_state"
+        } else if path == "/api/schedules/generate" {
+            "generate_schedule"
         } else {
             "set_assignment"
         },
         body,
-        expires_at,
+        timing,
     )
     .await
 }
@@ -482,15 +631,69 @@ async fn dispatch_http(
     shared: &Arc<Shared>,
     method: &str,
     args: Value,
-    expires_at: u64,
+    timing: RequestTiming,
 ) -> Response {
+    let duration = match request_duration(shared, method, &args) {
+        Ok(duration) => duration,
+        Err(error) => return error_response(error),
+    };
     match shared
-        .call(BridgeSource::Http, method, args, expires_at)
+        .call(BridgeSource::Http, method, args, timing.deadline(duration))
         .await
     {
         Ok(result) => Json(result).into_response(),
         Err(error) => error_response(error),
     }
+}
+
+fn request_duration(shared: &Shared, method: &str, args: &Value) -> Result<Duration, BridgeError> {
+    if method != "generate_schedule" {
+        return Ok(shared.timeout);
+    }
+    let args = args
+        .as_object()
+        .ok_or_else(|| failure(400, "参数必须为对象"))?;
+    if args
+        .keys()
+        .any(|key| !matches!(key.as_str(), "revision" | "month" | "timeLimitSeconds"))
+    {
+        return Err(failure(
+            400,
+            "生成排班仅接受 revision、month、timeLimitSeconds；不允许缺员选项",
+        ));
+    }
+    if !args
+        .get("revision")
+        .and_then(Value::as_str)
+        .is_some_and(|revision| !revision.is_empty())
+    {
+        return Err(failure(400, "缺少有效 revision，请先读取当前排班数据"));
+    }
+    if let Some(month) = args.get("month") {
+        let valid = month.as_str().is_some_and(|month| {
+            month.len() == 7
+                && month.as_bytes()[4] == b'-'
+                && month.as_bytes()[..4].iter().all(u8::is_ascii_digit)
+                && month.as_bytes()[5..].iter().all(u8::is_ascii_digit)
+                && month[..4]
+                    .parse::<u16>()
+                    .is_ok_and(|year| (1900..=2200).contains(&year))
+                && month[5..]
+                    .parse::<u8>()
+                    .is_ok_and(|month| (1..=12).contains(&month))
+        });
+        if !valid {
+            return Err(failure(400, "月份须为 YYYY-MM，年份范围为 1900–2200"));
+        }
+    }
+    let seconds = match args.get("timeLimitSeconds") {
+        None => 15.0,
+        Some(value) => value
+            .as_f64()
+            .filter(|seconds| seconds.is_finite() && (1.0..=60.0).contains(seconds))
+            .ok_or_else(|| failure(400, "timeLimitSeconds 须为 1–60 秒的数字"))?,
+    };
+    Ok(Duration::from_secs_f64(seconds) + shared.generation_overhead)
 }
 
 fn rpc_error(id: Value, code: i32, message: &str) -> Response {
@@ -511,7 +714,7 @@ fn supported_protocol(version: &str) -> bool {
     )
 }
 
-async fn mcp(shared: Arc<Shared>, body: Value, expires_at: u64) -> Response {
+async fn mcp(shared: Arc<Shared>, body: Value, timing: RequestTiming) -> Response {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     if !body.is_object()
         || body.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
@@ -534,7 +737,7 @@ async fn mcp(shared: Arc<Shared>, body: Value, expires_at: u64) -> Response {
             } else {
                 "2025-03-26"
             };
-            json!({"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "shift-schedule-expert", "version": env!("CARGO_PKG_VERSION")}, "instructions": "Read get_state before writing. All writes require its current revision. Changes are saved directly in the open application. MCP and HTTP share the write permissions in desktop Setting; by default only members may be changed. Disallowed writes return MCP tool errors or HTTP 403. Read-only fields must remain unchanged."})
+            json!({"protocolVersion": version, "capabilities": {"tools": {}}, "serverInfo": {"name": "shift-schedule-expert", "version": env!("CARGO_PKG_VERSION")}, "instructions": "Read get_state before writing. All writes and generate_schedule require its current revision. Changes are saved directly in the open application. MCP and HTTP share the write permissions in desktop Setting; by default only members may be changed. Generating requires assignment write permission and uses the built-in solver with complete coverage, preserving locked assignments and other months. Allow at least timeLimitSeconds + 155 seconds for generation, including startup and response delivery. Disallowed writes return MCP tool errors or HTTP 403. Read-only fields must remain unchanged."})
         }
         "ping" => json!({}),
         "tools/list" => json!({"tools": tool_definitions()}),
@@ -544,7 +747,11 @@ async fn mcp(shared: Arc<Shared>, body: Value, expires_at: u64) -> Response {
             };
             if !matches!(
                 name,
-                "get_state" | "replace_state" | "set_assignment" | "validate_schedule"
+                "get_state"
+                    | "replace_state"
+                    | "set_assignment"
+                    | "validate_schedule"
+                    | "generate_schedule"
             ) {
                 return rpc_error(id, -32602, "Unknown tool");
             }
@@ -555,7 +762,14 @@ async fn mcp(shared: Arc<Shared>, body: Value, expires_at: u64) -> Response {
             if !args.is_object() {
                 return rpc_error(id, -32602, "Tool arguments must be an object");
             }
-            match shared.call(BridgeSource::Mcp, name, args, expires_at).await {
+            let duration = match request_duration(&shared, name, &args) {
+                Ok(duration) => duration,
+                Err(error) => return rpc_error(id, -32602, &error.message),
+            };
+            match shared
+                .call(BridgeSource::Mcp, name, args, timing.deadline(duration))
+                .await
+            {
                 Ok(result) => json!({"content": [{"type": "text", "text": result.to_string()}]}),
                 Err(error) => {
                     json!({"isError": true, "content": [{"type": "text", "text": error.message}]})
@@ -573,6 +787,7 @@ fn tool_definitions() -> Value {
         {"name": "get_state", "description": "Read all members, shifts, rules, assignments and the current revision.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
         {"name": "validate_schedule", "description": "Check current schedule for rule violations without changing it.", "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}},
         {"name": "replace_state", "description": "Replace the complete planner document. Read first and preserve unchanged fields. All data is validated before saving. Only types allowed for MCP in desktop Setting may change; by default only members are allowed. Changes to a forbidden type return a tool error.", "inputSchema": {"type": "object", "properties": {"revision": revision, "state": {"type": "object", "additionalProperties": true}}, "required": ["revision", "state"], "additionalProperties": false}},
-        {"name": "set_assignment", "description": "Set one employee/date assignment. shiftId:off means rest; remove:true deletes. Locked assignments require unlock:true. Requires permission to modify assignments for MCP in desktop Setting; by default only members are allowed, so this tool returns a tool error until assignment changes are enabled.", "inputSchema": {"type": "object", "properties": {"revision": revision, "employeeId": {"type": "string"}, "date": {"type": "string"}, "shiftId": {"type": "string"}, "locked": {"type": "boolean"}, "remove": {"type": "boolean"}, "unlock": {"type": "boolean"}}, "required": ["revision", "employeeId", "date"], "additionalProperties": false}}
+        {"name": "set_assignment", "description": "Set one employee/date assignment. shiftId:off means rest; remove:true deletes. Locked assignments require unlock:true. Requires permission to modify assignments for MCP in desktop Setting; by default only members are allowed, so this tool returns a tool error until assignment changes are enabled.", "inputSchema": {"type": "object", "properties": {"revision": revision, "employeeId": {"type": "string"}, "date": {"type": "string"}, "shiftId": {"type": "string"}, "locked": {"type": "boolean"}, "remove": {"type": "boolean"}, "unlock": {"type": "boolean"}}, "required": ["revision", "employeeId", "date"], "additionalProperties": false}},
+        {"name": "generate_schedule", "description": "Generate and save a complete monthly schedule using the built-in solver and current configuration. Requires assignment write permission and the latest revision. Preserves locked assignments and all other months; month defaults to the application's active month. No partial coverage option. A completed solve with no valid feasible result returns success:false, saved:false and diagnostic issues without changing data. Transport, permission and lifecycle failures return tool errors. Allow timeLimitSeconds + 155 seconds for startup, solving and response delivery.", "inputSchema": {"type": "object", "properties": {"revision": revision, "month": {"type": "string", "pattern": "^(19[0-9]{2}|20[0-9]{2}|21[0-9]{2}|2200)-(0[1-9]|1[0-2])$", "description": "Optional YYYY-MM from 1900-01 through 2200-12; defaults to the active month."}, "timeLimitSeconds": {"type": "number", "minimum": 1, "maximum": 60, "default": 15, "description": "Solver time budget; startup is budgeted separately."}}, "required": ["revision"], "additionalProperties": false}}
     ])
 }

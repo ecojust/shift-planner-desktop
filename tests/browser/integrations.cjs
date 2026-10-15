@@ -209,9 +209,11 @@ async function checkHttpDocs(page, dialog, httpInfo, mcpInfo) {
     ['get-state', 'GET', '/api/state'],
     ['put-state', 'PUT', '/api/state'],
     ['set-assignment', 'POST', '/api/assignments'],
+    ['generate-schedule', 'POST', '/api/schedules/generate'],
     ['validate', 'GET', '/api/validate'],
   ]
-  assert.equal(await docs.locator('.integration-api-route').count(), 4)
+  assert.equal(await docs.locator('.integration-api-route').count(), routes.length)
+  assert.match(await docs.locator(':scope > summary').innerText(), /5 个接口/)
   for (const [id, method, pathname] of routes) {
     const route = docs.locator(`[data-http-route="${id}"]`)
     if (!await route.evaluate(node => node.open)) await route.locator(':scope > summary').click()
@@ -233,6 +235,14 @@ async function checkHttpDocs(page, dialog, httpInfo, mcpInfo) {
     }
     assert.ok(!example.includes(mcpInfo.token), 'HTTP examples must never use the MCP token')
     if (method !== 'GET') assert.ok(example.includes(method))
+    if (id === 'generate-schedule') {
+      const readPosition = example.indexOf("await request('/api/state')")
+      const generatePosition = example.indexOf("await request('/api/schedules/generate'")
+      assert.ok(readPosition >= 0 && generatePosition > readPosition, 'generation example must read the current revision before generating')
+      assert.match(example, /const parameters = \{ revision, timeLimitSeconds: 15 \}/)
+      assert.match(example, /if \(!result\.success\)/, 'generation example must distinguish an unsaved solver outcome')
+      assert.ok(example.includes('result.issues') && example.includes('result.generatedAt') && example.includes('result.state'))
+    }
   }
   const text = await docs.innerText()
   for (const field of ['revision', 'state', 'employeeId', 'date', 'shiftId', 'locked', 'remove', 'unlock', 'issues']) assert.ok(text.includes(field), `HTTP docs need ${field}`)
@@ -245,6 +255,20 @@ async function checkHttpDocs(page, dialog, httpInfo, mcpInfo) {
   await docs.getByRole('button', { name: '复制 POST /api/assignments 参数', exact: true }).click()
   const assignment = JSON.parse(await copied(page))
   for (const key of ['revision', 'employeeId', 'date', 'shiftId']) assert.equal(typeof assignment[key], 'string', key)
+  const generationRoute = docs.locator('[data-http-route="generate-schedule"]')
+  const generationText = await generationRoute.innerText()
+  for (const field of ['revision', 'month', 'timeLimitSeconds', 'success', 'saved', 'status', 'message', 'issues', 'stats', 'state', 'generatedAt']) assert.ok(generationText.includes(field), `generation reference needs ${field}`)
+  for (const status of ['400', '403', '409', '503', '504']) assert.ok(generationText.includes(status), `generation reference needs error ${status}`)
+  assert.match(generationText, /1–60 秒，默认 15 秒/)
+  assert.match(generationText, /排班结果.*写入权限/)
+  assert.match(generationText, /保留锁定安排、其他月份和软件当前显示的月份/)
+  assert.match(generationText, /不会切换软件月份/)
+  await generationRoute.getByRole('button', { name: '复制 POST /api/schedules/generate 参数', exact: true }).click()
+  const generationParameters = JSON.parse(await copied(page))
+  assert.deepEqual(Object.keys(generationParameters).sort(), ['month', 'revision', 'timeLimitSeconds'])
+  assert.equal(typeof generationParameters.revision, 'string')
+  assert.match(generationParameters.month, /^\d{4}-\d{2}$/)
+  assert.equal(generationParameters.timeLimitSeconds, 15)
   assert.ok(!(await docs.innerText()).includes(httpInfo.token), 'expanded documentation must keep real tokens masked')
   await screenshot(page, 'settings-http-api-reference')
   for (const width of [390, 320]) {
@@ -255,7 +279,7 @@ async function checkHttpDocs(page, dialog, httpInfo, mcpInfo) {
   }
   await page.setViewportSize({ width: 1440, height: 960 })
   await docs.locator(':scope > summary').click()
-  record('HTTP reference shows all four REST methods, parameters and errors, copies HTTP-only credentials, and fits narrow screens')
+  record('HTTP reference shows all five REST endpoints including generation parameters and saved/unsaved outcomes, copies HTTP-only credentials, and fits narrow screens')
 }
 async function fits(page) {
   const viewport = page.viewportSize(), bounds = await page.getByRole('dialog').boundingBox()

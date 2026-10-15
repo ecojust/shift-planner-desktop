@@ -28,6 +28,7 @@ impl Fixture {
                 service,
                 port,
                 request_timeout: timeout,
+                generation_overhead: Duration::from_secs(150),
             },
         )
         .await
@@ -340,7 +341,7 @@ async fn mcp_initialization_tools_notifications_and_errors_are_protocol_compatib
         .json::<Value>()
         .await
         .unwrap();
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 4);
+    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 5);
     assert_eq!(list["id"], "tools");
     assert_eq!(
         list["result"]["tools"][2]["inputSchema"]["required"],
@@ -551,6 +552,7 @@ async fn shutdown_closes_listener_and_pending_connections_and_rotates_credential
             service: Service::Http,
             port,
             request_timeout: Duration::from_secs(1),
+            generation_overhead: Duration::from_secs(150),
         },
     )
     .await
@@ -582,6 +584,7 @@ async fn occupied_port_falls_back_to_a_real_free_loopback_port() {
             service: Service::Http,
             port,
             request_timeout: Duration::from_secs(1),
+            generation_overhead: Duration::from_secs(150),
         },
     )
     .await
@@ -662,6 +665,7 @@ async fn unavailable_renderer_returns_service_unavailable() {
             service: Service::Http,
             port: 0,
             request_timeout: Duration::from_secs(1),
+            generation_overhead: Duration::from_secs(150),
         },
     )
     .await

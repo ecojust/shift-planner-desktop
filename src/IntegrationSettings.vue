@@ -170,7 +170,7 @@ onUnmounted(() => {
                   <p class="integration-hint">配置已含 MCP 令牌，粘贴到支持 HTTP 连接的 MCP 客户端。</p>
                 </template>
                 <details v-else class="integration-http-docs">
-                  <summary>HTTP 接口与示例 <span>4 个接口</span></summary>
+                  <summary>HTTP 接口与示例 <span>{{ httpDocs.length }} 个接口</span></summary>
                   <div class="integration-http-docs-body">
                     <p>请求需携带 <code>Authorization: Bearer &lt;HTTP 访问令牌&gt;</code>，JSON 请求体需设置 <code>Content-Type: application/json</code>。</p>
                     <p>修改前先读取最新 <code>revision</code>，写入时一并提交，防止覆盖他人的更新。<code>PUT /api/state</code> 提交完整 <code>state</code>，请保留所有未修改数据。</p>

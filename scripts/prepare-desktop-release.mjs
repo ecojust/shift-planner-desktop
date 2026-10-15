@@ -84,7 +84,10 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
   files.push(describe('SHA256SUMS'));
   const notes = `Shift Schedule Expert ${version} · Windows 与 macOS 桌面版
 
-本版补齐月初跨月周规则，按月份保存排班状态，并突出显示 MCP／HTTP 对配置的修改。
+本版为 MCP／HTTP 增加求解器排班接口，补齐月初跨月周规则，按月份保存排班状态，并突出显示外部配置修改。
+
+- MCP 的 generate_schedule 和 HTTP 的 POST /api/schedules/generate 根据已保存配置调用内置求解器；可指定月份，默认软件当前激活月份。
+- 接口生成成功后只保存目标月、记录来源和时间并解除该月失效；保留锁定和历史排班，无解、取消或提交前配置变更时不覆盖原数据。
 
 - 月初与上月同一自然周且上月已有排班时，合并历史计算周最低工时、星期权重与每日均摊；上月原记录保持不变。
 - 周最高工时、周班次次数、休息和连续工作继续计入跨月历史；没有上月记录及月末部分周保留原折算规则。
