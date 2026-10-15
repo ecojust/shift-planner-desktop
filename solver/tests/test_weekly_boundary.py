@@ -1,4 +1,4 @@
-"""Boundary-week minimums use known outside work without double counting tails."""
+"""Known first natural weeks are completed without rewriting prior-month work."""
 import calendar
 import copy
 import datetime as dt
@@ -65,19 +65,30 @@ class WeeklyBoundaryTest(unittest.TestCase):
         actual_total, actual_inside = minutes_by_week(data, result['assignments'])
         employee = data['state']['employees'][0]
         full = int(employee['minHoursPerWeek'] * 60)
+        previous_month = (first - dt.timedelta(days=1)).strftime('%Y-%m')
+        employee_ids = {item['id'] for item in data['state']['employees']}
+        known_previous_month = any(record['employeeId'] in employee_ids and record['date'].startswith(previous_month + '-')
+                                   for record in original['state']['assignments'])
         for week in {day - dt.timedelta(days=day.weekday()) for day in days}:
             key = week.isoformat()
             count = sum(week <= day < week + dt.timedelta(days=7) for day in days)
             prorated = (full * count + 6) // 7
             outside = known_total.get(key, 0) - known_inside.get(key, 0)
-            expected = min(prorated, max(0, full - outside))
-            self.assertGreaterEqual(actual_inside.get(key, 0), expected, result)
+            if week < first and known_previous_month:
+                # Audit the finished natural week directly, independently of
+                # the solver's formula for the editable month's residual.
+                self.assertGreaterEqual(actual_total.get(key, 0), full, result)
+            else:
+                expected = min(prorated, max(0, full - outside))
+                self.assertGreaterEqual(actual_inside.get(key, 0), expected, result)
             self.assertLessEqual(actual_total.get(key, 0), employee['maxHoursPerWeek'] * 60, result)
         self.assertTrue(all(record in result['assignments'] for record in fixed))
         return result
 
     def assertFailure(self, data, kind, week=None):
+        original = copy.deepcopy(data)
         result = solve(data)
+        self.assertEqual(data, original)
         self.assertEqual(result['status'], 'INFEASIBLE', result)
         self.assertNotIn('assignments', result)
         issues = [item for item in result['issues'] if item['type'] == kind and (week is None or week in item['message'])]
@@ -96,6 +107,52 @@ class WeeklyBoundaryTest(unittest.TestCase):
                        assignments=[assignment(f'2026-10-{day}', 'seven') for day in range(26, 31)])
         result = self.assertFeasible(data)
         self.assertEqual([item['shiftId'] for item in result['assignments'] if item['date'] == '2026-11-01'], ['five'])
+
+    def test_32_known_hours_plus_six_locked_hours_cannot_satisfy_full_40(self):
+        data = request(shifts=[shift(), shift('six', end='14:00')],
+                       assignments=[*[assignment(f'2026-10-{day}') for day in range(26, 30)],
+                                    assignment('2026-11-01', 'six', True)])
+        issues = self.assertFailure(data, 'weekly-min-hours', '2026-10-26')
+        message = issues[0]['message']
+        self.assertIn('首自然周按完整周补足', message)
+        self.assertIn('月外已排 32 小时', message)
+        self.assertIn('本月实际最低要求为 8 小时', message)
+        self.assertIn('本月最多不超过 6 小时', message)
+        self.assertIn('至少相差 2 小时', message)
+
+    def test_32_known_hours_requires_eight_hour_sunday(self):
+        data = request(shifts=[shift(), shift('six', end='14:00')],
+                       assignments=[assignment(f'2026-10-{day}') for day in range(26, 30)])
+        result = self.assertFeasible(data)
+        self.assertEqual([item['shiftId'] for item in result['assignments'] if item['date'] == '2026-11-01'], ['day'])
+
+    def test_prior_month_off_far_from_first_week_makes_history_known(self):
+        for locked in (False, True):
+            with self.subTest(locked=locked):
+                data = request(assignments=[assignment('2026-10-01', 'off', locked)])
+                issues = self.assertFailure(data, 'weekly-min-hours', '2026-10-26')
+                self.assertIn('月外已排 0 小时', issues[0]['message'])
+                self.assertIn('本月实际最低要求为 40 小时', issues[0]['message'])
+
+    def test_another_members_off_record_also_establishes_known_prior_month(self):
+        data = request()
+        data['state']['employees'].append(dict(data['state']['employees'][0], id='b', minHoursPerWeek=0))
+        data['state']['assignments'] = [dict(assignment('2026-10-01', 'off'), employeeId='b')]
+        issues = self.assertFailure(data, 'weekly-min-hours', '2026-10-26')
+        self.assertTrue(any(item['employeeId'] == 'a' and '本月实际最低要求为 40 小时' in item['message'] for item in issues))
+
+    def test_cross_year_first_week_completes_december_hours(self):
+        data = request(month='2027-01', shifts=[shift(), shift('six', end='14:00')],
+                       assignments=[assignment('2026-12-28'), assignment('2026-12-29'),
+                                    *[assignment(f'2027-01-{day:02d}', 'six', True) for day in range(1, 4)]])
+        issues = self.assertFailure(data, 'weekly-min-hours', '2026-12-28')
+        self.assertIn('月外已排 16 小时', issues[0]['message'])
+        self.assertIn('本月实际最低要求为 24 小时', issues[0]['message'])
+        self.assertIn('本月最多不超过 18 小时', issues[0]['message'])
+
+    def test_older_history_does_not_establish_previous_calendar_month(self):
+        data = request(assignments=[assignment('2026-09-01', 'off')])
+        self.assertFeasible(data)
 
     def test_minimum_36_maximum_44_and_40_known_hours_does_not_force_four_hour_gap(self):
         data = request(minimum=36, maximum=44, assignments=[assignment(f'2026-10-{day}') for day in range(26, 31)])
@@ -144,7 +201,8 @@ class WeeklyBoundaryTest(unittest.TestCase):
                 self.assertFalse(any(item['date'] == '2026-11-30' for item in result['assignments']))
 
     def test_unknown_candidate_outgoing_night_cannot_lower_the_target(self):
-        records = [assignment('2026-10-31', 'night'), assignment('2026-11-29', 'off', True),
+        records = [*[assignment(f'2026-10-{day}', 'night') for day in range(26, 30)],
+                   assignment('2026-10-31', 'night'), assignment('2026-11-29', 'off', True),
                    *[assignment(f'2026-12-{day:02d}', 'night') for day in range(1, 5)]]
         data = request(shifts=[shift('night', '22:00', '06:00')], assignments=records)
         issues = self.assertFailure(data, 'weekly-min-hours', '2026-11-30')
@@ -163,6 +221,7 @@ class WeeklyBoundaryTest(unittest.TestCase):
         issues = self.assertFailure(data, 'weekly-min-hours', '2026-10-26')
         self.assertIn('月外已排 0 小时', issues[0]['message'])
         self.assertIn('本月实际最低要求为 5.72 小时', issues[0]['message'])
+        self.assertIn('未找到上月排班记录', issues[0]['message'])
 
     def test_true_full_week_upper_limit_violation_is_still_rejected(self):
         data = request(assignments=[assignment(f'2026-10-{day}') for day in range(26, 32)])

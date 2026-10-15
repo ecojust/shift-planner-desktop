@@ -273,11 +273,22 @@ def solve(request: Any) -> dict:
             week = day - dt.date.fromordinal(day).weekday()
             week_days[week] += 1
             week_dates[week].append(day)
+        first_week = dates[0] - dt.date.fromordinal(dates[0]).weekday()
+        previous_month_end = dt.date.fromordinal(dates[0]) - dt.timedelta(days=1)
+        previous_month_start = previous_month_end.replace(day=1).toordinal()
+        has_previous_month = any(a['employeeId'] in emap and previous_month_start <= _date(a['date']) < dates[0]
+                                 for a in state['assignments'])
+        complete_first_week = first_week < dates[0] and has_previous_month
+        # Known prior-month cells, including rest, make the first natural week
+        # complete. Sparse historical blanks stay zero and are never variables.
+        weighted_week_dates = {week: list(days) for week, days in week_dates.items()}
+        if complete_first_week:
+            weighted_week_dates[first_week] = list(range(first_week, first_week + 7))
         weights = state['rules'].get('weekdayWeights')
         non_consecutive_shifts = state['rules'].get('nonConsecutiveShifts', [])
         weekly_shift_limits = state['rules'].get('weeklyShiftLimits', [])
         allow_partial = options.get('allowPartial', False)
-        weighted_weeks = {week: weekday_targets(weights, days, 0)[:2] for week, days in week_dates.items()} if weights else {}
+        weighted_weeks = {week: weekday_targets(weights, days, 0)[:2] for week, days in weighted_week_dates.items()} if weights else {}
         weekly_prorated_targets = {eid: {week: (minutes * days + 6) // 7 for week, days in week_days.items()} for eid, minutes in weekly_minimums.items()}
         fixed = [copy.deepcopy(a) for a in state['assignments'] if a['locked'] or _date(a['date']) not in active]
         fixed_cells = {}
@@ -317,18 +328,24 @@ def solve(request: Any) -> dict:
             fixed_current_minutes[eid] += overlap_minutes(start, end, month_start, month_end)
             for week, minutes in week_parts(max(start, month_start), min(end, month_end)):
                 fixed_month_weeks[eid][week] += minutes
-        # Preserve the partial-month allowance, but never require more than
-        # remains of the full-week minimum after known work outside this month.
+        # Complete the first natural week's minimum when prior-month data is
+        # known. Other month boundaries keep the partial-month allowance.
         # The two minute totals split every fixed interval exactly: a carry-in
         # tail is current-month work, not a second outside credit. Candidates'
         # outgoing overnight tails cannot change this precomputed requirement.
         known_outside_week_minutes = {eid: {week: fixed_weeks[eid][week] - fixed_month_weeks[eid][week]
                                            for week in week_days} for eid in emap}
-        weekly_targets = {eid: {week: min(prorated, max(0, weekly_minimums[eid] - known_outside_week_minutes[eid][week]))
+        weekly_targets = {eid: {week: (max(0, weekly_minimums[eid] - known_outside_week_minutes[eid][week])
+                                      if complete_first_week and week == first_week else
+                                      min(prorated, max(0, weekly_minimums[eid] - known_outside_week_minutes[eid][week])))
                                 for week, prorated in weekly_prorated_targets[eid].items()} for eid in emap}
 
         def weekly_requirement(eid, week):
-            return (f'周最低 {_hours_text(weekly_minimums[eid])} 小时，本月 {week_days[week]} 天原折算 '
+            context = ('上月已有排班记录，首自然周按完整周补足最低工时（不再以本月折算值封顶）；'
+                       if complete_first_week and week == first_week else
+                       '未找到上月排班记录，首周保留按本月天数折算的最低工时；'
+                       if week == first_week and first_week < dates[0] else '')
+            return (context + f'周最低 {_hours_text(weekly_minimums[eid])} 小时，本月 {week_days[week]} 天原折算 '
                     f'{_hours_text(weekly_prorated_targets[eid][week])} 小时（按分钟向上取整）；'
                     f'该周月外已排 {_hours_text(known_outside_week_minutes[eid][week])} 小时，'
                     f'因此本月实际最低要求为 {_hours_text(weekly_targets[eid][week])} 小时')
@@ -510,7 +527,9 @@ def solve(request: Any) -> dict:
                     conflicts.append(problem('weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，{weekly_requirement(eid, week)}，但现有班次、请假、固定安排和周上限下，本月最多不超过 {_hours_text(possible_weeks.get(week, 0))} 小时，至少相差 {_hours_text(target - possible_weeks.get(week, 0))} 小时。', '核对该成员这一周的可上班次、请假、锁定安排及最低/最高工时；月外已排工时已用于减去整周最低的剩余要求，也仍计入周上限。月内跨夜片段只计为本月完成量。', 'team', employeeId=eid, date=dt.date.fromordinal(week).isoformat()))
                 diagnostics.track(model.add(sum(month_weekly[eid][week]) + fixed_month_weeks[eid][week] >= target), f'weekly-min-{eid}-{week}', problem(
                     'weekly-min-hours', f'{e.get("name", eid)}在 {dt.date.fromordinal(week).isoformat()} 起的自然周，{weekly_requirement(eid, week)}。',
-                    '本月要求取原折算值与整周最低扣除月外已排后的非负余额中的较小值；核对该成员可用班次与固定安排，完整班次不能拆成零散小时。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
+                    ('首周已有上月记录，本月须补足整周最低扣除月外已排后的非负余额；' if complete_first_week and week == first_week else
+                     '本月要求取原折算值与整周最低扣除月外已排后的非负余额中的较小值；') +
+                    '核对该成员可用班次与固定安排，完整班次不能拆成零散小时。此条与同列要求组合冲突。', 'team', employeeId=eid, date=dt.date.fromordinal(max(week, dates[0])).isoformat()))
             for first_day in range(dates[0] - consecutive, dates[-1] + 1):
                 last_day = first_day + consecutive
                 terms = [var for day in dates if first_day <= day <= last_day for var in cells[(eid, day)]]
@@ -526,7 +545,7 @@ def solve(request: Any) -> dict:
         check_time()
         conflicts = daily_capacity_issues(employees, shifts, dates, x, fixed_coverage, fixed_cells, leave, shift_times, fixed_work, fixed_weeks, caps, rest, state['rules'].get('separationGroups', []), allow_partial, check_time)
         if not conflicts:
-            conflicts = weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_coverage, allow_partial, weekday_targets, check_time)
+            conflicts = weekday_capacity_issues(weights, weighted_week_dates, employees, shifts, x, fixed_coverage, allow_partial, weekday_targets, check_time, active)
         if conflicts:
             for index, item in enumerate(conflicts):
                 item['id'] = f'{item["type"]}-{index}'
@@ -543,8 +562,9 @@ def solve(request: Any) -> dict:
                 if minimum > capacity:
                     prorated = sum(weekly_prorated_targets[eid][week] for eid in emap)
                     known_outside = sum(known_outside_week_minutes[eid][week] for eid in emap)
+                    context = '上月已有排班记录，首自然周按完整周补足最低工时；' if complete_first_week and week == first_week else ''
                     return response('INFEASIBLE', '这一周的固定班次容量不足以满足成员最低工时，原排班未修改。', [problem(
-                        'weekly-fixed-capacity', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，本月 {week_days[week]} 天原折算最低工时合计 {_hours_text(prorated)} 小时，该周月外已排合计 {_hours_text(known_outside)} 小时；逐人扣减整周最低余额后，本月实际最低要求合计 {_hours_text(minimum)} 小时，固定班次人数最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时（按实际跨夜分钟计入）。',
+                        'weekly-fixed-capacity', context + f'{dt.date.fromordinal(week).isoformat()} 起的自然周，本月 {week_days[week]} 天原折算最低工时合计 {_hours_text(prorated)} 小时，该周月外已排合计 {_hours_text(known_outside)} 小时；逐人扣减整周最低余额后，本月实际最低要求合计 {_hours_text(minimum)} 小时，固定班次人数最多提供 {_hours_text(capacity)} 小时，至少相差 {_hours_text(minimum - capacity)} 小时（按实际跨夜分钟计入）。',
                         '增加对应班次固定人数、将适合的班次改为每日最少人数，或核实成员的周最低工时。', 'shifts', date=dt.date.fromordinal(max(week, dates[0])).isoformat())])
         for group in state['rules'].get('separationGroups', []):
             check_time()
@@ -586,17 +606,19 @@ def solve(request: Any) -> dict:
             selected_count = len(weights['days'])
             other_count = 7 - selected_count
             for week, (selected, others) in weighted_weeks.items():
-                weight_detail = problem('weekday-weight', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，星期 {"、".join(str(day) for day in weights["days"])} 合计占 {weights["percent"]}%（向上取整），其余星期平摊，组内每日人数相差不超过 1；月边界按存在的星期折算。',
+                context = ('首周合并上月固定工作记录，历史空白按 0 人计算。' if complete_first_week and week == first_week else
+                           '月边界按当月实际包含的星期折算。')
+                weight_detail = problem('weekday-weight', f'{dt.date.fromordinal(week).isoformat()} 起的自然周，星期 {"、".join(str(day) for day in weights["days"])} 合计占 {weights["percent"]}%（向上取整），其余星期平摊，组内每日人数相差不超过 1；' + context,
                     '核对该周的星期比例与每日人数要求、可用人员；调整比例或有关日期的人员/班次容量。此条与同列要求组合冲突。', 'rules', date=dt.date.fromordinal(max(week, dates[0])).isoformat())
                 weight_key = f'weekday-weight-{week}'
                 counts = {}
-                for day in week_dates[week]:
+                for day in weighted_week_dates[week]:
                     count = model.new_int_var(0, len(employees), f'weekday_total_{day}')
                     fixed_count = sum(len(fixed_coverage[(day, sid)]) for sid in smap)
                     model.add(count == sum(var for sid in smap for var in coverage[(day, sid)]) + fixed_count)
                     counts[day] = count
-                # Full weeks use their actual count. At a month boundary W is
-                # a complete-week basis whose absent weekdays retain their share.
+                # Known first weeks use the actual historical prefix. Other
+                # partial weeks retain a complete-week basis for absent days.
                 full_total = model.new_int_var(0, 7 * staff, f'full_week_total_{week}')
                 full_selected = model.new_int_var(0, 7 * staff, f'full_week_selected_{week}')
                 full_other = model.new_int_var(0, 7 * staff, f'full_week_other_{week}')
@@ -611,7 +633,7 @@ def solve(request: Any) -> dict:
                     model.add(other_target == 0)
                 diagnostics.track(model.add(sum(counts[day] for day in selected) == selected_target), weight_key, weight_detail)
                 diagnostics.track(model.add(sum(counts[day] for day in others) == other_target), weight_key, weight_detail)
-                if len(week_dates[week]) == 7:
+                if len(weighted_week_dates[week]) == 7:
                     diagnostics.track(model.add(full_total == sum(counts.values())), weight_key, weight_detail)
                 for label, group in (('selected', selected), ('remaining', others)):
                     if len(group) > 1:

@@ -11,8 +11,9 @@ import { isAvatarData } from './avatarData.ts'
 import ShiftRulesPanel from './ShiftRulesPanel.vue'
 import SourceBadge from './SourceBadge.vue'
 import { hoursToMinutes, monthlyHoursReference } from './hours.ts'
-import { weightedDayRange, weightedWeeks, weekdayWeightCapacity, weekdayWeightRuleError } from './weekday-weights.ts'
+import { weightedDayRange, weightedHistoryFits, weightedWeeks, weekdayWeightCapacity, weekdayWeightRuleError } from './weekday-weights.ts'
 import type { WeightedWeek } from './weekday-weights.ts'
+import { openingWeekNotice } from './solverGuidance.ts'
 
 const props = defineProps<{ state: PlannerState; section: 'team' | 'shifts' | 'rules'; payroll: PayrollSettings }>()
 const emit = defineEmits<{ change: [options?: { silent?: boolean }] }>()
@@ -39,6 +40,7 @@ const leaveEmployeeId = ref('')
 const leaveEmployee = computed(() => props.state.employees.find(employee => employee.id === leaveEmployeeId.value))
 const employeeDraft = reactive<Employee>({ id: '', name: '', role: '', group: '', color: '#d7e8f8', avatar: null, minHoursPerMonth: null, minHoursPerWeek: 40, maxHoursPerWeek: 48, eligibleShiftIds: [], unavailableDates: [] })
 const monthReference = computed(() => monthlyHoursReference(props.state))
+const openingWeekInfo = computed(() => openingWeekNotice(props.state))
 const referenceDraft = ref<number | string>(monthReference.value.hours)
 const referenceError = ref('')
 const referenceSaved = ref(false)
@@ -213,10 +215,11 @@ const weekdayPreviewWeeks = computed(() => weekdayExampleError.value ? [] : weig
 const weekdayCapacity = computed(() => weekdayWeightCapacity(weekdayPreviewState.value))
 const weekdayMinimum = computed(() => props.state.shifts.reduce((sum, shift) => sum + shift.required, 0) * 7)
 const weekdayMaximum = computed(() => props.state.shifts.some(shift => shift.staffingMode !== 'fixed') ? props.state.employees.length * 7 : Math.min(props.state.employees.length * 7, weekdayMinimum.value))
-const weekdayExampleBelowMinimum = computed(() => weekdayPreviewWeeks.value.some(week => week.dates.some(date => weightedDayRange(week, date)[0] < weekdayMinimum.value / 7)))
+const weekdayExampleHistoryConflict = computed(() => weekdayPreviewWeeks.value.some(week => !weightedHistoryFits(week)))
+const weekdayExampleBelowMinimum = computed(() => weekdayPreviewWeeks.value.some(week => weightedHistoryFits(week) && week.dates.some(date => weightedDayRange(week, date)[0] < weekdayMinimum.value / 7)))
 const weekdayFullSelected = computed(() => Math.ceil(Number(weekdayExampleTotal.value) * Number(weekdayPercent.value) / 100))
 const weekdaySelectedLabel = computed(() => weekdayOptions.filter(day => weekdayDays.value.includes(day.value)).map(day => day.short).join('、'))
-const weekdayMonthlyTotal = computed(() => weekdayPreviewWeeks.value.reduce((sum, week) => sum + week.totalTarget, 0))
+const weekdayMonthlyTotal = computed(() => weekdayExampleHistoryConflict.value ? null : weekdayPreviewWeeks.value.reduce((sum, week) => sum + week.totalTarget, 0))
 function resetRules() {
   Object.assign(rulesDraft, props.state.rules)
   weekdayWeightsEnabled.value = !!props.state.rules.weekdayWeights
@@ -551,7 +554,7 @@ const weekdayRulesPending = computed(() => {
         <p v-if="referenceError" class="sp-settings-inline-error" role="alert">{{ referenceError }}</p>
         <p v-else class="sp-settings-auto-status" role="status">{{ referenceSaved ? '月参考工时已自动保存' : '输入后自动保存，仅影响当前月份' }}</p>
         <p v-if="!monthReference.verified" class="sp-settings-calendar-warning" role="status">日历待核对，当前建议值为估算，可手动设置。</p>
-        <details class="sp-settings-help-details sp-settings-reference-details"><summary>参考工时说明</summary><p>月参考值按本月工作日 × 8 小时计算，包含法定节假日、调休补班及手动日历标记。未单独设置的成员，月最低工时跟随参考值；月份在顶部切换。</p><p>月最低和周最低都是必须满足的条件，设为 0 可关闭对应最低限制。周工时按周一至周日计算。月初、月末先按当月所占天数折算周最低；同一周月外已排工时可抵扣整周最低，本月实际最低取「折算值」与「整周最低减去月外已排工时后的剩余缺口」中较小的非负值。周最高仍计入已知跨月排班。排班精确到分钟，最低向上、最高向下取整。</p></details>
+        <details class="sp-settings-help-details sp-settings-reference-details"><summary>参考工时说明</summary><p>月参考值按本月工作日 × 8 小时计算，包含法定节假日、调休补班及手动日历标记。未单独设置的成员，月最低工时跟随参考值；月份在顶部切换。</p><p>月最低和周最低都是必须满足的条件，设为 0 可关闭对应最低限制。周工时按周一至周日计算，周最高计入已知跨月排班。排班精确到分钟，最低向上、最高向下取整。</p><p v-if="openingWeekInfo" class="sp-settings-boundary-note"><strong>{{ openingWeekInfo.title }}</strong><span v-if="openingWeekInfo.range"> · {{ openingWeekInfo.range }}</span><br />{{ openingWeekInfo.hours }}</p><p>月初有当前成员的上月排班记录（含休息）时，承接同一自然周；上月未排的格子按休息处理，历史安排保持不变。无上月记录及月末部分周，周最低仍取「按本月天数折算值」与「整周最低减去已知月外工时的剩余缺口」中较小的非负值。</p></details>
       </section>
       <div class="sp-settings-toolbar"><label class="sp-settings-search"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input v-model="employeeSearch" type="search" placeholder="搜索姓名、岗位或分组" aria-label="搜索员工" /></label><span>{{ state.employees.length }} / {{ limits.employees }} 位团队成员</span></div>
       <p v-if="state.employees.length >= limits.employees" class="sp-settings-hint">已达到 {{ limits.employees }} 人上限，可以编辑现有人员，或删除不再使用的人员后新增。</p>
@@ -636,19 +639,21 @@ const weekdayRulesPending = computed(() => {
                 <template v-else><p>假设完整周排 {{ weekdayExampleTotal }} 班，{{ weekdaySelectedLabel }}合计应排 ⌈{{ weekdayExampleTotal }} × {{ weekdayPercent }}%⌉ = {{ weekdayFullSelected }} 班，其余星期共 {{ Number(weekdayExampleTotal) - weekdayFullSelected }} 班。</p><p>严格覆盖下，完整周至少需要 {{ weekdayMinimum }} 班；固定人数班次不能增派，实际还需满足成员工时与休息规则。</p><p v-if="Number(weekdayExampleTotal) < weekdayMinimum || Number(weekdayExampleTotal) > weekdayMaximum" class="sp-settings-weight-capacity-warning">此演示班数超出当前人数规则或每人每天一班的容量范围，仅用于说明比例计算。</p><p v-else-if="weekdayExampleBelowMinimum" class="sp-settings-weight-capacity-warning">此示例分配后，有些日期未达到严格覆盖所需人数，需调整班次人数模式、总班数或占比后重新排班。</p></template>
               </div>
               <section v-if="!weekdayExampleError" class="sp-settings-weight-preview" aria-label="本月上班权重计算示例">
-                <div class="sp-settings-weight-preview-heading"><h4>{{ state.month }} · 按演示总班数分段计算</h4><span>本月示例共 <strong class="sp-settings-weight-month-total">{{ weekdayMonthlyTotal }}</strong> 班</span></div>
+                <div class="sp-settings-weight-preview-heading"><h4>{{ state.month }} · 按演示总班数分段计算</h4><span v-if="weekdayMonthlyTotal !== null">本月示例共 <strong class="sp-settings-weight-month-total">{{ weekdayMonthlyTotal }}</strong> 班</span><span v-else>含与上月排班不兼容的示例</span></div>
                 <div class="sp-settings-weight-weeks">
                   <article v-for="week in weekdayPreviewWeeks" :key="week.id" class="sp-settings-weight-week" :data-week="week.id">
                     <header><strong>{{ week.dates[0]!.slice(5) }} — {{ week.dates[week.dates.length - 1]!.slice(5) }}</strong><span>{{ week.dates.length === 7 ? '完整周' : '部分周' }}</span></header>
-                    <dl><div><dt>已选星期</dt><dd><strong class="sp-settings-weight-selected">{{ week.selectedTarget }}</strong> 班</dd></div><div><dt>其余星期</dt><dd><strong class="sp-settings-weight-other">{{ week.otherTarget }}</strong> 班</dd></div><div><dt>合计</dt><dd><strong class="sp-settings-weight-total">{{ week.totalTarget }}</strong> 班</dd></div></dl>
-                    <details><summary>示例逐日人数范围</summary><ul><li v-for="date in week.dates" :key="date" :class="{ selected: week.selectedDates.includes(date) }"><span>{{ date.slice(5) }} {{ dayWeightLabel(date) }}</span><strong>{{ dayWeightRange(week, date) }} 班</strong></li></ul><p>按上方演示总班数计算，同组内各天相差最多 1 班。实际增派后将按新的总班数重新计算，此示例不代表已满足工时和各班最少 / 固定人数规则。</p></details>
+                    <p v-if="week.history" class="sp-settings-weight-history">已计入上月排班：所选星期 {{ week.history.selectedTotal }} 班，其余星期 {{ week.history.otherTotal }} 班。下方仅列本月剩余份额，上月记录保持不变。</p>
+                    <p v-if="!weightedHistoryFits(week)" class="sp-settings-weight-history sp-settings-weight-capacity-warning">此段演示总班数与上月已排分布不兼容，请调整演示总班数后查看本月剩余份额。</p>
+                    <template v-else><dl><div><dt>已选星期</dt><dd><strong class="sp-settings-weight-selected">{{ week.selectedTarget }}</strong> 班</dd></div><div><dt>其余星期</dt><dd><strong class="sp-settings-weight-other">{{ week.otherTarget }}</strong> 班</dd></div><div><dt>合计</dt><dd><strong class="sp-settings-weight-total">{{ week.totalTarget }}</strong> 班</dd></div></dl>
+                    <details><summary>示例逐日人数范围</summary><ul><li v-for="date in week.dates" :key="date" :class="{ selected: week.selectedDates.includes(date) }"><span>{{ date.slice(5) }} {{ dayWeightLabel(date) }}</span><strong>{{ dayWeightRange(week, date) }} 班</strong></li></ul><p>按上方演示总班数计算，同组内各天相差最多 1 班。<template v-if="week.history">同一周的上月各天也参与比较。</template>实际增派后将按新的总班数重新计算，此示例不代表已满足工时和各班最少 / 固定人数规则。</p></details></template>
                   </article>
                 </div>
               </section>
               </details>
             </template>
             <p class="sp-settings-hint">比例是硬性规则，同时遵守各班人数模式与工时限制。</p>
-            <details class="sp-settings-help-details"><summary>权重与人数规则说明</summary><p class="sp-settings-soft-note"><strong>占比是硬性规则，人数模式同时生效。</strong>完整周以实际总班数计算，所选星期合计向上取整，组内各天均摊。月初、月末只保留当月出现的星期份额，缺失星期的份额不重新分配。为满足工时，只能向最少人数班次增派。固定人数班次须恰好满足人数，最少人数班次须达到下限，星期占比及其他规则也须同时满足。规则冲突时会提示无法排班。</p></details>
+            <details class="sp-settings-help-details"><summary>权重与人数规则说明</summary><p v-if="openingWeekInfo" class="sp-settings-boundary-note"><strong>{{ openingWeekInfo.title }}</strong><span v-if="openingWeekInfo.range"> · {{ openingWeekInfo.range }}</span><br />{{ openingWeekInfo.weights }}</p><p class="sp-settings-soft-note"><strong>占比是硬性规则，人数模式同时生效。</strong>完整周以实际总班数计算，所选星期合计向上取整，组内各天均摊。月初有当前成员的上月排班记录（含休息）时，同一自然周的上月已排也参与占比和每天人数检查；上月未排格按休息处理。无上月记录及月末部分周，只保留当月出现的星期份额，缺失份额不重新分配。为满足工时，只能向最少人数班次增派。固定人数班次须恰好满足人数，最少人数班次须达到下限，星期占比及其他规则也须同时满足。历史安排不自动改动，冲突时请核对上月排班或规则。</p></details>
           </div>
           <p v-else class="sp-settings-hint">关闭时按各班最少 / 固定人数规则安排。最少人数班次可为满足成员最低工时增派，固定人数班次不增派；不额外限制星期占比。</p>
         </section>
@@ -678,6 +683,10 @@ const weekdayRulesPending = computed(() => {
 </template>
 
 <style scoped>
+.sp-settings-boundary-note { overflow-wrap: anywhere; }
+.sp-settings-boundary-note strong { color: #3e6753; font-weight: 600; }
+.sp-settings-weight-week .sp-settings-weight-history { margin-top: 10px; font-size: 11px; line-height: 1.8; color: #678174; overflow-wrap: anywhere; }
+.sp-settings-weight-week .sp-settings-weight-capacity-warning { color: #9a682c; }
 .sp-settings-card-title { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 7px; min-width: 0; }
 .sp-settings-person-info { min-width: 0; }
 .sp-settings-editor-status { display: flex; justify-content: flex-end; margin-bottom: 12px; }

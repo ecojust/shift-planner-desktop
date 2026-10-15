@@ -24,7 +24,7 @@ import { BUILD_VERSION } from './buildInfo'
 import { minimumMonthHours, monthlyHoursByEmployee } from './hours.ts'
 import { createSolverRequest, solverDebugJSON, solverDebugFileName } from './solverDebug'
 import { parseRulesImport } from './rulesImport'
-import { withSolverGuidance, diagnosticActionLabel } from './solverGuidance'
+import { withSolverGuidance, diagnosticActionLabel, openingWeekNotice } from './solverGuidance'
 import './planner.css'
 
 const brandMarkUrl = `${import.meta.env.BASE_URL}brand-mark.png`
@@ -121,6 +121,7 @@ const navigation: { key: Section; label: string; icon: string }[] = [
 const sectionLabel = computed(() => navigation.find(n => n.key === section.value)!.label)
 const dates = computed(() => datesOfMonth(state.value.month))
 const monthOffset = computed(() => (new Date(`${state.value.month}-01T12:00:00`).getDay() + 6) % 7)
+const openingWeekInfo = computed(() => openingWeekNotice(state.value))
 const weekCount = computed(() => Math.ceil((dates.value.length + monthOffset.value) / 7))
 const visibleDates = computed(() => view.value === 'month' ? dates.value : dates.value.slice(Math.max(0, weekIndex.value * 7 - monthOffset.value), Math.min(dates.value.length, weekIndex.value * 7 + 7 - monthOffset.value)))
 const groups = computed(() => [...new Set(state.value.employees.map(e => e.group).filter(Boolean))])
@@ -790,6 +791,7 @@ watch([generating, cancelling], async () => {
         <template v-else>
         <div class="sp-generation-summary"><Icon name="spark" :size="35" /><div><strong>{{ state.employees.length }} 位成员 · {{ state.shifts.length }} 个班次</strong><p>需求 {{ coverage.total }} 个班位 · 保留 {{ lockedCount }} 项锁定安排</p></div></div>
         <p class="sp-modal-copy">按成员工时、请假和已设置规则重新安排本月未锁定班次。每日最少人数可增派；每日固定人数须恰好满足。</p>
+        <div v-if="openingWeekInfo" class="sp-opening-week-note" role="note" aria-label="月初跨周排班说明" :data-history-included="openingWeekInfo.included"><strong>{{ openingWeekInfo.title }}</strong><span v-if="openingWeekInfo.range" class="sp-opening-week-range">{{ openingWeekInfo.range }}</span><p>{{ openingWeekInfo.summary }}</p></div>
         <template v-if="desktop">
           <div class="sp-solver-engine" :class="{ 'is-error': engineState === 'error' }"><Icon :name="engineState === 'ready' ? 'shield' : 'info'" :size="18" /><span><strong>{{ engineState === 'ready' ? '已准备就绪' : engineState === 'error' ? '暂时无法排班' : '正在准备' }}</strong><small role="status">{{ engineInfo }}</small></span><button v-if="engineState === 'error'" class="sp-button" @click="checkEngine">重试检测</button></div>
           <p v-if="engineDiagnostic" class="sp-solver-diagnostic">请先重试；仍然无法使用时，可重新打开应用或更新到最新版本。</p>
@@ -857,3 +859,10 @@ watch([generating, cancelling], async () => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.sp-opening-week-note { margin-top: 12px; padding: 10px 12px; border-left: 3px solid #94b5a2; border-radius: 5px; background: #f3f7f4; color: #5c7869; font-size: 11px; line-height: 1.8; overflow-wrap: anywhere; }
+.sp-opening-week-note strong { color: #3e6753; font-size: 12px; font-weight: 600; }
+.sp-opening-week-range { display: block; font-variant-numeric: tabular-nums; }
+.sp-opening-week-note p { margin: 4px 0 0; }
+</style>

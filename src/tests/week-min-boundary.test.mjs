@@ -59,7 +59,14 @@ test('without known outside history the original prorated minimum remains, round
 
 test('prior-month overnight carry-in is completed in-month work and is not also outside credit', () => {
   const state = employee(fixture({ shifts: [day, night], assignments: [assignment('2026-10-31', 'night')] }), { eligibleShiftIds: ['day', 'night'] })
-  assert.equal(minimumAt(state), undefined, 'Six carried-in hours exceed the 343-minute Sunday target')
+  const november = minimumAt(state)
+  assert.match(november.message, /实际工时 6 小时/)
+  assert.match(november.message, /月外已知工时 2 小时/)
+  assert.match(november.message, /周最低工时 38 小时/, 'Known October history requires a full forty-hour week, not a prorated Sunday')
+  state.employees[0].minHoursPerWeek = 8
+  assert.equal(minimumAt(state), undefined, 'The same night contributes two outside plus six inside hours exactly once')
+  state.employees[0].minHoursPerWeek = 9
+  assert.ok(minimumAt(state), 'Eight total hours cannot satisfy a nine-hour complete-week minimum')
   // Viewed from October, only Saturday's two hours are in the month; the
   // outgoing six hours may reduce the target only once this shift is locked.
   state.month = '2026-10'

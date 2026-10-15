@@ -1,6 +1,7 @@
 import type { Assignment, Employee, Issue, PlannerState, Shift } from './domain.ts'
 import { hoursToMinutes, minimumMonthHours } from './hours.ts'
-import { weekdayWeightRuleError, weightedWeeks, findWeightedWeek, type WeightedWeek } from './weekday-weights.ts'
+import { weekdayWeightRuleError, weightedWeeks, weightedWeekTargets, findWeightedWeek, weightedGroups, weightedHistoryFits, weightedDayRange, type WeightedWeek } from './weekday-weights.ts'
+import { getPreviousWeekContext } from './weekBoundary.ts'
 
 const DAY = 86_400_000
 const HOUR = 3_600_000
@@ -108,8 +109,8 @@ const minimumMinutes = (hours: number) => hoursToMinutes(hours, 'ceil')
 const maximumMinutes = (employee: Employee) => hoursToMinutes(employee.maxHoursPerWeek, 'floor')
 const minimumWeekMinutes = (employee: Employee, days: number) => Math.ceil(minimumMinutes(employee.minHoursPerWeek ?? 0) * days / 7)
 
-interface WeeklyMinimum { target: number; prorated: number; outside: number }
-function weeklyMinimumTargets(employee: Employee, fixedWork: Work[], window: MonthWindow): Map<number, WeeklyMinimum> {
+interface WeeklyMinimum { target: number; prorated: number; outside: number; carried: boolean }
+function weeklyMinimumTargets(employee: Employee, fixedWork: Work[], window: MonthWindow, previousWeekStart?: string): Map<number, WeeklyMinimum> {
   const full = minimumMinutes(employee.minHoursPerWeek ?? 0)
   const sorted = [...fixedWork].sort((a, b) => a.start - b.start || a.end - b.end)
   return new Map(window.weeks.map(week => {
@@ -118,7 +119,9 @@ function weeklyMinimumTargets(employee: Employee, fixedWork: Work[], window: Mon
     // hours belong to completed in-month work, never to this outside credit.
     const outside = Math.max(0, workedMinutes(sorted, week.week, week.week + 7 * DAY) - workedMinutes(sorted, week.start, week.end))
     const prorated = minimumWeekMinutes(employee, week.days)
-    return [week.week, { target: Math.min(prorated, Math.max(0, full - outside)), prorated, outside }]
+    const carried = previousWeekStart === dateText(week.week)
+    const remaining = Math.max(0, full - outside)
+    return [week.week, { target: carried ? remaining : Math.min(prorated, remaining), prorated, outside, carried }]
   }))
 }
 
@@ -197,6 +200,7 @@ function configurationIssues(state: PlannerState): Issue[] {
 export function validateSchedule(state: PlannerState): Issue[] {
   const issues = configurationIssues(state)
   const window = monthWindow(state.month)
+  const previousWeek = getPreviousWeekContext(state)
   const employees = new Map(state.employees.map(employee => [employee.id, employee]))
   const shifts = new Map(state.shifts.map(shift => [shift.id, shift]))
   const byEmployee = new Map<string, Work[]>()
@@ -316,11 +320,13 @@ export function validateSchedule(state: PlannerState): Issue[] {
       const minutes = workedMinutes(work, window.start, window.end)
       const minimum = minimumMinutes(minimumMonthHours(state, employee))
       if (minutes + EPSILON < minimum) add('monthly-min-hours', `${employee.name}本月实际工时 ${Number((minutes / 60).toFixed(2))} 小时，少于月最低工时 ${Number((minimum / 60).toFixed(2))} 小时。`, { employeeId: employee.id, date: dateText(window.start), shiftId: '', locked: false })
-      const targets = weeklyMinimumTargets(employee, work.filter(item => item.assignment.locked || !item.assignment.date.startsWith(`${state.month}-`)), window)
+      const targets = weeklyMinimumTargets(employee, work.filter(item => item.assignment.locked || !item.assignment.date.startsWith(`${state.month}-`)), window, previousWeek?.weekStart)
       for (const week of window.weeks) {
         const minutes = workedMinutes(work, week.start, week.end)
-        const { target: minimum, prorated, outside } = targets.get(week.week)!
-        const explanation = minimum < prorated
+        const { target: minimum, prorated, outside, carried } = targets.get(week.week)!
+        const explanation = carried
+          ? `合并上月最后一个自然周，本周月外已知工时 ${Number((outside / 60).toFixed(2))} 小时，需补足整周最低 ${employee.minHoursPerWeek} 小时的剩余部分`
+          : minimum < prorated
           ? `本月原折算 ${Number((prorated / 60).toFixed(2))} 小时；本周月外已知工时 ${Number((outside / 60).toFixed(2))} 小时，仅需补足整周最低 ${employee.minHoursPerWeek} 小时的剩余部分`
           : `${employee.minHoursPerWeek} × ${week.days}/7，向上取整到分钟`
         if (minutes + EPSILON < minimum) add('weekly-min-hours', `${employee.name}在 ${dateText(week.week)} 起的一周，本月 ${week.days} 天实际工时 ${Number((minutes / 60).toFixed(2))} 小时，少于本月这段的周最低工时 ${Number((minimum / 60).toFixed(2))} 小时（${explanation}）。`, { employeeId: employee.id, date: dateText(week.start), shiftId: '', locked: false })
@@ -337,9 +343,11 @@ export function validateSchedule(state: PlannerState): Issue[] {
     const selectedActual = week.selectedDates.reduce((sum, date) => sum + dateTotal(date), 0)
     const otherActual = week.otherDates.reduce((sum, date) => sum + dateTotal(date), 0)
     if (!findWeightedWeek(state, week, selectedActual, otherActual)) {
-      quotaIssue('weekday-quota', `${week.id} 起的一周，所选星期 ${selectedActual} 人次、其余星期 ${otherActual} 人次，不符合实际总班次数的星期权重；月边界保留缺失星期原份额。`)
+      quotaIssue('weekday-quota', `${week.id} 起的一周，所选星期 ${selectedActual + (week.history?.selectedTotal ?? 0)} 人次、其余星期 ${otherActual + (week.history?.otherTotal ?? 0)} 人次，不符合实际总班次数的星期权重；${week.history ? '已合并上月同一自然周的固定排班。' : '月边界保留缺失星期原份额。'}`)
     }
-    for (const [label, dates] of [['所选星期', week.selectedDates], ['其余星期', week.otherDates]] as const) {
+    for (const [index, group] of weightedGroups(week).entries()) {
+      const label = index === 0 ? '所选星期' : '其余星期'
+      const dates = [...group.historyDates, ...group.dates]
       const counts = dates.map(dateTotal)
       if (counts.length && Math.max(...counts) - Math.min(...counts) > 1) quotaIssue('weekday-balance', `${week.id} 起的一周，${label}应平摊排班人次；当前每天为 ${counts.join('、')} 人次，最多相差 1 人次。`)
     }
@@ -444,9 +452,10 @@ function weightedDailyTargets(weeks: WeightedWeek[], fixed: Assignment[], employ
   }
   const targets = new Map<string, number>()
   for (const week of weeks) {
-    for (const [dates, total] of [[week.selectedDates, week.selectedTarget], [week.otherDates, week.otherTarget]] as const) {
+    for (const { dates, target: total } of weightedGroups(week)) {
       if (!dates.length) continue
-      const base = Math.floor(total / dates.length), remainder = total % dates.length
+      const [base] = weightedDayRange(week, dates[0]!)
+      const remainder = total - base * dates.length
       // Try different remainder days across attempts; preserve feasible locked
       // workloads by giving their required extra seat priority.
       const order = dates.map(date => ({ date, needsExtra: (counts.get(date)?.size || 0) > base ? 1 : 0, tie: random() }))
@@ -473,10 +482,19 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
   const shifts = new Map(state.shifts.map(shift => [shift.id, shift]))
   const monthMinimums = new Map(state.employees.map(employee => [employee.id, minimumMinutes(minimumMonthHours(state, employee))]))
   const fixedWork = fixed.map(item => workFor(item, shifts)).filter((item): item is Work => !!item)
-  const weekMinimums = new Map(state.employees.map(employee => [employee.id, weeklyMinimumTargets(employee, fixedWork.filter(item => item.assignment.employeeId === employee.id), window)]))
+  const previousWeek = getPreviousWeekContext(state)
+  const weekMinimums = new Map(state.employees.map(employee => [employee.id, weeklyMinimumTargets(employee, fixedWork.filter(item => item.assignment.employeeId === employee.id), window, previousWeek?.weekStart)]))
   const weekMinimum = (employee: Employee, week: number) => weekMinimums.get(employee.id)!.get(week)!.target
   const weightExamples = weightedWeeks(state)
   const employeeIds = new Set(state.employees.map(employee => employee.id))
+  const fixedCounts = new Map<string, Set<string>>()
+  const fixedRest = new Set<string>()
+  for (const item of fixed) {
+    if (item.shiftId === 'off') fixedRest.add(`${item.employeeId}\0${item.date}`)
+    if (!shifts.has(item.shiftId)) continue
+    const employees = fixedCounts.get(item.date) ?? new Set<string>()
+    employees.add(item.employeeId); fixedCounts.set(item.date, employees)
+  }
   const dailyMinimum = state.shifts.reduce((sum, shift) => sum + shift.required, 0)
   const dailyMaximum = state.shifts.every(shift => shift.staffingMode === 'fixed') ? Math.min(dailyMinimum, state.employees.length) : state.employees.length
   let best = fixed, bestRank = [Infinity, Infinity, Infinity, Infinity]
@@ -502,18 +520,17 @@ export function generateSchedule(state: PlannerState, seed = 1010): { assignment
       }, 0)
       const choices: WeightedWeek[] = []
       for (let fullTotal = 0; fullTotal <= state.employees.length * 7; fullTotal++) {
-        const candidate = weightedWeeks(state, fullTotal).find(week => week.id === example.id)!
-        if (candidate.totalTarget < requiredSlots) continue
+        const candidate = weightedWeekTargets(example, state.rules.weekdayWeights!, fullTotal)
+        if (candidate.totalTarget < requiredSlots || !weightedHistoryFits(candidate)) continue
         const fits = [[candidate.selectedDates, candidate.selectedTarget], [candidate.otherDates, candidate.otherTarget]].every(([rawDates, rawTotal]) => {
           const group = rawDates as string[], total = rawTotal as number
           if (!group.length) return total === 0
-          const low = Math.floor(total / group.length), high = Math.ceil(total / group.length)
-          if (low < dailyMinimum || high > dailyMaximum) return false
+          const [low, high] = weightedDayRange(candidate, group[0]!)
           let floor = 0, ceiling = 0
           for (const date of group) {
-            const lockedWork = new Set(fixed.filter(item => item.date === date && shifts.has(item.shiftId)).map(item => item.employeeId)).size
-            const available = plans.filter(plan => !plan.employee.unavailableDates.includes(date) && plan.employee.maxHoursPerWeek > 0 && plan.employee.eligibleShiftIds.length && !fixed.some(item => item.employeeId === plan.employee.id && item.date === date && item.shiftId === 'off')).length
-            const min = Math.max(low, lockedWork), max = Math.min(high, available)
+            const lockedWork = fixedCounts.get(date)?.size ?? 0
+            const available = plans.filter(plan => !plan.employee.unavailableDates.includes(date) && plan.employee.maxHoursPerWeek > 0 && plan.employee.eligibleShiftIds.length && !fixedRest.has(`${plan.employee.id}\0${date}`)).length
+            const min = Math.max(low, dailyMinimum, lockedWork), max = Math.min(high, dailyMaximum, available)
             if (min > max) return false
             floor += min; ceiling += max
           }

@@ -436,8 +436,8 @@ class SolverTest(unittest.TestCase):
         self.assertIn('241', result['issues'][0]['message'])
 
     def test_previous_month_night_tail_satisfies_first_partial_week_minimum(self):
-        # February 2026 begins on Sunday: 7/7 = one hour is needed in February,
-        # supplied by the Saturday night shift's seven-hour Sunday tail.
+        # February 2026 begins on Sunday. One known Saturday hour leaves six
+        # of the full week's seven hours, covered by the seven-hour Sunday tail.
         leaves = [f'2026-02-{day:02d}' for day in (2, 3, 4, 5, 6)]
         fixed = [assignment('a', '2026-01-31', 'night', False), assignment('a', '2026-02-01', 'off')]
         s = state(month='2026-02', employees=[employee('a', ['night'], cap=168, minimum_week=7, leave=leaves), employee('b', ['night'], cap=168)], shifts=[shift('night', '23:00', '07:00')], assignments=fixed)
@@ -501,9 +501,19 @@ class SolverTest(unittest.TestCase):
             week = (date - dt.timedelta(days=date.weekday())).isoformat()
             weeks.setdefault(week, []).append(date)
             date += dt.timedelta(days=1)
-        counts = weekly_team_counts(s, assignments)
+        employee_ids = {item['id'] for item in s['employees']}
+        previous_month = (first - dt.timedelta(days=1)).strftime('%Y-%m')
+        has_previous_history = any(item['employeeId'] in employee_ids and item['date'].startswith(previous_month + '-')
+                                   for item in s['assignments'])
+        if first.weekday() and has_previous_history:
+            start = first - dt.timedelta(days=first.weekday())
+            weeks[start.isoformat()] = [start + dt.timedelta(days=offset) for offset in range(7)]
+        counts = {}
+        for item in assignments:
+            if item['employeeId'] in employee_ids and item['shiftId'] != 'off':
+                counts[item['date']] = counts.get(item['date'], 0) + 1
         for week, days in weeks.items():
-            by_day = counts.get(week, ({}, {}))[0]
+            by_day = {day.isoformat(): counts.get(day.isoformat(), 0) for day in days}
             selected = [by_day.get(day.isoformat(), 0) for day in days if day.weekday() + 1 in chosen]
             others = [by_day.get(day.isoformat(), 0) for day in days if day.weekday() + 1 not in chosen]
             for group in (selected, others):
@@ -646,7 +656,7 @@ class SolverTest(unittest.TestCase):
         self.assertEqual(len(result['assignments']), 8)
         self.assert_weighted_actual(s, result['assignments'])
 
-    def test_weighted_outside_month_assignments_are_preserved_but_not_counted_in_quota(self):
+    def test_weighted_previous_month_assignments_are_preserved_and_counted_in_first_week_quota(self):
         prior = assignment('a', '2026-09-28', locked=False)
         s = state(month='2026-10', employees=[employee('a', cap=168), employee('b', cap=168), employee('c', cap=168)], assignments=[prior])
         s['rules'].update(weekdayWeights={'days': [6, 7], 'percent': 50}, minRestHours=0, maxConsecutiveDays=31)
@@ -655,6 +665,118 @@ class SolverTest(unittest.TestCase):
         self.assertIn(prior, result['assignments'])
         self.assert_daily_minimum(s, result['assignments'])
         self.assert_weighted_actual(s, result['assignments'])
+
+    def test_weighted_coherent_previous_week_counts_preserve_all_history(self):
+        prior = [assignment('a', f'2026-09-{day}', locked=False) for day in (28, 29, 30)]
+        prior += [assignment('b', '2026-09-01', 'off', False), assignment('a', '2026-11-01', 'off', False)]
+        s = state(employees=[employee('a', cap=168), employee('b', cap=168)],
+                  shifts=[shift(mode='fixed')], assignments=prior)
+        s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
+        original = copy.deepcopy(s)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertEqual(s, original)
+        self.assertCountEqual([item for item in result['assignments'] if not item['date'].startswith(s['month'] + '-')], prior)
+        self.assertEqual(sum(item['shiftId'] != 'off' and '2026-09-28' <= item['date'] <= '2026-10-04'
+                             for item in result['assignments']), 7)
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+
+    def test_weighted_previous_counts_are_not_retroactively_limited_by_current_fixed_staffing(self):
+        for prior_count in (0, 2):
+            with self.subTest(prior_count=prior_count):
+                prior = [assignment('a', '2026-09-01', 'off', False)]
+                prior += [assignment(eid, f'2026-09-{day}', locked=False)
+                          for day in (28, 29, 30) for eid in ('a', 'b')[:prior_count]]
+                s = state(employees=[employee('a', cap=168), employee('b', cap=168)],
+                          shifts=[shift(required=1, mode='fixed')], assignments=prior)
+                s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
+                result = solve(request(s))
+                self.assertFeasible(result)
+                self.assertCountEqual([item for item in result['assignments'] if not item['date'].startswith(s['month'] + '-')], prior)
+                self.assert_daily_minimum(s, result['assignments'])
+                self.assert_weighted_actual(s, result['assignments'])
+
+    def test_weighted_incoherent_previous_counts_are_infeasible_even_with_partial_coverage(self):
+        # Two starts on Monday and known zero on Tuesday cannot be made uniform
+        # by any choices in the editable Thursday-Sunday part of the week.
+        prior = [assignment('a', '2026-09-28', locked=False), assignment('b', '2026-09-28', locked=False)]
+        s = state(employees=[employee('a', cap=168), employee('b', cap=168)],
+                  shifts=[shift(mode='fixed')], assignments=prior)
+        s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
+        original = copy.deepcopy(s)
+        for allow_partial in (False, True):
+            with self.subTest(allow_partial=allow_partial):
+                r = request(s)
+                r['options']['allowPartial'] = allow_partial
+                result = solve(r)
+                self.assertEqual(result['status'], 'INFEASIBLE', result)
+                self.assertNotIn('assignments', result)
+                self.assertEqual(s, original)
+
+    def test_weighted_historical_group_ratio_is_checked_even_when_every_day_is_balanced(self):
+        # A complete seven-day week with one start per day is evenly balanced,
+        # but Mon/Sat's two starts do not meet ceil(7 * 40%) == three starts.
+        current = [assignment('a', '2026-11-01'), assignment('b', '2026-11-01', 'off')]
+        s = state(month='2026-11', employees=[employee('a', cap=168), employee('b', cap=168)],
+                  assignments=current)
+        s['rules'].update(weekdayWeights={'days': [1, 6], 'percent': 40}, minRestHours=0, maxConsecutiveDays=31)
+        baseline = solve(request(s))
+        self.assertFeasible(baseline)
+        self.assert_weighted_actual(s, baseline['assignments'])
+        s['assignments'] += [assignment('a', f'2026-10-{day}', locked=False) for day in range(26, 32)]
+        original = copy.deepcopy(s)
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE', result)
+        self.assertNotIn('assignments', result)
+        self.assertEqual(s, original)
+        self.assertTrue(any(item['type'] == 'weekday-weight-capacity' and '合并上月固定工作记录' in item['message']
+                            for item in result['issues']), result)
+
+    def test_weighted_previous_month_off_far_from_boundary_makes_blank_days_known_zero(self):
+        s = state(employees=[employee(str(i), cap=168) for i in range(3)], shifts=[shift(required=2, mode='fixed')])
+        s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
+        # Future and two-month-old records do not establish previous-month history.
+        s['assignments'] = [assignment('0', '2026-08-31', 'off', False), assignment('1', '2026-11-01', 'off', False)]
+        baseline = solve(request(s))
+        self.assertFeasible(baseline)
+        self.assert_weighted_actual(s, baseline['assignments'])
+        # A single off record anywhere in September makes its empty Mon-Wed cells
+        # count as zero, which conflicts with exactly two starts on Thu-Sun.
+        prior_off = assignment('2', '2026-09-01', 'off', False)
+        s['assignments'].append(prior_off)
+        original = copy.deepcopy(s)
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE', result)
+        self.assertNotIn('assignments', result)
+        self.assertEqual(s, original)
+
+    def test_weighted_january_uses_december_history_across_year_boundary(self):
+        s = state(month='2027-01', employees=[employee(str(i), cap=168) for i in range(3)],
+                  shifts=[shift(required=2, mode='fixed')])
+        s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
+        self.assertFeasible(solve(request(s)))
+        s['assignments'] = [assignment('0', '2026-12-01', 'off', False)]
+        result = solve(request(s))
+        self.assertEqual(result['status'], 'INFEASIBLE', result)
+        self.assertNotIn('assignments', result)
+
+    def test_weighted_known_first_week_does_not_include_next_month_in_last_week(self):
+        prior = [assignment(eid, f'2026-09-{day}', locked=False)
+                 for day in (28, 29, 30) for eid in ('a', 'b')]
+        # Next month's Sunday has zero starts. Including it would violate the
+        # uniform rule against the final Mon-Sat's fixed count of two.
+        future_off = assignment('c', '2026-11-01', 'off', False)
+        s = state(employees=[employee(eid, cap=168) for eid in ('a', 'b', 'c')],
+                  shifts=[shift(required=2, mode='fixed')], assignments=prior + [future_off])
+        s['rules'].update(weekdayWeights={'days': list(range(1, 8)), 'percent': 100}, minRestHours=0, maxConsecutiveDays=31)
+        result = solve(request(s))
+        self.assertFeasible(result)
+        self.assertTrue(all(item in result['assignments'] for item in s['assignments']))
+        self.assert_daily_minimum(s, result['assignments'])
+        self.assert_weighted_actual(s, result['assignments'])
+        self.assertEqual(sum(item['shiftId'] != 'off' and '2026-10-26' <= item['date'] <= '2026-10-31'
+                             for item in result['assignments']), 12)
 
     def test_zero_weight_partial_week_can_be_empty_only_when_daily_minimum_permits_it(self):
         s = state(month='2026-02', employees=[employee(str(i), cap=168, minimum_month=8) for i in range(7)], shifts=[shift(required=0)])

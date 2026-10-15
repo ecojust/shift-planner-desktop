@@ -46,6 +46,12 @@ function minutesWithin(intervals, from, to) {
   return intervals.reduce((sum, [start, end]) => sum + Math.max(0, Math.min(end, to) - Math.max(start, from)) / MINUTE, 0)
 }
 function outsideAssignments(state) { return state.assignments.filter(item => !item.date.startsWith(`${state.month}-`)) }
+function previousMonthRecorded(state) {
+  const [monthStart] = monthRange(state.month), previous = new Date(monthStart)
+  previous.setUTCMonth(previous.getUTCMonth() - 1)
+  const first = previous.toISOString().slice(0, 10), last = `${state.month}-01`
+  return state.assignments.some(item => item.date >= first && item.date < last && state.employees.some(employee => employee.id === item.employeeId))
+}
 
 function audit(original, generated) {
   const [monthStart, monthEnd] = monthRange(original.month)
@@ -85,8 +91,10 @@ function audit(original, generated) {
       const fullMinimum = Math.ceil(employee.minHoursPerWeek * 60)
       const proratedMinimum = Math.ceil(fullMinimum * days / 7)
       const knownOutside = minutesWithin(fixed, monday, weekEnd) - minutesWithin(fixed, inStart, inEnd)
-      const requiredInMonth = Math.min(proratedMinimum, Math.max(0, fullMinimum - knownOutside))
+      const carried = monday < monthStart && previousMonthRecorded(original)
+      const requiredInMonth = carried ? Math.max(0, fullMinimum - knownOutside) : Math.min(proratedMinimum, Math.max(0, fullMinimum - knownOutside))
       const inMonth = minutesWithin(work, inStart, inEnd), wholeWeek = minutesWithin(work, monday, weekEnd)
+      if (carried) assert.ok(wholeWeek >= fullMinimum, `${employee.name}: the complete first week must reach ${fullMinimum} minutes, including retained history`)
       assert.ok(inMonth >= requiredInMonth, `${employee.name}: ${new Date(monday).toISOString().slice(0, 10)} needs ${requiredInMonth} minutes; has ${inMonth}`)
       assert.ok(wholeWeek <= Math.floor(employee.maxHoursPerWeek * 60), `${employee.name}: whole-week cap still includes outside history`)
       return { monday: new Date(monday).toISOString().slice(0, 10), days, proratedMinimum, knownOutside, requiredInMonth, inMonth, wholeWeek }
@@ -94,6 +102,36 @@ function audit(original, generated) {
     return { employeeId: employee.id, monthMinutes, weekly }
   })
   return { assignmentCount: generated.assignments.length, members }
+}
+function weightedHistoryFixture(unbalanced = false) {
+  const result = fixture({ teamName: unbalanced ? '上月固定人次不均不可忽略' : '完整自然周星期权重', historyDays: 0, firstDayLeave: false })
+  result.employees = Array.from({ length: 8 }, (_, index) => ({ ...result.employees[0], id: `weighted-${index + 1}`, name: `权重成员${index + 1}`, minHoursPerWeek: 0, maxHoursPerWeek: 168 }))
+  result.shifts[0].required = 1
+  result.rules.weekdayWeights = { days: [7], percent: 50 }
+  result.assignments = Array.from({ length: 6 }, (_, index) => ({ employeeId: `weighted-${index + 1}`, date: `2026-10-${unbalanced && index === 5 ? 26 : 26 + index}`, shiftId: 'day', locked: index % 2 === 0 }))
+  return result
+}
+function auditFullWeekWeights(original, generated) {
+  assert.deepEqual(outsideAssignments(generated), original.assignments, 'Weight balancing must not rewrite any fixed historical person-count')
+  const work = generated.assignments.filter(item => item.shiftId !== 'off')
+  const weeks = [['2026-10-26', '2026-11-01'], ['2026-11-02', '2026-11-08'], ['2026-11-09', '2026-11-15'], ['2026-11-16', '2026-11-22'], ['2026-11-23', '2026-11-29']]
+  return weeks.map(([first, last]) => {
+    const records = work.filter(item => item.date >= first && item.date <= last)
+    const dates = Array.from({ length: 7 }, (_, day) => new Date(Date.parse(`${first}T00:00:00Z`) + day * DAY).toISOString().slice(0, 10))
+    const counts = dates.map(date => records.filter(item => item.date === date).length)
+    const total = records.length, selected = counts[6], other = counts.slice(0, 6).reduce((sum, value) => sum + value, 0)
+    // Directly count the seven actual dates; no extrapolated/prorated candidate
+    // totals and no application weekday-weight helpers are used as an oracle.
+    assert.equal(selected, Math.ceil(total / 2), `${first}: Sunday is half of the actual complete-week person-count, rounded up`)
+    assert.equal(selected + other, total)
+    assert.ok(Math.max(...counts.slice(0, 6)) - Math.min(...counts.slice(0, 6)) <= 1, `${first}: the other six dates must share their actual group total evenly`)
+    assert.ok(counts.every(count => count >= 1), `${first}: daily staffing minima remain satisfied`)
+    if (first === '2026-10-26') {
+      assert.deepEqual(counts.slice(0, 6), [1, 1, 1, 1, 1, 1])
+      assert.ok(selected >= 6, 'Six retained weekday assignments require at least six Sunday assignments, not the month-only prorated four')
+    }
+    return { first, last, counts, total, selected, other }
+  })
 }
 
 async function main() {
@@ -106,6 +144,7 @@ async function main() {
   page.on('worker', worker => workerUrls.push(worker.url()))
   page.on('pageerror', error => errors.push(error.stack || String(error)))
   page.on('console', message => { if (message.type() === 'error') errors.push(message.text()) })
+  const guidanceCaptured = new Set()
   const state = () => page.evaluate(() => JSON.parse(localStorage.getItem('shift-planner:v1') || 'null'))
   async function persisted(predicate) {
     const deadline = Date.now() + 8000
@@ -114,12 +153,30 @@ async function main() {
   }
   async function importFixture(document, name) {
     await fs.writeFile(path.join(output, `${name}-input.json`), JSON.stringify(document, null, 2) + '\n')
-    await page.locator('input[type=file]').setInputFiles({ name: `${name}.json`, mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
+    await page.locator('input[type=file]:not([aria-label="导入规则文件"])').setInputFiles({ name: `${name}.json`, mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(document)) })
     await page.getByRole('button', { name: '确认导入', exact: true }).click()
     await persisted(value => value.teamName === document.teamName && JSON.stringify(value.assignments) === JSON.stringify(document.assignments))
   }
   async function generate(expectedSuccess) {
+    const original = await state()
     await page.getByRole('button', { name: '自动排班', exact: true }).click()
+    const explanation = page.getByRole('note', { name: '月初跨周排班说明', exact: true })
+    await explanation.waitFor()
+    const carried = previousMonthRecorded(original)
+    assert.equal(await explanation.getAttribute('data-history-included'), String(carried))
+    assert.match(await explanation.innerText(), carried ? /已计入上月排班/ : /月初周按当月部分折算/)
+    if (carried) assert.match(await explanation.innerText(), /上月记录保持不变/)
+    if (!guidanceCaptured.has(carried)) {
+      guidanceCaptured.add(carried)
+      await page.screenshot({ path: path.join(output, carried ? '08-generation-carried-guidance.png' : '10-generation-no-history-guidance.png') })
+      if (carried) {
+        await page.setViewportSize({ width: 320, height: 650 })
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
+        assert.equal(await explanation.evaluate(node => node.scrollWidth > node.clientWidth), false)
+        await page.screenshot({ path: path.join(output, '09-generation-carried-guidance-320.png') })
+        await page.setViewportSize({ width: 1440, height: 1050 })
+      }
+    }
     await page.getByRole('button', { name: '开始生成', exact: true }).click()
     await page.locator('.sp-solve-result').waitFor({ timeout: 45000 })
     const text = await page.locator('.sp-solve-result').innerText()
@@ -179,6 +236,60 @@ async function main() {
     await page.screenshot({ path: path.join(output, '02-no-history-retains-prorated-minimum.png') })
     record('no-history-control-still-requires-343-minutes-and-generates-november-first', noHistoryAudit)
 
+    const sixHourGap = fixture({ teamName: '上月32小时加本月6小时不足整周40', historyDays: 4, firstDayLeave: false })
+    sixHourGap.shifts.push({ ...dayShift, id: 'six', name: '六小时班', shortName: '六', end: '14:00' })
+    sixHourGap.employees[0].eligibleShiftIds = ['six']
+    await importFixture(sixHourGap, 'history-32-plus-six-insufficient')
+    const sixHourMessage = await generate(false)
+    assert.match(sixHourMessage, /原排班未改变/)
+    assert.match(sixHourMessage, /2026-10-26/)
+    assert.match(sixHourMessage, /周最低工时\s*8\s*小时/)
+    assert.match(sixHourMessage, /月外已知工时\s*32\s*小时/)
+    assert.deepEqual((await state()).assignments, sixHourGap.assignments)
+    record('retained-32-hours-plus-only-six-available-hours-fails-the-real-40-hour-first-week', { message: sixHourMessage, fixedMinutes: 32 * 60, availableInMonthMinutes: 6 * 60, requiredWholeWeekMinutes: 40 * 60 })
+
+    const eightHourGap = fixture({ teamName: '上月32小时本月补8小时', historyDays: 4, firstDayLeave: false })
+    await importFixture(eightHourGap, 'history-32-plus-eight')
+    await generate(true)
+    const eightHourResult = await persisted(value => value.assignments.some(item => item.date === '2026-11-01'))
+    const eightHourAudit = audit(eightHourGap, eightHourResult), eightHourWeek = eightHourAudit.members[0].weekly[0]
+    assert.equal(eightHourWeek.knownOutside, 1920)
+    assert.equal(eightHourWeek.inMonth, 480)
+    assert.equal(eightHourWeek.wholeWeek, 2400)
+    assert.equal(eightHourResult.assignments.find(item => item.date === '2026-11-01').shiftId, 'day')
+    const lastWeek = eightHourAudit.members[0].weekly.at(-1)
+    assert.equal(lastWeek.monday, '2026-11-30')
+    assert.equal(lastWeek.requiredInMonth, 343, 'The month-end partial week keeps its existing prorated minimum')
+    await fs.writeFile(path.join(output, 'history-32-plus-eight-generated.json'), JSON.stringify(eightHourResult, null, 2) + '\n')
+    await page.screenshot({ path: path.join(output, '05-history-32-plus-eight.png') })
+    record('retained-32-hours-generates-eight-more-hours-to-reach-40-and-month-end-still-prorates', eightHourAudit)
+
+    const offHistory = fixture({ teamName: '仅有上月休息记录也算已有排班', historyDays: 0, firstDayLeave: false })
+    offHistory.assignments.push({ employeeId: 'boundary-1', date: '2026-10-30', shiftId: 'off', locked: false })
+    await importFixture(offHistory, 'off-history')
+    const offMessage = await generate(false)
+    assert.match(offMessage, /周最低工时\s*40\s*小时/)
+    assert.deepEqual((await state()).assignments, offHistory.assignments)
+    record('an-unlocked-off-record-activates-complete-first-week-minimum-without-inventing-worked-hours', { message: offMessage })
+
+    const weightedHistory = weightedHistoryFixture()
+    await importFixture(weightedHistory, 'weighted-history')
+    await generate(true)
+    const weightedResult = await persisted(value => value.assignments.some(item => item.date === '2026-11-01'))
+    audit(weightedHistory, weightedResult)
+    const weightAudit = auditFullWeekWeights(weightedHistory, weightedResult)
+    await fs.writeFile(path.join(output, 'weighted-history-generated.json'), JSON.stringify(weightedResult, null, 2) + '\n')
+    await page.screenshot({ path: path.join(output, '06-full-week-weighted-history.png') })
+    record('weekday-weights-use-seven-actual-dates-including-fixed-october-person-counts-and-even-groups', weightAudit)
+
+    const unbalancedHistory = weightedHistoryFixture(true)
+    await importFixture(unbalancedHistory, 'weighted-unbalanced-history')
+    const unbalancedMessage = await generate(false)
+    assert.match(unbalancedMessage, /原排班未改变/)
+    assert.deepEqual((await state()).assignments, unbalancedHistory.assignments)
+    await page.screenshot({ path: path.join(output, '07-fixed-history-uneven-group.png') })
+    record('uneven-fixed-october-daily-counts-cannot-be-hidden-by-a-correct-group-total', { fixedOtherGroupCounts: [2, 1, 1, 1, 1, 0], message: unbalancedMessage })
+
     const shortfall = fixture({ teamName: '月外36小时仍需补足4小时' })
     shortfall.shifts.push({ ...dayShift, id: 'half', name: '短班', shortName: '短', end: '12:00' })
     shortfall.employees[0].eligibleShiftIds.push('half')
@@ -223,9 +334,9 @@ async function main() {
     await page.screenshot({ path: path.join(output, '04-whole-week-cap-still-enforced.png') })
     record('whole-week-56-hour-conflict-still-rejects-against-48-hour-cap-and-preserves-roster', { message: capMessage })
 
-    assert.equal(workerUrls.length, 4, 'Every scenario creates a real browser Worker')
+    assert.equal(workerUrls.length, 9, 'Every scenario creates a real browser Worker')
     assert.ok(workerUrls.every(workerUrl => /scheduler\.worker/.test(workerUrl)), JSON.stringify(workerUrls))
-    record('four-real-browser-workers-perform-the-scenarios-without-native-or-solver-mocks')
+    record('nine-real-browser-workers-perform-the-scenarios-without-native-or-solver-mocks')
     assert.deepEqual(errors, [])
     record('no-browser-console-or-page-errors')
     report.ok = true

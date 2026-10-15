@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { weightedWeeks, findWeightedWeek, weekdayWeightRuleError, weightedDayRange, weekdayWeightCapacity } from '../weekday-weights.ts'
+import { weightedWeeks, findWeightedWeek, weekdayWeightRuleError, weightedDayRange, weekdayWeightCapacity, weightedHistoryFits } from '../weekday-weights.ts'
 
 function fixture(month = '2025-10', headcount = 12) {
   return { version: 1, teamName: '权重测试', month, rules: { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days: [1, 6], percent: 40 } }, shifts: [{ id: 'day', name: '白班', start: '08:00', end: '16:00', required: 5 }], employees: Array.from({ length: headcount }, (_, i) => ({ id: `e${i}`, maxHoursPerWeek: 168, eligibleShiftIds: ['day'], unavailableDates: [] })), assignments: [] }
@@ -217,4 +217,146 @@ test('large preview integers use exact ceilings without unsafe multiplication', 
   assert.equal(full.selectedTarget, expected)
   assert.equal(full.otherTarget, W - expected)
   assert.equal(full.totalTarget, W)
+})
+
+function priorWork(date, count, shiftId = 'day') {
+  return Array.from({ length: count }, (_, index) => ({ employeeId: `e${index}`, date, shiftId, locked: false }))
+}
+
+test('prior-month rest activates a full first week across New Year without adding out-of-month preview dates', () => {
+  const state = fixture('2027-01')
+  const withoutHistory = weightedWeeks(state, 14)
+  state.assignments = [{ employeeId: 'e0', date: '2026-12-01', shiftId: 'off', locked: false }]
+  const weeks = weightedWeeks(state, 14)
+  const first = weeks[0]
+  assert.deepEqual(first.dates, ['2027-01-01', '2027-01-02', '2027-01-03'])
+  assert.deepEqual(first.selectedDates, ['2027-01-02'])
+  assert.deepEqual(first.otherDates, ['2027-01-01', '2027-01-03'])
+  assert.deepEqual(first.history.dates, ['2026-12-28', '2026-12-29', '2026-12-30', '2026-12-31'])
+  assert.deepEqual(first.history.counts, { '2026-12-28': 0, '2026-12-29': 0, '2026-12-30': 0, '2026-12-31': 0 })
+  assert.deepEqual([first.selectedTarget, first.otherTarget, first.totalTarget], [6, 8, 14], 'a known prior month leaves no imaginary work outside the current month')
+  assert.equal(findWeightedWeek(state, first, 6, 8)?.fullTotal, 14)
+  assert.ok(weeks.flatMap(week => week.dates).every(date => date.startsWith('2027-01-')))
+  assert.deepEqual(weeks.slice(1), withoutHistory.slice(1), 'history only affects the month-start week')
+})
+
+test('rest on the final previous-month day counts as history but unknown or invalid records do not', () => {
+  const state = fixture('2026-09')
+  const baseline = weightedWeeks(state, 35)
+  for (const assignment of [
+    { employeeId: 'departed', date: '2026-08-31', shiftId: 'day' },
+    { employeeId: 'departed', date: '2026-08-31', shiftId: 'off' },
+    { employeeId: 'e0', date: '2026-08-32', shiftId: 'off' },
+    { employeeId: 'e0', date: '2026-07-31', shiftId: 'day' },
+    { employeeId: 'e0', date: '2026-09-01', shiftId: 'off' },
+  ]) {
+    state.assignments = [assignment]
+    assert.deepEqual(weightedWeeks(state, 35), baseline, `must not infer known previous-month data from ${JSON.stringify(assignment)}`)
+  }
+  state.assignments = [{ employeeId: 'e0', date: '2026-08-31', shiftId: 'off' }]
+  const first = weightedWeeks(state, 35)[0]
+  assert.deepEqual(first.history.dates, ['2026-08-31'])
+  assert.deepEqual(first.history.counts, { '2026-08-31': 0 })
+  assert.deepEqual([first.selectedTarget, first.otherTarget], [14, 21])
+})
+
+test('a month beginning Monday and the month-end partial week retain the original calculation', () => {
+  const monday = fixture('2026-06')
+  const mondayBaseline = weightedWeeks(monday, 35)
+  monday.assignments = priorWork('2026-05-31', 4)
+  assert.deepEqual(weightedWeeks(monday, 35), mondayBaseline)
+
+  const tuesday = fixture('2026-09')
+  const monthEnd = weightedWeeks(tuesday, 35).at(-1)
+  tuesday.assignments = [...priorWork('2026-08-31', 4), ...priorWork('2026-10-01', 10)]
+  assert.deepEqual(weightedWeeks(tuesday, 35).at(-1), monthEnd, 'next-month records do not change the month-end proration')
+})
+
+test('actual first-week totals subtract recorded history rather than a prorated historical share', () => {
+  const state = fixture('2026-09')
+  state.assignments = priorWork('2026-08-31', 4)
+  const savedHistory = structuredClone(state.assignments)
+  const first = weightedWeeks(state, 16)[0]
+  assert.deepEqual([first.history.selectedTotal, first.history.otherTotal], [4, 0])
+  assert.deepEqual([first.selectedTarget, first.otherTarget, first.totalTarget], [3, 9, 12])
+  assert.equal(findWeightedWeek(state, first, 3, 9)?.fullTotal, 16, 'four historical plus twelve current starts form the actual full-week total')
+  assert.equal(findWeightedWeek(state, first, 4, 9), null, 'eight selected out of seventeen starts violates ceil(17 × 40%) = 7')
+  assert.equal(weightedHistoryFits(first), true, 'selected daily counts of four and three are balanced')
+  assert.deepEqual(weightedDayRange(first, '2026-09-05'), [3, 4], 'the daily range uses both sides of the natural week')
+  weekdayWeightCapacity(state)
+  assert.deepEqual(state.assignments, savedHistory, 'weight previews and capacity checks never rewrite history')
+})
+
+test('full first-week ratios and daily balance can both be satisfied by the fixed historical counts', () => {
+  const state = fixture('2027-01', 4)
+  state.shifts[0].required = 1
+  state.assignments = [
+    ...priorWork('2026-12-28', 2),
+    ...priorWork('2026-12-29', 1),
+    ...priorWork('2026-12-30', 1),
+    ...priorWork('2026-12-31', 1),
+  ]
+  const first = weightedWeeks(state, 9)[0]
+  assert.deepEqual([first.history.selectedTotal, first.history.otherTotal], [2, 3])
+  assert.deepEqual([first.selectedTarget, first.otherTarget], [2, 2])
+  assert.equal(findWeightedWeek(state, first, 2, 2)?.fullTotal, 9)
+  assert.equal(weightedHistoryFits(first), true)
+  assert.deepEqual(weightedDayRange(first, '2027-01-02'), [2, 2])
+  assert.deepEqual(weightedDayRange(first, '2027-01-01'), [1, 1])
+  assert.notEqual(weekdayWeightCapacity(state).maxPercent, null)
+})
+
+test('historical daily imbalance is infeasible even when the overall first-week ratio is exact', () => {
+  const state = fixture('2027-01', 4)
+  state.shifts[0].required = 0
+  state.assignments = [
+    ...priorWork('2026-12-28', 2),
+    ...priorWork('2026-12-29', 1),
+    ...priorWork('2026-12-30', 3),
+    ...priorWork('2026-12-31', 1),
+  ]
+  const first = weightedWeeks(state, 10)[0]
+  assert.equal(findWeightedWeek(state, first, 2, 1)?.fullTotal, 10, 'group totals alone are four selected and six other starts')
+  assert.equal(weightedHistoryFits(first), false, 'historical other-day counts of one and three already violate the daily spread')
+  assert.equal(weekdayWeightCapacity(state).maxPercent, null, 'no current-month assignment can repair that historical difference')
+})
+
+test('a preview whose full-week quota is already exceeded by history is explicitly infeasible', () => {
+  const state = fixture('2026-09', 4)
+  state.assignments = priorWork('2026-08-31', 4)
+  const first = weightedWeeks(state, 5)[0]
+  assert.equal(first.selectedTarget, -2)
+  assert.equal(weightedHistoryFits(first), false)
+  assert.equal(findWeightedWeek(state, first, 0, 3), null)
+})
+
+test('capacity honors fixed historical counts without imposing current minimum coverage on past days', () => {
+  function independentlyEnumeratedMaximum(historyCount) {
+    let maximum = null
+    function enumerate(currentCounts) {
+      if (currentCounts.length < 6) {
+        for (let count = 1; count <= 4; count++) enumerate([...currentCounts, count])
+        return
+      }
+      const [saturday, ...otherDays] = currentCounts
+      if (Math.abs(historyCount - saturday) > 1 || Math.max(...otherDays) - Math.min(...otherDays) > 1) return
+      const selected = historyCount + saturday
+      const all = selected + otherDays.reduce((sum, count) => sum + count, 0)
+      for (let percent = 0; percent <= 100; percent++) {
+        if (Math.ceil(all * percent / 100) === selected) maximum = Math.max(maximum ?? 0, percent)
+      }
+    }
+    enumerate([])
+    return maximum
+  }
+  const expected = [16, 37, 50, 58, 61]
+  for (let historicalMonday = 0; historicalMonday <= 4; historicalMonday++) {
+    const state = fixture('2026-09', 4)
+    state.shifts[0].required = 1
+    state.assignments = historicalMonday
+      ? priorWork('2026-08-31', historicalMonday)
+      : [{ employeeId: 'e0', date: '2026-08-01', shiftId: 'off', locked: false }]
+    assert.equal(independentlyEnumeratedMaximum(historicalMonday), expected[historicalMonday])
+    assert.equal(weekdayWeightCapacity(state).maxPercent, expected[historicalMonday], `history fixes Monday at ${historicalMonday}; current Saturday must stay within one`)
+  }
 })

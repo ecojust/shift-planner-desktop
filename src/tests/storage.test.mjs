@@ -257,6 +257,33 @@ test('Excel partial weeks show their actual counts and a matching complete-week 
   assert.deepEqual(exportedWeek(state, '2026-09-28'), ['2026-09-28', '2026-10-01', '2026-10-04', 7, 4, 3, 10, 0, 0, '通过', 4, 3])
 })
 
+function carriedWeightedFixture() {
+  const state = weightedFixture()
+  state.assignments = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04']
+    .map(date => ({ employeeId: 'e1', date, shiftId: 'early', locked: false }))
+  state.assignments.push(...['2026-10-03', '2026-10-04'].map(date => ({ employeeId: 'e2', date, shiftId: 'night', locked: false })))
+  return state
+}
+
+test('Excel checks actual whole-week weights with previous-month records while reporting only current-month work', () => {
+  const state = carriedWeightedFixture(), before = structuredClone(state)
+  // Whole week: 9 starts, weekend 4 = ceil(9 * 40%), weekdays one per day.
+  assert.deepEqual(exportedWeek(state, '2026-09-28').slice(3), [6, 4, 2, 9, 0, 0, '通过', 4, 2])
+  const history = explanationRows(state).find(row => row[0] === '跨月周历史')
+  assert.equal(history[4], 0)
+  assert.equal(history[6], 3)
+  assert.match(history[2], /2026-09-28 至 2026-09-30/)
+  assert.deepEqual(state, before, 'export never changes retained history')
+})
+
+test('Excel catches uneven previous-month weekdays even if complete-week group totals still match', () => {
+  const state = carriedWeightedFixture()
+  Object.assign(state.assignments[1], { employeeId: 'e2', date: '2026-09-28' })
+  Object.assign(state.assignments[2], { employeeId: 'e3', date: '2026-09-28' })
+  // Current month and both group totals are unchanged, but weekdays are 3,0,0,1,1.
+  assert.deepEqual(exportedWeek(state, '2026-09-28').slice(3), [6, 4, 2, 9, 0, 0, '同组日期分布不均', 4, 2])
+})
+
 test('Excel minimum coverage checks each date and shift even when weighted totals match', () => {
   const state = weightedFixture()
   state.assignments.find(item => item.date === '2026-10-07' && item.shiftId === 'early').shiftId = 'night'

@@ -4,7 +4,7 @@ import type { DayKind, PlannerDocument, PayrollSettings, PayrollResult } from '.
 import type { Shift } from './domain.ts'
 import { isAvatarData } from './avatarData.ts'
 import { hoursToMinutes, monthlyHoursByEmployee } from './hours.ts'
-import { findWeightedWeek, weekdayWeightRuleError, weightedWeeks } from './weekday-weights.ts'
+import { findWeightedWeek, weekdayWeightRuleError, weightedGroups, weightedWeeks } from './weekday-weights.ts'
 import { parseDataProvenance } from './dataProvenance.ts'
 
 export const STORAGE_KEY = 'shift-planner:v1'
@@ -307,14 +307,14 @@ export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Ce
   }
   if (safe.rules.weekdayWeights) {
     const rule = safe.rules.weekdayWeights
-    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班的最少或固定人数要求，各组内每日差不超过 1 班。月首尾不足整周时，匹配完整周基准表示可满足比例的周总量，不表示月外已有这些排班。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', ...safe.shifts.map(s => s.name + '实际班次')])
+    rows[1]!.push(['上班权重', `星期 ${rule.days.join('、')} 合计 ${rule.percent}%；按实际班次数核对，权重不替代每天每班的最少或固定人数要求，各组内每日差不超过 1 班。月初有上月排班时，匹配完整周基准为含上月同周记录的实际总数，均摊也计入历史日期。无上月记录及月末不足整周时，基准仅表示可满足本月星期份额的周总量。人数要求只核对本月日期。`], ['自然周起始', '本月首日', '本月末日', '本段实际班次', '选中星期实际班次', '其余星期实际班次', '匹配完整周基准', '班位缺口', '固定人数超额', '人数与权重检查', ...safe.shifts.map(s => s.name + '实际班次')])
     for (const week of weightedWeeks(safe)) {
       const assignments = safe.assignments.filter(item => week.dates.includes(item.date) && item.shiftId !== 'off')
       const selectedActual = assignments.filter(item => week.selectedDates.includes(item.date)).length
       const otherActual = assignments.length - selectedActual
       const matched = findWeightedWeek(safe, week, selectedActual, otherActual)
-      const evenGroups = [week.selectedDates, week.otherDates].every(dates => {
-        const counts = dates.map(date => assignments.filter(item => item.date === date).length)
+      const evenGroups = weightedGroups(week).every(group => {
+        const counts = [...group.historyDates.map(date => week.history!.counts[date]!), ...group.dates.map(date => assignments.filter(item => item.date === date).length)]
         return counts.length < 2 || Math.max(...counts) - Math.min(...counts) <= 1
       })
       let minimumGap = 0, fixedGap = 0, fixedExcess = 0
@@ -328,6 +328,7 @@ export function scheduleXLSX(state: PlannerDocument, options: { payrollRows?: Ce
       }
       const problems = [minimumGap ? '最低覆盖不足' : '', fixedGap ? '固定人数不足' : '', fixedExcess ? '固定人数超额' : '', !matched ? '星期比例未匹配' : '', !evenGroups ? '同组日期分布不均' : ''].filter(Boolean)
       rows[1]!.push([week.id, week.dates[0]!, week.dates.at(-1)!, assignments.length, selectedActual, otherActual, matched?.fullTotal ?? '未匹配', minimumGap + fixedGap, fixedExcess, problems.join('；') || '通过', ...safe.shifts.map(shift => assignments.filter(item => item.shiftId === shift.id).length)])
+      if (week.history) rows[1]!.push(['跨月周历史', week.id, `已计入 ${week.history.dates[0]} 至 ${week.history.dates.at(-1)} 的上月排班`, '上月选中星期班次', week.history.selectedTotal, '上月其余星期班次', week.history.otherTotal, '上月记录保持不变；本段实际班次列仅统计本月。'])
     }
   }
   if (rows.some(items => items.length > 100000 || items.some(row => row.length > 256))) throw new Error('Excel 导出数据量超出限制')

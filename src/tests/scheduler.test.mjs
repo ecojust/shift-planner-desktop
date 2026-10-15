@@ -603,3 +603,166 @@ test('staffing mode rejects unknown values without mutating the existing roster'
     assert.deepEqual(generated.assignments, value.assignments)
   }
 })
+
+function carriedMinimumState(extra = {}) {
+  return state({
+    employees: [employee('a', { minHoursPerMonth: 0, minHoursPerWeek: 40, maxHoursPerWeek: 40, eligibleShiftIds: ['morning'] })],
+    shifts: [{ ...morning, required: 0 }], rules: { minRestHours: 0, maxConsecutiveDays: 31 },
+    assignments: [assignment('2026-09-28')], ...extra,
+  })
+}
+
+test('known prior-month underwork raises the first-week minimum instead of accepting only the prorated share', () => {
+  const value = carriedMinimumState({ assignments: ['2026-09-28', '2026-10-01', '2026-10-02', '2026-10-03'].map(date => assignment(date)) })
+  const issue = minimumIssues(value).find(item => item.date === '2026-10-01')
+  assert.ok(issue, '32 combined hours must not satisfy a 40-hour complete natural week')
+  assert.match(issue.message, /实际工时 24 小时.*周最低工时 32 小时/)
+  assert.match(issue.message, /合并上月.*月外已知工时 8 小时/)
+  value.assignments.push(assignment('2026-10-04'))
+  assert.ok(!minimumIssues(value).some(item => item.date === '2026-10-01'))
+})
+
+test('browser generation fills the complete first-week deficit while preserving all unlocked history', () => {
+  const value = carriedMinimumState(), before = structuredClone(value)
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  const combined = generated.assignments.filter(item => item.employeeId === 'a' && item.shiftId !== 'off' && item.date >= '2026-09-28' && item.date <= '2026-10-04')
+  assert.equal(combined.length * 8, 40, 'independent whole-week arithmetic must reach 40 without exceeding the cap')
+  assert.deepEqual(generated.assignments.filter(item => !item.date.startsWith('2026-10-')), before.assignments)
+  assert.deepEqual(value, before)
+  assert.deepEqual(validateSchedule({ ...value, assignments: generated.assignments }), [])
+})
+
+test('a single earlier previous-month rest record makes the first week complete for every current member', () => {
+  const value = carriedMinimumState({
+    employees: ['a', 'b'].map(id => employee(id, { minHoursPerMonth: 0, minHoursPerWeek: 28, maxHoursPerWeek: 40, eligibleShiftIds: ['morning'] })),
+    assignments: [assignment('2026-09-03', 'off')],
+  })
+  const firstIssues = minimumIssues(value).filter(item => item.date === '2026-10-01')
+  assert.equal(firstIssues.length, 2)
+  assert.ok(firstIssues.every(item => /周最低工时 28 小时/.test(item.message)))
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  for (const id of ['a', 'b']) {
+    const firstHours = generated.assignments.filter(item => item.employeeId === id && item.shiftId !== 'off' && item.date >= '2026-10-01' && item.date <= '2026-10-04').length * 8
+    assert.ok(firstHours >= 28 && firstHours <= 40, `${id}: zero previous hours still require the full minimum`)
+  }
+  assert.deepEqual(generated.assignments.filter(item => !item.date.startsWith('2026-10-')), value.assignments)
+})
+
+test('infeasible complete first-week minimum retains the original rather than accepting a prorated solution', () => {
+  const value = carriedMinimumState({ assignments: [assignment('2026-09-30', 'off'), assignment('2026-10-02')] })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, false, 'four remaining eight-hour days cannot meet a 40-hour week from zero history')
+  assert.deepEqual(generated.assignments, value.assignments)
+  assert.ok(generated.issues.some(item => item.type === 'weekly-min-hours' && item.date === '2026-10-01' && /周最低工时 40 小时/.test(item.message)))
+})
+
+test('a Sunday month start with 32 historical hours needs eight more hours instead of a six-hour partial success', () => {
+  const history = ['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29'].map(date => assignment(date))
+  const value = carriedMinimumState({ month: '2026-11', shifts: [{ ...morning, required: 0 }, { ...morning, id: 'short', name: '短班', end: '14:00', required: 0 }],
+    employees: [employee('a', { minHoursPerMonth: 0, minHoursPerWeek: 40, maxHoursPerWeek: 40, eligibleShiftIds: ['morning', 'short'] })],
+    assignments: [...history, assignment('2026-11-01', 'short', true)],
+  })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, false)
+  assert.deepEqual(generated.assignments, value.assignments)
+  assert.ok(generated.issues.some(item => item.type === 'weekly-min-hours' && item.date === '2026-11-01' && /实际工时 6 小时.*周最低工时 8 小时/.test(item.message)))
+  value.assignments.at(-1).shiftId = 'morning'
+  const recovered = generateSchedule(value, 42)
+  assert.equal(recovered.success, true)
+  assert.equal(recovered.assignments.filter(item => item.date >= '2026-10-26' && item.date <= '2026-11-01' && item.shiftId !== 'off').length * 8, 40)
+})
+
+test('cross-year first-week generation carries the previous December and leaves its records untouched', () => {
+  const value = carriedMinimumState({ month: '2027-01', assignments: ['2026-12-28', '2026-12-29'].map(date => assignment(date)) })
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  const firstWeek = generated.assignments.filter(item => item.date >= '2026-12-28' && item.date <= '2027-01-03' && item.shiftId !== 'off')
+  assert.equal(firstWeek.length * 8, 40)
+  assert.deepEqual(generated.assignments.filter(item => item.date.startsWith('2026-12-')), value.assignments)
+})
+
+test('carried night hours count once and the remaining complete-week minimum keeps minute precision', () => {
+  const value = state({
+    employees: [employee('a', { minHoursPerMonth: 0, minHoursPerWeek: 24.1, maxHoursPerWeek: 40 })],
+    rules: { minRestHours: 0, maxConsecutiveDays: 31 },
+    assignments: [assignment('2026-09-28'), assignment('2026-09-30', 'night'), assignment('2026-10-01')],
+  })
+  const issue = minimumIssues(value).find(item => item.date === '2026-10-01')
+  assert.ok(issue, '10 outside hours plus 6 carried and 8 current hours are six minutes short')
+  assert.match(issue.message, /实际工时 14 小时.*周最低工时 14\.1 小时/)
+  assert.match(issue.message, /月外已知工时 10 小时/)
+  value.shifts.push({ ...morning, id: 'extended', end: '16:06' })
+  value.employees[0].eligibleShiftIds.push('extended')
+  value.assignments.at(-1).shiftId = 'extended'
+  assert.ok(!minimumIssues(value).some(item => item.date === '2026-10-01'))
+})
+
+function carriedWeightState(month = '2026-10', days = [6, 7], percent = 50) {
+  return state({ month, employees: Array.from({ length: 8 }, (_, index) => employee(`e${index}`, { minHoursPerMonth: 0, minHoursPerWeek: 0, maxHoursPerWeek: 168, eligibleShiftIds: ['morning'] })),
+    shifts: [{ ...morning }], rules: { minRestHours: 0, maxConsecutiveDays: 31, weekdayWeights: { days, percent } }, assignments: [] })
+}
+function assertCompleteWeightWeek(value, assignments, monday, percent, selectedDays) {
+  const dates = Array.from({ length: 7 }, (_, index) => new Date(Date.parse(`${monday}T00:00:00Z`) + index * 86400000).toISOString().slice(0, 10))
+  const count = date => assignments.filter(item => item.date === date && item.shiftId !== 'off').length
+  const selected = dates.filter(date => selectedDays.includes(new Date(`${date}T00:00:00Z`).getUTCDay() || 7))
+  const other = dates.filter(date => !selected.includes(date))
+  const total = dates.reduce((sum, date) => sum + count(date), 0)
+  assert.equal(selected.reduce((sum, date) => sum + count(date), 0), Math.ceil(total * percent / 100), 'ratio uses independently counted full-week actual work')
+  for (const group of [selected, other]) {
+    const counts = group.map(count)
+    if (counts.length) assert.ok(Math.max(...counts) - Math.min(...counts) <= 1, `full-week group must balance: ${counts}`)
+  }
+  assert.deepEqual(assignments.filter(item => !item.date.startsWith(`${value.month}-`)), value.assignments.filter(item => !item.date.startsWith(`${value.month}-`)))
+}
+
+test('first-week weight validation counts history instead of accepting a fictitious partial-week witness', () => {
+  const value = carriedWeightState()
+  value.assignments = ['2026-09-28', '2026-09-29', '2026-09-30', '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'].map(date => assignment(date, 'morning', false, 'e0'))
+  value.assignments.push(...['2026-10-03', '2026-10-04'].map(date => assignment(date, 'morning', false, 'e1')))
+  const issue = validateSchedule(value).find(item => item.type === 'weekday-quota' && item.date === '2026-10-01')
+  assert.ok(issue, 'nine actual starts require five selected starts, not four')
+  assert.match(issue.message, /所选星期 4 人次、其余星期 5 人次.*已合并上月/)
+})
+
+test('browser weighted generation subtracts fixed history and balances each complete group across the boundary', () => {
+  const value = carriedWeightState()
+  value.assignments = ['2026-09-28', '2026-09-29', '2026-09-30'].flatMap(date => ['e0', 'e1'].map(id => assignment(date, 'morning', false, id)))
+  const before = structuredClone(value)
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  assertCompleteWeightWeek(value, generated.assignments, '2026-09-28', 50, [6, 7])
+  assert.deepEqual(value, before)
+  assert.deepEqual(validateSchedule({ ...value, assignments: generated.assignments }), [])
+})
+
+test('a Sunday-only current fragment receives its actual remaining whole-week weight budget', () => {
+  const value = carriedWeightState('2026-11', [7], 50)
+  value.assignments = ['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30', '2026-10-31'].map(date => assignment(date, 'morning', false, 'e0'))
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  const sunday = generated.assignments.filter(item => item.date === '2026-11-01' && item.shiftId !== 'off').length
+  assert.ok(sunday === 6 || sunday === 7)
+  assertCompleteWeightWeek(value, generated.assignments, '2026-10-26', 50, [7])
+})
+
+test('historical daily imbalance cannot be repaired by changing current dates or silently modifying history', () => {
+  const value = carriedWeightState('2026-11', [7], 50)
+  value.assignments = ['2026-10-26', '2026-10-27', '2026-10-28', '2026-10-29', '2026-10-30'].map(date => assignment(date, 'morning', false, 'e0'))
+  value.assignments.push(assignment('2026-10-26', 'morning', false, 'e1'))
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, false)
+  assert.deepEqual(generated.assignments, value.assignments)
+  assert.ok(generated.issues.some(item => item.type === 'weekday-balance' && item.date === '2026-11-01'))
+})
+
+test('known zero-work history constrains full-week balance without imposing today’s daily minimum on past days', () => {
+  const value = carriedWeightState('2026-09', [1, 6], 16)
+  value.assignments = [assignment('2026-08-05', 'off', false, 'e0')]
+  const generated = generateSchedule(value, 42)
+  assert.equal(generated.success, true)
+  assertCompleteWeightWeek(value, generated.assignments, '2026-08-31', 16, [1, 6])
+  assert.equal(generated.assignments.filter(item => item.date === '2026-08-31').length, 0)
+  assert.ok(datesOfMonth('2026-09').every(date => generated.assignments.some(item => item.date === date && item.shiftId === 'morning')))
+})

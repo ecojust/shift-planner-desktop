@@ -1,4 +1,5 @@
 import type { PlannerState } from './domain.ts'
+import { getPreviousWeekContext } from './weekBoundary.ts'
 
 export interface WeightedWeek {
   id: string
@@ -10,6 +11,15 @@ export interface WeightedWeek {
   otherTarget: number
   /** Complete seven-day baseline; examples do not constrain the solver. */
   fullTotal: number
+  /** Retained previous-month starts; the primary dates and targets stay in-month. */
+  history?: {
+    dates: string[]
+    selectedDates: string[]
+    otherDates: string[]
+    counts: Record<string, number>
+    selectedTotal: number
+    otherTotal: number
+  }
 }
 
 export function weekdayWeightRuleError(value: unknown): string | null {
@@ -26,7 +36,7 @@ const DAY = 86400000
 function isoDay(date: string) { return new Date(`${date}T00:00:00Z`).getUTCDay() || 7 }
 
 type WeightRule = NonNullable<PlannerState['rules']['weekdayWeights']>
-type WeekDates = Pick<WeightedWeek, 'id' | 'dates' | 'selectedDates' | 'otherDates'>
+type WeekDates = Pick<WeightedWeek, 'id' | 'dates' | 'selectedDates' | 'otherDates' | 'history'>
 
 /** Exact integer ceiling without multiplying a large safe integer beyond its range. */
 function ceilShare(value: number, numerator: number, denominator: number) {
@@ -34,14 +44,21 @@ function ceilShare(value: number, numerator: number, denominator: number) {
 }
 function targets(week: WeekDates, rule: WeightRule, fullTotal: number): WeightedWeek {
   const selectedFull = ceilShare(fullTotal, rule.percent, 100)
-  const selectedTarget = ceilShare(selectedFull, week.selectedDates.length, rule.days.length)
-  const otherTarget = rule.days.length === 7 ? 0 : ceilShare(fullTotal - selectedFull, week.otherDates.length, 7 - rule.days.length)
+  const selectedTarget = week.history ? selectedFull - week.history.selectedTotal : ceilShare(selectedFull, week.selectedDates.length, rule.days.length)
+  const otherTarget = week.history ? fullTotal - selectedFull - week.history.otherTotal
+    : rule.days.length === 7 ? 0 : ceilShare(fullTotal - selectedFull, week.otherDates.length, 7 - rule.days.length)
   return { ...week, fullTotal, selectedTarget, otherTarget, totalTarget: selectedTarget + otherTarget }
+}
+
+/** Rebudget an already collected week without rescanning the retained roster. */
+export function weightedWeekTargets(week: WeightedWeek, rule: WeightRule, fullTotal: number): WeightedWeek {
+  return targets(week, rule, fullTotal)
 }
 
 /**
  * Preview only: fullTotal is an explicit seven-day example, not a fixed staffing quota.
- * Missing weekdays retain their shares outside the month and are never renormalized.
+ * Unknown missing weekdays retain their shares outside the month. Known previous
+ * weekdays consume their actual portion of the complete first week's budget.
  * The default example uses minimum daily coverage × 7; it may not meet the weights.
  */
 export function weightedWeeks(state: PlannerState, fullTotal = state.shifts.reduce((sum, shift) => sum + shift.required, 0) * 7): WeightedWeek[] {
@@ -50,6 +67,23 @@ export function weightedWeeks(state: PlannerState, fullTotal = state.shifts.redu
   if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(state.month) || Number(state.month.slice(0, 4)) < 1) return []
   const first = Date.parse(`${state.month}-01T00:00:00Z`)
   if (!Number.isFinite(first)) return []
+  const context = getPreviousWeekContext(state)
+  let history: WeightedWeek['history']
+  if (context) {
+    const employeeIds = new Set(state.employees.map(employee => employee.id))
+    const shiftIds = new Set(state.shifts.map(shift => shift.id))
+    const dates = new Set(context.historyDates)
+    const keys = new Map(context.historyDates.map(date => [date, new Set<string>()]))
+    for (const assignment of state.assignments) {
+      if (dates.has(assignment.date) && employeeIds.has(assignment.employeeId) && shiftIds.has(assignment.shiftId)) keys.get(assignment.date)!.add(`${assignment.employeeId}\0${assignment.shiftId}`)
+    }
+    const counts = Object.fromEntries([...keys].map(([date, entries]) => [date, entries.size]))
+    const selectedDates = context.historyDates.filter(date => rule.days.includes(isoDay(date)))
+    const otherDates = context.historyDates.filter(date => !rule.days.includes(isoDay(date)))
+    history = { dates: context.historyDates, selectedDates, otherDates, counts,
+      selectedTotal: selectedDates.reduce((sum, date) => sum + counts[date]!, 0),
+      otherTotal: otherDates.reduce((sum, date) => sum + counts[date]!, 0) }
+  }
   const groups = new Map<string, string[]>()
   for (let time = first; new Date(time).toISOString().slice(0, 7) === state.month; time += DAY) {
     const date = new Date(time).toISOString().slice(0, 10)
@@ -61,6 +95,7 @@ export function weightedWeeks(state: PlannerState, fullTotal = state.shifts.redu
     id, dates,
     selectedDates: dates.filter(date => rule.days.includes(isoDay(date))),
     otherDates: dates.filter(date => !rule.days.includes(isoDay(date))),
+    ...(context?.weekStart === id && history ? { history } : {}),
   }, rule, fullTotal))
 }
 
@@ -75,8 +110,8 @@ export function findWeightedWeek(state: PlannerState, week: WeightedWeek, select
   if (!rule || weekdayWeightRuleError(rule) || !Number.isSafeInteger(selectedActual) || selectedActual < 0 || !Number.isSafeInteger(otherActual) || otherActual < 0) return null
   if (selectedActual > week.selectedDates.length * state.employees.length || otherActual > week.otherDates.length * state.employees.length) return null
   const max = state.employees.length * 7
-  const full = week.dates.length === 7
-  const start = full ? selectedActual + otherActual : 0
+  const full = week.dates.length === 7 || !!week.history
+  const start = full ? selectedActual + otherActual + (week.history ? week.history.selectedTotal + week.history.otherTotal : 0) : 0
   const end = full ? Math.min(start, max) : max
   for (let total = start; total <= end; total++) {
     const result = targets(week, rule, total)
@@ -85,11 +120,33 @@ export function findWeightedWeek(state: PlannerState, week: WeightedWeek, select
   return null
 }
 
+export function weightedGroups(week: WeightedWeek) {
+  return [
+    { dates: week.selectedDates, historyDates: week.history?.selectedDates ?? [], target: week.selectedTarget, historyTotal: week.history?.selectedTotal ?? 0, fullTarget: week.selectedTarget + (week.history?.selectedTotal ?? 0) },
+    { dates: week.otherDates, historyDates: week.history?.otherDates ?? [], target: week.otherTarget, historyTotal: week.history?.otherTotal ?? 0, fullTarget: week.otherTarget + (week.history?.otherTotal ?? 0) },
+  ]
+}
+
+/** A candidate cannot rebalance retained days or spend a negative month budget. */
+export function weightedHistoryFits(week: WeightedWeek): boolean {
+  return weightedGroups(week).every(group => {
+    if (group.target < 0 || (!group.dates.length && group.target !== 0)) return false
+    const count = group.dates.length + group.historyDates.length
+    if (!count) return group.fullTarget === 0
+    const low = Math.floor(group.fullTarget / count), high = Math.ceil(group.fullTarget / count)
+    if (group.target < low * group.dates.length || group.target > high * group.dates.length) return false
+    return group.historyDates.every(date => {
+      const actual = week.history!.counts[date]!
+      return actual >= low && actual <= high
+    })
+  })
+}
+
 export function weightedDayRange(week: WeightedWeek, date: string): [number, number] {
   if (!week.dates.includes(date)) return [0, 0]
-  const selected = week.selectedDates.includes(date)
-  const count = selected ? week.selectedDates.length : week.otherDates.length
-  const total = selected ? week.selectedTarget : week.otherTarget
+  const group = weightedGroups(week)[week.selectedDates.includes(date) ? 0 : 1]!
+  const count = group.dates.length + group.historyDates.length
+  const total = group.fullTarget
   return count ? [Math.floor(total / count), Math.ceil(total / count)] : [0, 0]
 }
 
@@ -159,9 +216,9 @@ export function weekdayWeightCapacity(state: PlannerState): { maxPercent: number
     minimum.set(date, required)
     if (minimum.get(date)! > capacity.get(date)!) return { maxPercent: null, explanation }
   }
-  function fitsGroup(dates: string[], total: number) {
+  function fitsGroup(week: WeightedWeek, dates: string[], total: number) {
     if (!dates.length) return total === 0
-    const low = Math.floor(total / dates.length), high = Math.ceil(total / dates.length)
+    const [low, high] = weightedDayRange(week, dates[0]!)
     let min = 0, max = 0
     for (const date of dates) {
       const lower = Math.max(low, minimum.get(date) ?? 0), upper = Math.min(high, capacity.get(date) ?? 0)
@@ -178,7 +235,7 @@ export function weekdayWeightCapacity(state: PlannerState): { maxPercent: number
       const lastTotal = week.dates.length === 7 ? week.dates.reduce((sum, date) => sum + capacity.get(date)!, 0) : state.employees.length * 7
       for (let fullTotal = firstTotal; fullTotal <= lastTotal; fullTotal++) {
         const result = targets(week, candidate, fullTotal)
-        if (fitsGroup(week.selectedDates, result.selectedTarget) && fitsGroup(week.otherDates, result.otherTarget)) return true
+        if (weightedHistoryFits(result) && fitsGroup(result, week.selectedDates, result.selectedTarget) && fitsGroup(result, week.otherDates, result.otherTarget)) return true
       }
       return false
     })

@@ -84,8 +84,10 @@ export function prepareRelease(root = process.cwd(), env = process.env) {
   files.push(describe('SHA256SUMS'));
   const notes = `Shift Schedule Expert ${version} · Windows 与 macOS 桌面版
 
-本版按月份保存排班状态，并突出显示 MCP／HTTP 对配置的修改。
+本版补齐月初跨月周规则，按月份保存排班状态，并突出显示 MCP／HTTP 对配置的修改。
 
+- 月初与上月同一自然周且上月已有排班时，合并历史计算周最低工时、星期权重与每日均摊；上月原记录保持不变。
+- 周最高工时、周班次次数、休息和连续工作继续计入跨月历史；没有上月记录及月末部分周保留原折算规则。
 - MCP／HTTP 修改使用高对比底色、图标和明确的来源文字；手动修改保持轻量样式，每张配置卡仍最多显示一个状态。
 - 本月已有排班记录时显示「已排班」，没有记录时显示「未排班」。
 - 保存成员、班次或规则修改后，已有排班月份显示「规则已修改，排班已失效」，保留原排班供查看。

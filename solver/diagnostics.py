@@ -210,7 +210,7 @@ def daily_capacity_issues(employees, shifts, dates, x, fixed_coverage, fixed_cel
     return result
 
 
-def weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_coverage, allow_partial, targets, check_time):
+def weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_coverage, allow_partial, targets, check_time, active_dates):
     if not weights:
         return []
     staff = len(employees)
@@ -219,6 +219,11 @@ def weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_cov
         bounds = {}
         for day in days:
             fixed_count = sum(len(fixed_coverage[(day, s['id'])]) for s in shifts)
+            if day not in active_dates:
+                # Historical staffing is immutable, including unrecorded zero
+                # days. Today's required staffing must not rewrite the past.
+                bounds[day] = fixed_count, fixed_count
+                continue
             eligible = {e['id'] for e in employees for s in shifts if (e['id'], day, s['id']) in x}
             lower = fixed_count if allow_partial else sum(max(len(fixed_coverage[(day, s['id'])]), s['required']) for s in shifts)
             upper = fixed_count + len(eligible)
@@ -245,8 +250,10 @@ def weekday_capacity_issues(weights, week_dates, employees, shifts, x, fixed_cov
         if not viable:
             labels = '、'.join(str(d) for d in weights['days'])
             detail = '；'.join(f'{day_text(day)[5:]}：{a} 人' if a == b else f'{day_text(day)[5:]}：{a}–{b} 人' for day, (a, b) in bounds.items())
+            context = ('首周合并上月固定工作记录，历史空白按 0 人计算。' if any(day not in active_dates for day in days) else
+                       '月边界按当月实际包含的星期折算。')
             return [problem('weekday-weight-capacity',
-                f'{day_text(week)} 起这一周，星期 {labels} 合计 {weights["percent"]}%（向上取整、组内均摊）的要求与每日人数范围冲突。当前可行范围：{detail}。月边界按当月实际包含的星期折算。',
+                f'{day_text(week)} 起这一周，星期 {labels} 合计 {weights["percent"]}%（向上取整、组内均摊）的要求与每日人数范围冲突。当前可行范围：{detail}。' + context,
                 '调整所选星期或百分比，或调整相关班次固定/最少人数、人员可用日期；当前每天的人数范围内不存在满足此比例的组合。',
-                'rules', date=day_text(min(days)))]
+                'rules', date=day_text(min(day for day in days if day in active_dates)))]
     return []
