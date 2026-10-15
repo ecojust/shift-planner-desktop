@@ -111,6 +111,12 @@ async function snapshot(page, source = 'mcp') {
 }
 async function copied(page) { return page.evaluate(() => window.__clipboardWrites.at(-1)) }
 async function stored(page) { return page.evaluate(() => JSON.parse(localStorage.getItem('shift-planner:v1'))) }
+async function monthStatus(page, expected) {
+  const status = page.getByRole('status', { name: '本月排班状态', exact: true })
+  await status.waitFor()
+  assert.equal(await status.getAttribute('data-schedule-status'), expected)
+  assert.equal(await status.innerText(), { scheduled: '已排班', invalid: '规则已修改，排班已失效', empty: '未排班' }[expected])
+}
 async function closeSettings(page) {
   const dialog = page.getByRole('dialog', { name: '设置', exact: true })
   await dialog.getByRole('button', { name: '关闭设置', exact: true }).click()
@@ -473,6 +479,61 @@ async function checkAggregatedCards() {
   record('aggregated member, shift and rule cards fit 320px screens and retain at most one badge per card')
   await page.close()
 }
+async function checkScheduleValidity() {
+  const state = clone(fixture), stamp = { source: 'manual', at: '2026-10-14T08:30:00.000Z' }
+  state.assignments.push({ employeeId: 'qa-2', date: '2026-09-30', shiftId: 'off', locked: false })
+  state.provenance = { fields: {}, invalidatedSchedules: { '2026-09': stamp, '2026-10': stamp } }
+  const page = await preparePage(true, {}, state)
+  let dialog = await openSettings(page)
+  for (const service of ['mcp', 'http']) await setService(page, dialog, service, true)
+  await dialog.getByRole('checkbox', { name: '允许修改排班结果', exact: true }).check()
+  await closeSettings(page)
+  await monthStatus(page, 'invalid')
+  const before = clone((await snapshot(page)).state.provenance.invalidatedSchedules)
+  const single = await request(page, 'set_assignment', { revision: (await snapshot(page)).revision, employeeId: 'qa-2', date: '2026-10-02', shiftId: 'off' }, { source: 'http' })
+  assert.ok(single.response.result)
+  await monthStatus(page, 'invalid')
+  assert.deepEqual(single.persisted.provenance.invalidatedSchedules, before)
+  const noOp = clone(await snapshot(page))
+  noOp.state.provenance.invalidatedSchedules = {}
+  assert.ok((await request(page, 'replace_state', noOp)).response.result)
+  assert.deepEqual((await stored(page)).provenance.invalidatedSchedules, before)
+  const denied = clone(await snapshot(page))
+  denied.state.rules.minRestHours = 12
+  await deniedWithoutMutation(page, 'replace_state', denied, { source: 'http' })
+  const incomplete = clone(await snapshot(page))
+  incomplete.state.assignments.push({ employeeId: 'qa-1', date: '2026-10-03', shiftId: 'day', locked: false })
+  assert.ok((await request(page, 'replace_state', incomplete)).response.result)
+  await monthStatus(page, 'invalid')
+  assert.deepEqual((await stored(page)).provenance.invalidatedSchedules, before)
+  record('HTTP single assignments, forged-metadata no-ops, denied writes and incomplete full replacements preserve month invalidity')
+
+  const complete = clone(await snapshot(page))
+  complete.state.assignments = complete.state.assignments.filter(item => !item.date.startsWith('2026-10-'))
+  for (let day = 1; day <= 31; day++) complete.state.assignments.push({ employeeId: `qa-${day % 2 ? 1 : 2}`, date: `2026-10-${String(day).padStart(2, '0')}`, shiftId: 'day', locked: day === 1 })
+  const refreshed = await request(page, 'replace_state', complete, { source: 'http' })
+  assert.ok(refreshed.response.result, JSON.stringify(refreshed.response))
+  await monthStatus(page, 'scheduled')
+  assert.deepEqual(refreshed.persisted.provenance.invalidatedSchedules, { '2026-09': stamp })
+  const config = clone(await snapshot(page))
+  config.state.employees[0].name = '配置保存后全部历史月份失效'
+  const invalidated = await request(page, 'replace_state', config)
+  assert.ok(invalidated.response.result)
+  await monthStatus(page, 'invalid')
+  assert.deepEqual(Object.keys(invalidated.persisted.provenance.invalidatedSchedules).sort(), ['2026-09', '2026-10'])
+  for (const value of Object.values(invalidated.persisted.provenance.invalidatedSchedules)) assert.equal(value.source, 'mcp')
+  await enableAfterReload(page)
+  await monthStatus(page, 'invalid')
+  assert.deepEqual((await stored(page)).provenance.invalidatedSchedules, invalidated.persisted.provenance.invalidatedSchedules)
+  const removed = clone(await snapshot(page))
+  removed.state.assignments = removed.state.assignments.filter(item => !item.date.startsWith('2026-10-'))
+  assert.ok((await request(page, 'replace_state', removed, { source: 'http' })).response.result)
+  await monthStatus(page, 'empty')
+  assert.equal((await stored(page)).provenance.invalidatedSchedules['2026-10'], undefined)
+  assert.ok((await stored(page)).provenance.invalidatedSchedules['2026-09'])
+  record('a validated complete HTTP replacement clears only its changed month; later MCP configuration invalidates all populated months across reload and deletion clears only the emptied month')
+  await page.close()
+}
 async function main() {
   await fs.mkdir(out, { recursive: true })
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } : {}) })
@@ -561,6 +622,7 @@ async function main() {
     await section(page, '排班日历')
     record('legacy member cards with no saved history hide provenance badges entirely')
     const initial = await snapshot(page)
+    await monthStatus(page, 'scheduled')
     await scheduleTime(page)
     assert.equal(initial.state.employees[0].name, fixture.employees[0].name)
     const changed = clone(initial)
@@ -572,6 +634,8 @@ async function main() {
     await page.getByText('外部 AI 已修改成员', { exact: true }).first().waitFor()
     assert.match(await page.locator('.sp-context').innerText(), /已通过 MCP 更新/)
     assert.equal(update.persisted.provenance.fields['employees.qa-1.name'].source, 'mcp')
+    await monthStatus(page, 'invalid')
+    assert.equal(update.persisted.provenance.invalidatedSchedules['2026-10'].source, 'mcp')
     await scheduleTime(page)
     record('external get_state/replace_state reads live data and updates the visible calendar with persistence before acknowledgement')
 
@@ -592,6 +656,7 @@ async function main() {
     const afterLocal = await snapshot(page)
     assert.notEqual(afterLocal.state.month, beforeLocal.state.month)
     assert.notEqual(afterLocal.revision, beforeLocal.revision)
+    await monthStatus(page, 'empty')
     record('external reads immediately see current application changes and a new revision')
 
     dialog = await openSettings(page)
@@ -665,6 +730,7 @@ async function main() {
     const assignment = await request(page, 'set_assignment', { revision: (await snapshot(page)).revision, employeeId: 'qa-2', date: '2026-11-02', shiftId: 'off' })
     assert.ok(assignment.response.result, JSON.stringify(assignment.response))
     assert.equal(assignment.persisted.assignments.some(item => item.employeeId === 'qa-2' && item.date === '2026-11-02'), true)
+    await monthStatus(page, 'scheduled')
     dialog = await openSettings(page)
     for (const name of ['班次', '排班规则', '排班结果']) await dialog.getByRole('checkbox', { name: `允许修改${name}`, exact: true }).uncheck()
     await closeSettings(page)
@@ -685,6 +751,9 @@ async function main() {
     assert.equal(httpResult.persisted.provenance.fields['employees.qa-1.role'].source, 'http')
     assert.deepEqual(httpResult.persisted.provenance.fields['employees.qa-1.name'], beforeHttp.state.provenance.fields['employees.qa-1.name'])
     assert.equal(httpResult.persisted.provenance.fields['employees.qa-1.group'], undefined)
+    await monthStatus(page, 'invalid')
+    assert.deepEqual(Object.keys(httpResult.persisted.provenance.invalidatedSchedules).sort(), ['2026-10', '2026-11'])
+    assert.equal(httpResult.persisted.provenance.invalidatedSchedules['2026-11'].source, 'http')
     assert.match(await page.locator('.sp-context').innerText(), /已通过 HTTP 更新/)
     await section(page, '成员管理')
     await badge(page, 'employees.qa-1', 'http', 'HTTP')
@@ -832,6 +901,7 @@ async function main() {
     await page.waitForFunction(role => JSON.parse(localStorage.getItem('shift-planner:v1')).employees[0].role === role, backup.employees[0].role)
     assert.deepEqual((await snapshot(page)).state, backup)
     assert.deepEqual((await stored(page)).provenance, backup.provenance)
+    await monthStatus(page, 'invalid')
     assert.equal(await page.evaluate(() => localStorage.getItem('shift-planner:integration-permissions:v1')), permissionsBeforeImport)
     assert.match(await page.locator('.sp-context').innerText(), /已导入备份排班/)
     await notice.waitFor()
@@ -853,6 +923,7 @@ async function main() {
     await closeSettings(page)
     const newAssignment = await request(page, 'set_assignment', { revision: (await snapshot(page)).revision, employeeId: 'qa-1', date: `${scheduleMonth}-03`, shiftId: 'day' })
     assert.ok(newAssignment.response.result, JSON.stringify(newAssignment.response))
+    await monthStatus(page, 'invalid')
     const mcpScheduleStamp = clone(newAssignment.persisted.provenance.scheduleUpdates[scheduleMonth])
     assert.equal(mcpScheduleStamp.source, 'mcp')
     assert.ok(Number.isFinite(Date.parse(mcpScheduleStamp.at)))
@@ -877,6 +948,7 @@ async function main() {
     await dialog.getByRole('checkbox', { name: '允许修改排班结果', exact: true }).uncheck()
     await closeSettings(page)
     await deniedWithoutMutation(page, 'set_assignment', { revision: (await snapshot(page)).revision, employeeId: 'qa-1', date: `${scheduleMonth}-04`, shiftId: 'off' })
+    await monthStatus(page, 'invalid')
     assert.deepEqual((await snapshot(page)).state.provenance.scheduleUpdates, beforeNoOps)
     await scheduleTime(page, mcpScheduleStamp)
     record('reads, config-only writes, no-op assignments, invalid inputs and denied writes do not refresh schedule timestamps')
@@ -895,6 +967,7 @@ async function main() {
     assert.deepEqual((await snapshot(page)).state.provenance.scheduleUpdates, beforeNoOps)
     await scheduleTime(page, mcpScheduleStamp)
     record('manual calendar edits retain the most recent external schedule timestamp')
+    await monthStatus(page, 'invalid')
 
     dialog = await openSettings(page)
     await dialog.getByRole('checkbox', { name: '允许修改排班结果', exact: true }).check()
@@ -908,9 +981,11 @@ async function main() {
     await scheduleTime(page, mcpScheduleStamp)
     await page.getByRole('button', { name: '下个月', exact: true }).click()
     assert.equal((await snapshot(page)).state.month, otherMonth)
+    await monthStatus(page, 'scheduled')
     await scheduleTime(page, httpScheduleStamp)
     const deleted = await request(page, 'set_assignment', { revision: (await snapshot(page)).revision, employeeId: 'qa-2', date: `${otherMonth}-02`, remove: true })
     assert.ok(deleted.response.result)
+    await monthStatus(page, 'empty')
     const deletionStamp = clone(deleted.persisted.provenance.scheduleUpdates[otherMonth])
     assert.equal(deletionStamp.source, 'mcp')
     assert.notEqual(deletionStamp.at, httpScheduleStamp.at)
@@ -935,6 +1010,7 @@ async function main() {
     assert.deepEqual((await snapshot(page)).state.provenance.scheduleUpdates, scheduleBackup.provenance.scheduleUpdates)
     await scheduleTime(page, mcpScheduleStamp)
     record('JSON backup restoration preserves historical per-month schedule timestamps instead of stamping import time')
+    await monthStatus(page, 'invalid')
 
     const fieldStamps = (await snapshot(page)).state.provenance.fields
     for (const [sectionName, field, focus] of [
@@ -1013,6 +1089,7 @@ async function main() {
     record('compact settings at 800x600, short, and 320px viewports scroll internally with a stationary heading and accessible close/copy controls')
     await page.close()
     await checkIndependentServices()
+    await checkScheduleValidity()
     await checkAggregatedCards()
 
     const web = await preparePage(false)

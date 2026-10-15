@@ -47,6 +47,16 @@ async function shot(page, name) {
   report.screenshots.push(file)
 }
 async function stored(page) { return page.evaluate(key => JSON.parse(localStorage.getItem(key)), storageKey) }
+async function assertScheduleStatus(page, expected) {
+  const status = page.locator('.sp-month-schedule-status')
+  await status.waitFor()
+  assert.equal(await status.getAttribute('role'), 'status')
+  assert.equal(await status.getAttribute('aria-label'), '本月排班状态')
+  assert.equal(await status.getAttribute('data-schedule-status'), expected)
+  assert.equal((await status.innerText()).trim(), {
+    scheduled: '已排班', invalid: '规则已修改，排班已失效', empty: '未排班',
+  }[expected])
+}
 async function preparePage(desktop, initial = fixture) {
   const page = await browser.newPage({ viewport: { width: 1440, height: 960 }, locale: 'zh-CN', acceptDownloads: true })
   activePage = page
@@ -151,6 +161,7 @@ async function overwriteCurrent(page) {
   await page.evaluate(value => sessionStorage.setItem('rules-import-next-fixture', JSON.stringify(value)), changed)
   await page.reload({ waitUntil: 'networkidle' })
   await page.getByRole('heading', { name: '排班日历', exact: true }).waitFor()
+  await assertScheduleStatus(page, 'scheduled')
   return changed
 }
 async function waitSaved(page, employeeRole) {
@@ -177,6 +188,13 @@ async function assertRestored(page, original, prior, confirmationStarted) {
     assert.equal(actual.provenance.fields[field].source, 'manual', field)
     assert.ok(Date.parse(actual.provenance.fields[field].at) >= confirmationStarted, `${field} needs a new saved timestamp`)
   }
+  assert.deepEqual(Object.keys(actual.provenance.invalidatedSchedules).sort(), ['2026-09', '2026-10'])
+  for (const month of ['2026-09', '2026-10']) {
+    const stamp = actual.provenance.invalidatedSchedules[month]
+    assert.equal(stamp.source, 'manual', month)
+    assert.ok(Date.parse(stamp.at) >= confirmationStarted, `${month} needs a new invalidation timestamp`)
+  }
+  await assertScheduleStatus(page, 'invalid')
   assert.deepEqual(actual.provenance.scheduleUpdates, prior.provenance.scheduleUpdates)
   assert.equal(await page.locator('.sp-schedule-update time').getAttribute('datetime'), currentAt)
   assert.equal(original.data.debug.originalHourDefaults[0].minHoursPerMonth, null)
@@ -187,6 +205,7 @@ async function main() {
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } : {}) })
   try {
     const page = await preparePage(false)
+    await assertScheduleStatus(page, 'scheduled')
     const exported = await exportFile(page)
     assert.match(exported.name, /^排班规则-2026-10-当前设置.*\.json$/)
     assert.equal(exported.data.debug.format, 'shiftflow-solver-debug')
@@ -212,11 +231,13 @@ async function main() {
     assert.equal(await dialog.locator('dl > div').filter({ hasText: /^所有月份排班/ }).locator('dd').innerText(), '3 条')
     assert.equal(await dialog.locator('dl > div').filter({ hasText: /^其中锁定安排/ }).locator('dd').innerText(), '2 条')
     assert.deepEqual(await stored(page), prior)
+    await assertScheduleStatus(page, 'scheduled')
     await dialog.getByRole('button', { name: '取消', exact: true }).click()
     await dialog.waitFor({ state: 'detached' })
     assert.deepEqual((await exportFile(page)).data.state, beforeCancel.data.state)
     assert.deepEqual(await stored(page), prior)
-    record('import preview reports file counts and cancellation preserves current memory and storage')
+    await assertScheduleStatus(page, 'scheduled')
+    record('import preview reports file counts and cancellation preserves current memory, storage and scheduled status')
 
     await chooseFile(page, exported)
     await dialog.waitFor()
@@ -229,6 +250,7 @@ async function main() {
     assert.equal(await dialog.count(), 0)
     assert.equal(await page.getByRole('button', { name: '导入规则', exact: true }).isEnabled(), true)
     assert.deepEqual(await stored(page), prior)
+    await assertScheduleStatus(page, 'scheduled')
     record('Escape and an empty file-picker selection cancel safely and allow the same rules file to be reopened')
 
     await chooseFile(page, exported)
@@ -248,10 +270,11 @@ async function main() {
     const restored = await assertRestored(page, exported, prior, confirmationStarted)
     assert.equal(await page.evaluate(key => localStorage.getItem(key), permissionKey), permissionsBefore)
     await shot(page, 'browser-imported')
-    record('confirmed import restores members, shifts, rules and assignments, preserves null hour defaults and matching avatar, and stamps changes manually')
+    record('confirmed import restores rules and assignments with manual change stamps and invalidates every imported scheduled month')
 
     await page.reload({ waitUntil: 'networkidle' })
     assert.deepEqual(await stored(page), restored)
+    await assertScheduleStatus(page, 'invalid')
     await section(page, '成员管理')
     const memberBadge = page.locator('[data-source-path="employees.import-1"]')
     assert.equal(await page.locator('#member-import-1 .sp-source-badge').count(), 1)
@@ -261,7 +284,8 @@ async function main() {
     await shot(page, 'imported-manual-source')
     await section(page, '排班日历')
     assert.equal(await page.locator('.sp-schedule-update time').getAttribute('datetime'), currentAt)
-    record('imported data and manual source timestamps persist across reload while the prior external schedule time remains intact')
+    await assertScheduleStatus(page, 'invalid')
+    record('imported data, invalid schedule status and manual timestamps persist across reload and navigation while prior external schedule time remains intact')
 
     const beforeInvalid = await exportFile(page)
     await chooseFile(page, { name: 'invalid-rules.json', bytes: Buffer.from('{invalid-json') })
@@ -269,6 +293,7 @@ async function main() {
     assert.equal(await preview(page).count(), 0)
     assert.deepEqual((await exportFile(page)).data.state, beforeInvalid.data.state)
     assert.deepEqual(await stored(page), restored)
+    await assertScheduleStatus(page, 'invalid')
     record('invalid files show a user-visible error and preserve both displayed and persisted data')
 
     const beforeFailure = await overwriteCurrent(page)
@@ -279,12 +304,14 @@ async function main() {
     await preview(page).getByRole('button', { name: '确认导入', exact: true }).click()
     await page.getByRole('alert').filter({ hasText: /保存|存储|空间/ }).waitFor()
     assert.deepEqual(await stored(page), beforeFailure)
+    await assertScheduleStatus(page, 'scheduled')
     await page.evaluate(() => { window.__rulesImportFaults.failSave = false })
     if (await preview(page).count()) await preview(page).getByRole('button', { name: '取消', exact: true }).click()
     assert.deepEqual((await exportFile(page)).data.state, beforeFailureExport.data.state)
     assert.deepEqual(await stored(page), beforeFailure)
+    await assertScheduleStatus(page, 'scheduled')
     await shot(page, 'save-failure-preserves-state')
-    record('a failed local save leaves the old document and metadata intact without a partial in-memory import')
+    record('a failed local save preserves the old document, metadata and scheduled status without a partial in-memory import')
 
     const stalePicker = page.waitForEvent('filechooser')
     await page.getByRole('button', { name: '导入规则', exact: true }).click()
@@ -297,6 +324,7 @@ async function main() {
     assert.equal((await stored(page)).employees[0].role, beforeFailure.employees[0].role)
     assert.equal((await exportFile(page)).data.state.month, '2026-11')
     assert.equal(await page.getByRole('button', { name: '导入规则', exact: true }).isEnabled(), true)
+    await assertScheduleStatus(page, 'empty')
     record('data changes while file selection is pending invalidate that selection instead of overwriting newer state')
     await page.close()
 
@@ -307,6 +335,7 @@ async function main() {
     await chooseFile(desktop, null, true)
     assert.equal(await preview(desktop).count(), 0)
     assert.deepEqual(await stored(desktop), desktopPrior)
+    await assertScheduleStatus(desktop, 'scheduled')
     await chooseFile(desktop, desktopExport, true)
     await preview(desktop).waitFor()
     const desktopConfirmStarted = Date.now()

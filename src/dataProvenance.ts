@@ -8,6 +8,8 @@ export interface DataProvenance {
   pendingExternalChange?: { source: 'mcp' | 'http'; at: string; categories: string[] }
   /** Latest accepted external assignment change per month, independent of configuration edits. */
   scheduleUpdates?: Record<string, { source: 'mcp' | 'http'; at: string }>
+  /** Latest configuration change that made each existing month's schedule stale. */
+  invalidatedSchedules?: Record<string, ChangeStamp>
 }
 
 /** Summarize a card's own paths and descendants without including sibling cards. */
@@ -31,6 +33,7 @@ export const MAX_PROVENANCE_BYTES = 4 * 1024 * 1024
 const categories = ['团队', '成员', '班次', '排班规则', '日期设置', '工时设置', '津贴'] as const
 const entityCollections = new Set(['employees', 'shifts', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits'])
 const roots = ['teamName', 'employees', 'shifts', 'rules', 'calendar', 'monthlyReferenceHours', 'payroll'] as const
+const scheduleConfigurationRoots = new Set(['employees', 'shifts', 'rules', 'calendar', 'monthlyReferenceHours'])
 const resettableRoots = new Set(['calendar', 'monthlyReferenceHours', 'rules.weekdayWeights', 'rules.separationGroups', 'rules.nonConsecutiveShifts', 'rules.weeklyShiftLimits'])
 
 /** Arrays of entities use persistent IDs; arrays of field values are a single leaf. */
@@ -126,6 +129,14 @@ export function withChangeProvenance(previous: PlannerDocument, next: PlannerDoc
     .filter(path => JSON.stringify(before.fields[path]) !== JSON.stringify(after.fields[path]))
   const { provenance: _submitted, ...document } = next
   const trusted = previous.provenance
+  const scheduledMonths = new Set(next.assignments.map(assignment => assignment.date.slice(0, 7)))
+  const invalidatedSchedules: Record<string, ChangeStamp> = Object.create(null)
+  for (const [month, stamp] of Object.entries(trusted?.invalidatedSchedules ?? {})) {
+    if (scheduledMonths.has(month)) invalidatedSchedules[month] = { ...stamp }
+  }
+  if (changed.some(path => scheduleConfigurationRoots.has(path.split('.')[0]!))) {
+    for (const month of scheduledMonths) invalidatedSchedules[month] = { source, at }
+  }
   let scheduleUpdates = trusted?.scheduleUpdates
   // Manual configuration watchers may intentionally omit assignments from their
   // snapshots. Never infer an external schedule write from those local snapshots.
@@ -156,7 +167,19 @@ export function withChangeProvenance(previous: PlannerDocument, next: PlannerDoc
     const affected = new Set([...(pendingExternalChange?.categories ?? []), ...changed.map(category)])
     pendingExternalChange = { source, at, categories: categories.filter(name => affected.has(name)) }
   }
-  return { ...document, provenance: { fields, ...(pendingExternalChange ? { pendingExternalChange: { ...pendingExternalChange, categories: [...pendingExternalChange.categories] } } : {}), ...(scheduleUpdates ? { scheduleUpdates } : {}) } }
+  return { ...document, provenance: { fields, ...(pendingExternalChange ? { pendingExternalChange: { ...pendingExternalChange, categories: [...pendingExternalChange.categories] } } : {}), ...(scheduleUpdates ? { scheduleUpdates } : {}), ...(Object.keys(invalidatedSchedules).length ? { invalidatedSchedules } : {}) } }
+}
+
+/** A successful generation acknowledges only the months it actually replaced. */
+export function markSchedulesCurrent<T extends PlannerDocument>(state: T, months: readonly string[]): T {
+  const provenance = state.provenance
+  const invalidated = provenance?.invalidatedSchedules
+  if (!invalidated || !months.some(month => Object.hasOwn(invalidated, month))) return state
+  const current = new Set(months)
+  const remaining: Record<string, ChangeStamp> = Object.create(null)
+  for (const [month, stamp] of Object.entries(invalidated)) if (!current.has(month)) remaining[month] = { ...stamp }
+  const { invalidatedSchedules: _invalidated, ...history } = provenance
+  return { ...state, provenance: { ...history, ...(Object.keys(remaining).length ? { invalidatedSchedules: remaining } : {}) } }
 }
 
 /** Validate persisted/imported metadata using actual document paths and bounded plain values. */
@@ -170,7 +193,7 @@ export function parseDataProvenance(value: unknown, state: PlannerDocument): Dat
     if (Object.keys(value).some(key => !allowed.includes(key))) fail('包含未知字段')
   }
   const raw = object(value)
-  exactKeys(raw, ['fields', 'pendingExternalChange', 'scheduleUpdates'])
+  exactKeys(raw, ['fields', 'pendingExternalChange', 'scheduleUpdates', 'invalidatedSchedules'])
   if (new TextEncoder().encode(JSON.stringify(raw)).length > MAX_PROVENANCE_BYTES) fail('记录超过 4 MB')
   const rawFields = object(raw.fields)
   if (Object.keys(rawFields).length > MAX_PROVENANCE_FIELDS) fail(`记录不能超过 ${MAX_PROVENANCE_FIELDS} 项`)
@@ -187,6 +210,20 @@ export function parseDataProvenance(value: unknown, state: PlannerDocument): Dat
     fields[path] = { source: stamp.source, at: stamp.at }
   }
   const provenance: DataProvenance = { fields }
+  if (raw.invalidatedSchedules !== undefined) {
+    const invalidated = object(raw.invalidatedSchedules)
+    if (Object.keys(invalidated).length > 1200) fail('排班失效记录最多保存 1200 个月')
+    const invalidatedSchedules: Record<string, ChangeStamp> = Object.create(null)
+    for (const [month, value] of Object.entries(invalidated)) {
+      if (!validMonth(month)) fail('排班失效月份必须为有效 YYYY-MM')
+      const stamp = object(value)
+      exactKeys(stamp, ['source', 'at'])
+      if (stamp.source !== 'manual' && stamp.source !== 'mcp' && stamp.source !== 'http') fail('排班失效来源必须为手动、MCP 或 HTTP')
+      if (!validTimestamp(stamp.at)) fail('排班失效时间必须为有效 ISO 时间')
+      invalidatedSchedules[month] = { source: stamp.source, at: stamp.at }
+    }
+    if (Object.keys(invalidatedSchedules).length) provenance.invalidatedSchedules = invalidatedSchedules
+  }
   if (raw.scheduleUpdates !== undefined) {
     const updates = object(raw.scheduleUpdates)
     if (Object.keys(updates).length > 1200) fail('排班更新时间最多保存 1200 个月')

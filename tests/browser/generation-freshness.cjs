@@ -19,7 +19,7 @@ const fixture = {
   },
 }
 const clone = value => JSON.parse(JSON.stringify(value))
-const report = { url, scope: 'Real Vue, controlled valid desktop solver responses and real web Worker; no native transport', checks: [], errors: [], screenshots: [], ok: false }
+const report = { url, scope: 'Real Vue persistent per-month schedule validity, controlled valid desktop solver responses and real web Worker; no native transport', checks: [], errors: [], screenshots: [], ok: false }
 let browser, activePage
 function record(name) { report.checks.push(name); console.log('PASS', name) }
 async function screenshot(page, name) { const file = path.join(out, `${name}.png`); await page.screenshot({ path: file, animations: 'disabled' }); report.screenshots.push(file) }
@@ -45,7 +45,7 @@ async function prepare(desktop, state = fixture) {
     throw new Error(`Unexpected controlled IPC command: ${command}`)
   })
   await page.addInitScript(({ state, desktop }) => {
-    localStorage.setItem('shift-planner:v1', JSON.stringify(state))
+    if (!localStorage.getItem('shift-planner:v1')) localStorage.setItem('shift-planner:v1', JSON.stringify(state))
     window.__freshnessWorkerCount = 0
     if (desktop) {
       window.isTauri = true
@@ -73,7 +73,8 @@ async function start(page, control) {
 }
 function success(request) {
   const assignments = clone(request.state.assignments.filter(item => item.locked || !item.date.startsWith(`${request.state.month}-`)))
-  for (let day = 1; day <= 31; day++) {
+  const [year, month] = request.state.month.split('-').map(Number)
+  for (let day = 1; day <= new Date(Date.UTC(year, month, 0)).getUTCDate(); day++) {
     const date = `${request.state.month}-${String(day).padStart(2, '0')}`
     if (!assignments.some(item => item.date === date && item.shiftId === 'day')) assignments.push({ employeeId: `qa-${day % 2 ? 1 : 2}`, date, shiftId: 'day', locked: false })
   }
@@ -100,6 +101,17 @@ async function freshness(page, stale, message) {
   if (stale) assert.match(text, /配置已更改，上次排班结果需要重新检查/)
   else { assert.doesNotMatch(text, /配置已更改|设置已更改/); if (message) assert.match(text, message) }
 }
+async function monthStatus(page, expected) {
+  const badge = page.getByRole('status', { name: '本月排班状态', exact: true })
+  await badge.waitFor()
+  assert.equal(await badge.getAttribute('data-schedule-status'), expected)
+  assert.equal(await badge.innerText(), { scheduled: '已排班', invalid: '规则已修改，排班已失效', empty: '未排班' }[expected])
+}
+async function moveMonth(page, direction, month, expected) {
+  await page.getByRole('button', { name: direction > 0 ? '下个月' : '上个月', exact: true }).click()
+  await page.waitForFunction(month => JSON.parse(localStorage.getItem('shift-planner:v1')).month === month, month)
+  await monthStatus(page, expected)
+}
 async function section(page, name) {
   await page.getByRole('navigation', { name: '应用导航' }).getByRole('button', { name: new RegExp(name) }).click()
   await page.getByRole('heading', { name, exact: true }).waitFor()
@@ -124,6 +136,30 @@ async function changeMember(page, name) {
   await page.waitForFunction(name => JSON.parse(localStorage.getItem('shift-planner:v1')).employees[0].name === name, name)
   await section(page, '排班日历')
 }
+async function changeShift(page, name) {
+  await section(page, '班次设置')
+  await page.locator('#shift-day .sp-settings-edit').click()
+  const dialog = page.getByRole('dialog', { name: '编辑班次', exact: true })
+  await dialog.getByRole('textbox', { name: '班次名称', exact: true }).fill(name)
+  await dialog.getByRole('button', { name: '保存班次', exact: true }).click()
+  await dialog.waitFor({ state: 'hidden' })
+  await page.waitForFunction(name => JSON.parse(localStorage.getItem('shift-planner:v1')).shifts[0].name === name, name)
+  await section(page, '排班日历')
+}
+async function restFirstCell(page) {
+  const state = await stored(page)
+  await page.getByRole('button', { name: '月视图', exact: true }).click()
+  await page.getByRole('button', { name: `${state.employees[0].name} 2026-10-01 ${state.shifts[0].name}，点击编辑`, exact: true }).click()
+  const dialog = page.getByRole('dialog', { name: '调整班次', exact: true })
+  await dialog.getByRole('button', { name: /安排休息/ }).click()
+  await dialog.getByRole('button', { name: '保存安排', exact: true }).click()
+  await dialog.waitFor({ state: 'detached' })
+  await page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).assignments.some(item => item.employeeId === 'qa-1' && item.date === '2026-10-01' && item.shiftId === 'off'))
+}
+async function undoAndPersist(page, expected) {
+  await page.getByRole('button', { name: '撤销上次调整', exact: true }).click()
+  await page.waitForFunction(assignments => JSON.stringify(JSON.parse(localStorage.getItem('shift-planner:v1')).assignments) === JSON.stringify(assignments), expected)
+}
 async function savedGenerated(page) {
   await page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).assignments.filter(item => item.date.startsWith('2026-10') && item.shiftId === 'day').length === 31)
   const state = await stored(page)
@@ -135,39 +171,82 @@ async function main() {
   browser = await chromium.launch({ headless: true, args: ['--no-sandbox'], ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } : {}) })
   try {
     const { page, control } = await prepare(true)
+    await monthStatus(page, 'scheduled')
+    await moveMonth(page, -1, '2026-09', 'scheduled')
+    await moveMonth(page, 1, '2026-10', 'scheduled')
+    await moveMonth(page, 1, '2026-11', 'empty')
+    await moveMonth(page, -1, '2026-10', 'scheduled')
+    await changeRule(page, 11)
+    await monthStatus(page, 'scheduled')
+    assert.equal((await stored(page)).provenance.invalidatedSchedules, undefined)
+    record('legacy working and off-only months are scheduled, an empty month is not, and a saved no-op preserves validity')
     await start(page, control); await settle(page, control)
     await freshness(page, false, /排班已生成/)
     const generated = await savedGenerated(page)
     await freshness(page, false, /排班已生成/)
     assert.equal(await page.locator('.sp-solve-result').evaluate(node => node.classList.contains('is-warning')), false)
     assert.deepEqual(generated.provenance, fixture.provenance)
+    await monthStatus(page, 'scheduled')
     await screenshot(page, 'desktop-success-fresh')
     record('desktop successful roster commit stays fresh immediately and after autosave, preserving locked/history entries and provenance')
 
     await page.getByRole('button', { name: '已核对变更', exact: true }).click()
     await page.waitForFunction(() => !JSON.parse(localStorage.getItem('shift-planner:v1')).provenance.pendingExternalChange)
     await freshness(page, false, /排班已生成/)
+    await monthStatus(page, 'scheduled')
     record('acknowledging source metadata after success does not mark the result stale')
 
     await changeRule(page, 12, false)
     await freshness(page, false, /排班已生成/)
     assert.equal((await stored(page)).rules.minRestHours, 11)
+    await monthStatus(page, 'scheduled')
     record('an unsaved rule draft and navigation do not invalidate the successful result')
     await changeRule(page, 12)
     await freshness(page, true)
+    await monthStatus(page, 'invalid')
+    const invalidated = clone((await stored(page)).provenance.invalidatedSchedules)
+    assert.deepEqual(Object.keys(invalidated).sort(), ['2026-09', '2026-10'])
+    for (const stamp of Object.values(invalidated)) assert.equal(stamp.source, 'manual')
     await screenshot(page, 'desktop-rule-change-stale')
     record('saving a real rule change after successful generation marks the result stale')
 
+    await section(page, '成员管理'); await section(page, '排班日历')
+    await monthStatus(page, 'invalid')
+    await page.reload({ waitUntil: 'networkidle' })
+    await monthStatus(page, 'invalid')
+    assert.deepEqual((await stored(page)).provenance.invalidatedSchedules, invalidated)
+    await moveMonth(page, -1, '2026-09', 'invalid')
+    await moveMonth(page, 1, '2026-10', 'invalid')
+    await moveMonth(page, 1, '2026-11', 'empty')
+    await moveMonth(page, -1, '2026-10', 'invalid')
+    record('configuration invalidation persists across pages, reload and months without labelling an empty month scheduled')
+
     await start(page, control); await settle(page, control)
     await freshness(page, false, /排班已生成/)
+    await monthStatus(page, 'scheduled')
+    await page.waitForFunction(() => !JSON.parse(localStorage.getItem('shift-planner:v1')).provenance.invalidatedSchedules?.['2026-10'])
+    assert.deepEqual((await stored(page)).provenance.invalidatedSchedules, { '2026-09': invalidated['2026-09'] })
+    await undoAndPersist(page, generated.assignments)
+    await monthStatus(page, 'invalid')
+    await start(page, control); await settle(page, control)
+    await freshness(page, false, /排班已生成/)
+    await monthStatus(page, 'scheduled')
+    await changeShift(page, '重排后保存的新日班')
+    await monthStatus(page, 'invalid')
+    await freshness(page, true)
+    await start(page, control); await settle(page, control)
+    await freshness(page, false, /排班已生成/)
+    await monthStatus(page, 'scheduled')
     await changeMember(page, '手动改名后的成员')
     await freshness(page, true)
-    record('regeneration clears prior staleness and a subsequent saved member change invalidates the new result')
+    await monthStatus(page, 'invalid')
+    record('regeneration clears only its current month, undo restores prior invalidity, and saved shift and member changes invalidate the new result')
 
     const beforeFailure = (await stored(page)).assignments
     await start(page, control); await settle(page, control, 'unknown')
     await freshness(page, false, /尚未找到可行方案/)
     assert.deepEqual((await stored(page)).assignments, beforeFailure)
+    await monthStatus(page, 'invalid')
     await changeRule(page, 13)
     await freshness(page, true)
     record('unchanged failed attempts remain fresh and preserve the roster; a later saved rule change marks their diagnostic stale')
@@ -175,10 +254,57 @@ async function main() {
     await start(page, control); await settle(page, control, 'transport')
     await freshness(page, false, /排班超过等待时长/)
     assert.deepEqual((await stored(page)).assignments, beforeFailure)
+    await monthStatus(page, 'invalid')
     record('transport failure preserves its current diagnostic and existing roster without a false stale warning')
     await page.close()
 
-    const inflight = await prepare(true)
+    const editing = await prepare(true)
+    await restFirstCell(editing.page)
+    await monthStatus(editing.page, 'scheduled')
+    await editing.page.getByRole('button', { name: '设置 2026-10-01 日期类型', exact: true }).click()
+    const dateDialog = editing.page.getByRole('dialog', { name: '2026-10-01 · 日期类型', exact: true })
+    await dateDialog.getByRole('button', { name: /休息日 不计入月参考工时/ }).click()
+    await dateDialog.getByRole('button', { name: '确认日期类型', exact: true }).click()
+    await dateDialog.waitFor({ state: 'detached' })
+    await editing.page.waitForFunction(() => JSON.parse(localStorage.getItem('shift-planner:v1')).calendar['2026-10-01'] === 'restday')
+    await monthStatus(editing.page, 'invalid')
+    let configurationInvalidated = clone((await stored(editing.page)).provenance.invalidatedSchedules)
+    await undoAndPersist(editing.page, fixture.assignments)
+    await monthStatus(editing.page, 'invalid')
+    const undoInvalidated = (await stored(editing.page)).provenance.invalidatedSchedules
+    assert.deepEqual(Object.keys(undoInvalidated).sort(), Object.keys(configurationInvalidated).sort())
+    for (const [month, stamp] of Object.entries(undoInvalidated)) {
+      assert.equal(stamp.source, 'manual')
+      assert.ok(Date.parse(stamp.at) >= Date.parse(configurationInvalidated[month].at))
+    }
+    configurationInvalidated = clone(undoInvalidated)
+    await restFirstCell(editing.page)
+    await monthStatus(editing.page, 'invalid')
+    assert.deepEqual((await stored(editing.page)).provenance.invalidatedSchedules, configurationInvalidated)
+    await undoAndPersist(editing.page, fixture.assignments)
+    await monthStatus(editing.page, 'invalid')
+    await editing.page.getByRole('button', { name: '删除本月排班', exact: true }).click()
+    await editing.page.getByRole('dialog').getByRole('button', { name: '确认删除', exact: true }).click()
+    await monthStatus(editing.page, 'empty')
+    await editing.page.waitForFunction(() => !JSON.parse(localStorage.getItem('shift-planner:v1')).provenance.invalidatedSchedules?.['2026-10'])
+    await undoAndPersist(editing.page, fixture.assignments)
+    await monthStatus(editing.page, 'invalid')
+    assert.deepEqual((await stored(editing.page)).provenance.invalidatedSchedules, configurationInvalidated)
+    await editing.page.reload({ waitUntil: 'networkidle' })
+    await monthStatus(editing.page, 'invalid')
+    await screenshot(editing.page, 'persistent-invalid-schedule-desktop')
+    await editing.page.setViewportSize({ width: 320, height: 640 })
+    await monthStatus(editing.page, 'invalid')
+    const statusBounds = await editing.page.locator('.sp-month-schedule-status').boundingBox()
+    assert.ok(statusBounds && statusBounds.x >= 0 && statusBounds.x + statusBounds.width <= 321)
+    assert.equal(await editing.page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false)
+    await screenshot(editing.page, 'persistent-invalid-schedule-320')
+    record('single-cell replacement and undo cannot erase later calendar configuration invalidity; deleting and undoing restores the prior month status')
+    await editing.page.close()
+
+    const inflightState = clone(fixture)
+    inflightState.provenance.invalidatedSchedules = { '2026-10': { source: 'manual', at: '2026-10-14T08:30:00.000Z' } }
+    const inflight = await prepare(true, inflightState)
     await start(inflight.page, inflight.control)
     // Simulate a queued real UI event during asynchronous solving; the overlay
     // normally intercepts pointer input, but the revision guard must still hold.
@@ -188,6 +314,9 @@ async function main() {
     await freshness(inflight.page, true)
     assert.deepEqual((await stored(inflight.page)).assignments, fixture.assignments)
     assert.equal((await stored(inflight.page)).month, '2026-11')
+    await monthStatus(inflight.page, 'empty')
+    assert.deepEqual((await stored(inflight.page)).provenance.invalidatedSchedules, inflightState.provenance.invalidatedSchedules)
+    await moveMonth(inflight.page, -1, '2026-10', 'invalid')
     record('a real month change during generation rejects the old successful response and preserves the new current state')
     await inflight.page.close()
 
@@ -199,6 +328,7 @@ async function main() {
       assert.equal(await web.evaluate(() => window.__freshnessWorkerCount), 1)
       if (mode === 'success') {
         await freshness(web, false, /排班已生成/)
+        await monthStatus(web, 'scheduled')
         await savedGenerated(web)
         await freshness(web, false, /排班已生成/)
         await screenshot(web, 'real-worker-success-fresh')
@@ -213,6 +343,7 @@ async function main() {
         await changeMember(web, '失败后手动修改的成员')
       }
       await freshness(web, true)
+      await monthStatus(web, 'invalid')
       record(`real web Worker ${mode} stays fresh until an actual saved configuration change`)
       await web.close()
     }

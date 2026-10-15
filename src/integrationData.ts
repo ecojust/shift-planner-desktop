@@ -3,7 +3,7 @@ import { validateSchedule } from './scheduler.ts'
 import { isCivilDate } from './calendar.ts'
 import type { PlannerDocument } from './payroll.ts'
 import { DEFAULT_INTEGRATION_PERMISSIONS, type IntegrationPermission, type IntegrationPermissions } from './integrationPermissions.ts'
-import { withChangeProvenance } from './dataProvenance.ts'
+import { configurationFields, markSchedulesCurrent, withChangeProvenance } from './dataProvenance.ts'
 
 export type IntegrationSource = 'mcp' | 'http'
 
@@ -27,6 +27,28 @@ function equalData(left: unknown, right: unknown): boolean {
   const a = left as Record<string, unknown>, b = right as Record<string, unknown>
   const keys = Object.keys(a)
   return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && equalData(a[key], b[key]))
+}
+
+/** Stable entity paths distinguish actual configuration edits from list reordering. */
+function changedScheduleConfiguration(previous: PlannerDocument, next: PlannerDocument): boolean {
+  const roots = new Set(['employees', 'shifts', 'rules', 'calendar', 'monthlyReferenceHours'])
+  const before = configurationFields(previous), after = configurationFields(next)
+  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
+    .some(path => roots.has(path.split('.')[0]!) && !equalData(before[path], after[path]))
+}
+
+function changedAssignmentMonths(previous: PlannerDocument, next: PlannerDocument): Set<string> {
+  const before = new Map(previous.assignments.map(item => [`${item.employeeId}\0${item.date}`, item]))
+  const after = new Map(next.assignments.map(item => [`${item.employeeId}\0${item.date}`, item]))
+  const months = new Set<string>()
+  for (const key of new Set([...before.keys(), ...after.keys()])) {
+    const oldAssignment = before.get(key), newAssignment = after.get(key)
+    if (oldAssignment?.shiftId !== newAssignment?.shiftId || oldAssignment?.locked !== newAssignment?.locked) {
+      if (oldAssignment) months.add(oldAssignment.date.slice(0, 7))
+      if (newAssignment) months.add(newAssignment.date.slice(0, 7))
+    }
+  }
+  return months
 }
 
 /** Execute against the application's current document, in one synchronous transaction. */
@@ -92,8 +114,19 @@ export function createIntegrationHandler(read: () => PlannerDocument, apply: (st
     }
     if (denied.size) throw new IntegrationError(`未授权修改${[...denied].join('、')}，请在右上角设置中开启对应写入权限`, 403)
     if (!changed.length) return current
+    let accepted = withChangeProvenance(current.state, next, source)
+    if (method === 'replace_state' && !changedScheduleConfiguration(current.state, next)) {
+      const nonemptyMonths = new Set(next.assignments.map(item => item.date.slice(0, 7)))
+      const currentMonths = [...changedAssignmentMonths(current.state, next)].filter(month => {
+        if (!nonemptyMonths.has(month) || !accepted.provenance?.invalidatedSchedules?.[month]) return false
+        // Coverage is a warning in the validator, but an incomplete monthly result
+        // must not acknowledge a configuration change as successfully rescheduled.
+        return !validateSchedule({ ...next, month }).some(issue => issue.severity === 'error' || issue.type === 'coverage')
+      })
+      accepted = markSchedulesCurrent(accepted, currentMonths)
+    }
     // apply must persist before replacing the in-memory document; a failed save rejects the write.
-    apply(withChangeProvenance(current.state, next, source), source)
+    apply(accepted, source)
     return snapshot()
   }
 }

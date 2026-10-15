@@ -5,7 +5,7 @@ import InfoTip from './InfoTip.vue'
 import SettingsPanel from './SettingsPanel.vue'
 import IntegrationSettings from './IntegrationSettings.vue'
 import { useIntegrations } from './integrations'
-import { configurationFields, withChangeProvenance } from './dataProvenance'
+import { configurationFields, markSchedulesCurrent, withChangeProvenance, type ChangeStamp } from './dataProvenance'
 import { formatChangeTime } from './changeTime'
 import SourceBadge from './SourceBadge.vue'
 import EmployeeAvatar from './EmployeeAvatar.vue'
@@ -91,7 +91,7 @@ const editing = ref<{ employee: Employee; date: string; shiftId: string; locked:
 const calendarDate = ref('')
 const calendarKind = ref<DayKind>('workday')
 const calendarReset = ref<{ date: string; revision: number } | null>(null)
-const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]>; source: string }[]>([])
+const history = ref<{ assignments: Assignment[]; leaves: Record<string, string[]>; source: string; configuration: string; invalidatedSchedules: Record<string, ChangeStamp> }[]>([])
 const savedAt = ref('')
 let acceptingProvenance = false
 function acceptProvenance(update: () => void) {
@@ -128,6 +128,12 @@ const employees = computed(() => state.value.employees.filter(e => (!groupFilter
 const assignments = computed(() => new Map(state.value.assignments.map(a => [`${a.employeeId}:${a.date}`, a])))
 const monthAssignments = computed(() => state.value.assignments.filter(a => a.date.startsWith(state.value.month) && a.shiftId !== 'off'))
 const monthEntryCount = computed(() => state.value.assignments.filter(a => a.date.startsWith(`${state.value.month}-`)).length)
+const monthScheduleInvalidation = computed(() => state.value.provenance?.invalidatedSchedules?.[state.value.month])
+const monthScheduleStatus = computed(() => !monthEntryCount.value ? 'empty' : monthScheduleInvalidation.value ? 'invalid' : 'scheduled')
+const monthScheduleLabel = computed(() => ({ empty: '未排班', scheduled: '已排班', invalid: '规则已修改，排班已失效' })[monthScheduleStatus.value])
+const monthScheduleDescription = computed(() => monthScheduleStatus.value === 'invalid'
+  ? `成员、班次或规则已于 ${formatChangeTime(monthScheduleInvalidation.value!.at)} 修改。已有排班记录仍保留，请按当前配置重新生成。`
+  : monthScheduleStatus.value === 'scheduled' ? '本月已有排班记录。' : '本月尚无排班记录。')
 const issues = computed(() => validateSchedule(state.value).map(formatUserIssue))
 const externalChange = computed(() => state.value.provenance?.pendingExternalChange)
 const scheduleUpdate = computed(() => state.value.provenance?.scheduleUpdates?.[state.value.month])
@@ -192,8 +198,42 @@ function clone<T>(value: T): T { return JSON.parse(JSON.stringify(value)) }
 // Request correlation does not require a secure-context-only randomUUID API.
 function solverRequestId() { return `${Array.from(crypto.getRandomValues(new Uint8Array(12)), value => value.toString(16).padStart(2, '0')).join('')}-${Date.now()}` }
 function flash(message: string) { notice.value = formatUserMessage(message); window.clearTimeout(noticeTimer); noticeTimer = window.setTimeout(() => notice.value = '', 5500) }
-function remember() { history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value }); if (history.value.length > 10) history.value.shift() }
-function undo() { const previous = history.value.pop(); if (previous) { state.value.assignments = previous.assignments; for (const e of state.value.employees) if (previous.leaves[e.id]) e.unavailableDates = previous.leaves[e.id]!; scheduleSource.value = previous.source; solverFeedback.value = null; expandedFeedback.value = false; flash('已撤销上一次排班调整') } }
+function scheduleConfigurationKey(document: Document) {
+  return JSON.stringify(Object.entries(configurationFields(document))
+    .filter(([path]) => /^(employees|shifts|rules|calendar|monthlyReferenceHours)(\.|$)/.test(path))
+    .sort(([a], [b]) => a.localeCompare(b)))
+}
+function remember() {
+  history.value.push({ assignments: clone(state.value.assignments), leaves: Object.fromEntries(state.value.employees.map(e => [e.id, [...e.unavailableDates]])), source: scheduleSource.value, configuration: scheduleConfigurationKey(state.value), invalidatedSchedules: clone(state.value.provenance?.invalidatedSchedules ?? {}) })
+  if (history.value.length > 10) history.value.shift()
+}
+function undo() {
+  const previous = history.value.pop()
+  if (!previous) return
+  const at = new Date().toISOString()
+  const next = withChangeProvenance(state.value, {
+    ...state.value,
+    assignments: previous.assignments,
+    employees: state.value.employees.map(employee => previous.leaves[employee.id] ? { ...employee, unavailableDates: previous.leaves[employee.id]! } : employee),
+  }, 'manual', at) as Document
+  // Restoring an older roster must not erase either its old invalidation or a
+  // later configuration edit. A deleted month's marker may already be pruned.
+  const invalidated = { ...previous.invalidatedSchedules, ...next.provenance?.invalidatedSchedules }
+  const months = new Set(next.assignments.map(assignment => assignment.date.slice(0, 7)))
+  for (const month of Object.keys(invalidated)) if (!months.has(month)) delete invalidated[month]
+  if (scheduleConfigurationKey(next) !== previous.configuration) {
+    for (const month of months) invalidated[month] = { source: 'manual', at }
+  }
+  if (Object.keys(invalidated).length) next.provenance = { ...next.provenance, fields: next.provenance?.fields ?? {}, invalidatedSchedules: invalidated }
+  acceptProvenance(() => { state.value = next })
+  scheduleSource.value = previous.source; solverFeedback.value = null; expandedFeedback.value = false
+  flash('已撤销上一次排班调整')
+}
+function commitGeneratedAssignments(assignments: Assignment[], month: string) {
+  remember()
+  const next = markSchedulesCurrent(withChangeProvenance(state.value, { ...state.value, assignments }, 'manual') as Document, [month])
+  acceptProvenance(() => { state.value = next })
+}
 function requestMonthDeletion() {
   if (generating.value || !monthEntryCount.value) return
   monthDeletion.value = { month: state.value.month, count: monthEntryCount.value, revision }
@@ -237,10 +277,13 @@ function openCell(employee: Employee, date: string) { const a = entry(employee.i
 function saveCell() {
   const edit = editing.value; if (!edit) return
   remember()
-  state.value.assignments = state.value.assignments.filter(a => !(a.employeeId === edit.employee.id && a.date === edit.date))
-  edit.employee.unavailableDates = edit.employee.unavailableDates.filter(d => d !== edit.date)
-  if (edit.shiftId === 'leave') edit.employee.unavailableDates.push(edit.date)
-  else state.value.assignments.push({ employeeId: edit.employee.id, date: edit.date, shiftId: edit.shiftId, locked: edit.locked })
+  const assignments = state.value.assignments.filter(a => !(a.employeeId === edit.employee.id && a.date === edit.date))
+  const unavailableDates = edit.employee.unavailableDates.filter(d => d !== edit.date)
+  if (edit.shiftId === 'leave') unavailableDates.push(edit.date)
+  else assignments.push({ employeeId: edit.employee.id, date: edit.date, shiftId: edit.shiftId, locked: edit.locked })
+  // Commit the cell and leave configuration together: a temporary empty month
+  // must not clear its invalidation while replacing its only assignment.
+  state.value = { ...state.value, assignments, employees: state.value.employees.map(employee => employee.id === edit.employee.id ? { ...employee, unavailableDates } : employee) }
   editing.value = null
   const conflict = issues.value.find(i => i.employeeId === edit.employee.id && (!i.date || i.date === edit.date))
   flash(conflict ? `已保存，请处理冲突：${conflict.message}` : '班次已更新，锁定班次会在重新生成时保留')
@@ -339,7 +382,7 @@ async function generate() {
       else {
         const checked = checkDesktopResult(request, result)
         if (checked.success && checked.assignments) {
-          remember(); state.value.assignments = checked.assignments; showIssues.value = checked.issues.length > 0
+          commitGeneratedAssignments(checked.assignments, request.state.month); showIssues.value = checked.issues.length > 0
           scheduleSource.value = '已自动生成排班'
         }
         feedback(checked.success, checked.message, [], false, checked.success ? [] : checked.issues)
@@ -367,7 +410,7 @@ async function generate() {
         else {
           const blockingIssues = result.issues.filter((issue: Issue) => issue.severity === 'error' || issue.type === 'coverage')
           if (result.success === false || blockingIssues.length) feedback(false, '暂未找到符合规则的排班方案，这不代表无解。原排班未改变。', ['下方是此次尝试中发现的问题，可参考调整后重试。'], false, blockingIssues)
-          else { remember(); state.value.assignments = result.assignments; showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过') }
+          else { commitGeneratedAssignments(result.assignments, request.state.month); showIssues.value = result.issues.length > 0; scheduleSource.value = '已自动生成排班'; feedback(true, result.issues.length ? `排班已生成，有 ${result.issues.length} 项需要检查` : '排班已生成，所有岗位已覆盖，规则检查通过') }
         }
       } catch { feedback(false, '排班结果未能读取，请重试；原排班未改变。') }
       finally { if (isCurrent()) finishGeneration() }
@@ -618,7 +661,7 @@ watch([generating, cancelling], async () => {
       <main class="sp-content">
         <div v-if="saveError" class="sp-banner sp-banner-warning" role="alert"><Icon name="info" /><span>{{ saveError }}</span><button @click="exportBackup">导出备份</button></div>
         <div v-if="dates.some(date => !info(date).verified)" class="sp-banner sp-banner-warning" role="status"><Icon name="calendar" /><span>{{ state.month.slice(0, 4) }} 年的假期安排或法定计薪口径待核对。未手动确认的日期暂按工作日和周末推算，请点击日期核对，或导入已有日历备份。</span></div>
-        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span>{{ scheduleSource }}</span><span v-if="scheduleUpdate" class="sp-schedule-update" :data-schedule-source="scheduleUpdate.source" aria-label="本月最近外部排班生成或更新时间"><span>最近 {{ scheduleUpdate.source.toUpperCase() }} 排班生成 / 更新：</span><time :datetime="scheduleUpdate.at" title="软件成功保存该月份外部排班数据的时间（本机时间）">{{ formatChangeTime(scheduleUpdate.at) }}</time><small>本机时间</small></span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" :disabled="generating || readingRules || !!rulesImportCandidate" title="导入之前导出的规则文件" @click="openRulesImport"><Icon name="upload" :size="17" />{{ readingRules ? '正在读取…' : '导入规则' }}</button><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
+        <div class="sp-page-heading"><div><h1>{{ sectionLabel }}</h1><p v-if="section === 'calendar'" class="sp-context"><span class="sp-month-schedule-status" :class="`is-${monthScheduleStatus}`" :data-schedule-status="monthScheduleStatus" role="status" aria-label="本月排班状态" :title="monthScheduleDescription"><Icon :name="monthScheduleStatus === 'invalid' ? 'info' : monthScheduleStatus === 'scheduled' ? 'check' : 'calendar'" :size="14" />{{ monthScheduleLabel }}</span><span class="sp-schedule-action">{{ scheduleSource }}</span><span v-if="scheduleUpdate" class="sp-schedule-update" :data-schedule-source="scheduleUpdate.source" aria-label="本月最近外部排班生成或更新时间"><span>最近 {{ scheduleUpdate.source.toUpperCase() }} 排班生成 / 更新：</span><time :datetime="scheduleUpdate.at" title="软件成功保存该月份外部排班数据的时间（本机时间）">{{ formatChangeTime(scheduleUpdate.at) }}</time><small>本机时间</small></span></p></div><div v-if="section === 'calendar'" class="sp-heading-actions"><button class="sp-button" :disabled="generating || readingRules || !!rulesImportCandidate" title="导入之前导出的规则文件" @click="openRulesImport"><Icon name="upload" :size="17" />{{ readingRules ? '正在读取…' : '导入规则' }}</button><button class="sp-button" title="导出成员、班次、规则和相关排班记录" @click="exportRules()"><Icon name="file" :size="17" />导出规则</button><button class="sp-button" @click="exportExcel"><Icon name="download" :size="17" />导出 Excel</button><button v-if="section === 'calendar'" class="sp-button sp-primary" :disabled="generating || (desktop && engineState === 'checking')" @click="showGenerate = true"><Icon :name="generating ? 'clock' : 'spark'" :size="18" />{{ generating ? '正在排班…' : desktop && engineState === 'checking' ? '正在准备…' : '自动排班' }}</button></div></div>
         <div v-if="rulesImportError && !rulesImportCandidate" class="sp-rules-import-error" role="alert"><span>{{ rulesImportError }}</span><button type="button" aria-label="关闭规则导入提示" @click="rulesImportError = ''">×</button></div>
         <section v-if="externalChange" class="sp-external-change" role="status" aria-label="外部配置变更提醒">
           <Icon name="info" :size="20" />

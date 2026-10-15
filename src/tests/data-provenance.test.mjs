@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { configurationFields, latestConfigurationChange, withChangeProvenance, parseDataProvenance, MAX_PROVENANCE_BYTES } from '../dataProvenance.ts'
+import { configurationFields, latestConfigurationChange, withChangeProvenance, markSchedulesCurrent, parseDataProvenance, MAX_PROVENANCE_BYTES } from '../dataProvenance.ts'
 import { backupJSON, parseBackup, loadSaved, saveLocal, STORAGE_KEY } from '../storage.ts'
 import { createPayrollConfig } from '../payroll.ts'
 
@@ -389,4 +389,194 @@ test('schedule acceptance history survives backup and local restart independentl
     else globalThis.localStorage = savedStorage
   }
   assert.equal(parseBackup(backupJSON(fixture())).provenance?.scheduleUpdates, undefined)
+})
+
+function scheduledFixture() {
+  const state = fixture()
+  state.assignments = [assignment('2026-10-15'), assignment('2026-11-01', 'e2', 'off', true)]
+  return state
+}
+
+test('each scheduling configuration category invalidates every populated month with the trusted source and time', () => {
+  const updates = [
+    next => { next.employees[0].name = '修改成员' },
+    next => { next.shifts[0].start = '08:00' },
+    next => { next.rules.minRestHours = 12 },
+    next => { next.calendar['2027-01-01'] = 'workday' },
+    next => { next.monthlyReferenceHours['2027-01'] = 176 },
+  ]
+  for (const source of ['manual', 'mcp', 'http']) {
+    for (const update of updates) {
+      const before = scheduledFixture()
+      const result = changed(before, next => { update(next); next.month = '2026-12' }, source, secondTime)
+      assert.deepEqual(Object.keys(result.provenance.invalidatedSchedules).sort(), ['2026-10', '2026-11'])
+      assert.deepEqual(result.provenance.invalidatedSchedules['2026-10'], stamp(source, secondTime))
+      assert.deepEqual(result.provenance.invalidatedSchedules['2026-11'], stamp(source, secondTime), 'off-only months also contain a saved schedule')
+      assert.equal(result.provenance.invalidatedSchedules['2026-12'], undefined, 'viewed empty month is not marked')
+      assert.equal(result.provenance.invalidatedSchedules['2027-01'], undefined, 'calendar/reference entry alone is not a schedule')
+      assert.equal(result.provenance.scheduleUpdates, undefined, 'configuration edits do not change external generation history')
+      assert.equal(before.provenance, undefined)
+    }
+  }
+})
+
+test('team names, payroll, navigation, reordering and pure assignment changes never create invalidations', () => {
+  const updates = [
+    next => { next.teamName = '新团队名称' },
+    next => { next.payroll.monthlySalary = 8000 },
+    next => { next.month = '2026-12' },
+    next => { next.employees.reverse(); next.assignments.reverse() },
+    next => { next.assignments[0].locked = true },
+    next => { next.assignments.push(assignment('2026-12-01')) },
+    next => { next.provenance = { fields: {}, invalidatedSchedules: { '2026-10': stamp('mcp', firstTime) } } },
+  ]
+  for (const source of ['manual', 'mcp', 'http']) {
+    for (const update of updates) {
+      const result = changed(scheduledFixture(), update, source, secondTime)
+      assert.equal(result.provenance?.invalidatedSchedules, undefined)
+    }
+  }
+  assert.equal(changed(fixture(), next => { next.rules.minRestHours = 12 }, 'mcp', firstTime).provenance.invalidatedSchedules, undefined, 'configuration changes without assignments have nothing to invalidate')
+})
+
+test('new configuration edits replace invalidation timestamps while assignment edits and no-ops preserve them', () => {
+  const invalid = changed(scheduledFixture(), next => { next.rules.minRestHours = 12 }, 'mcp', firstTime)
+  const edited = changed(invalid, next => {
+    next.assignments[0].locked = true
+    next.assignments.push(assignment('2026-12-01'))
+  }, 'http', secondTime)
+  assert.deepEqual(edited.provenance.invalidatedSchedules, invalid.provenance.invalidatedSchedules)
+  assert.equal(edited.provenance.invalidatedSchedules['2026-12'], undefined, 'a later assignment write does not inherit old invalidation')
+  assert.deepEqual(edited.provenance.scheduleUpdates['2026-10'], stamp('http', secondTime))
+  const noOp = withChangeProvenance(edited, structuredClone(edited), 'manual', thirdTime)
+  assert.deepEqual(noOp.provenance.invalidatedSchedules, invalid.provenance.invalidatedSchedules)
+  const reconfigured = changed(edited, next => { next.employees[0].maxHoursPerWeek = 40 }, 'manual', thirdTime)
+  for (const month of ['2026-10', '2026-11', '2026-12']) assert.deepEqual(reconfigured.provenance.invalidatedSchedules[month], stamp('manual', thirdTime))
+  assert.deepEqual(invalid.provenance.invalidatedSchedules['2026-10'], stamp('mcp', firstTime))
+})
+
+test('configuration watchers with intentionally empty previous assignments still mark and retain all current months', () => {
+  const initial = scheduledFixture()
+  const next = structuredClone(initial)
+  next.rules.minRestHours = 12
+  const marked = withChangeProvenance({ ...initial, assignments: [] }, next, 'manual', firstTime)
+  assert.deepEqual(Object.keys(marked.provenance.invalidatedSchedules), ['2026-10', '2026-11'])
+  const unchanged = withChangeProvenance({ ...marked, assignments: [] }, structuredClone(marked), 'manual', secondTime)
+  assert.deepEqual(unchanged.provenance.invalidatedSchedules, marked.provenance.invalidatedSchedules)
+  assert.equal(unchanged.provenance.scheduleUpdates, undefined)
+})
+
+test('invalidation records disappear only for months with no remaining assignments, including during pure clearing', () => {
+  const initial = scheduledFixture()
+  initial.assignments.push(assignment('2026-10-16', 'e2', 'off'))
+  const invalid = changed(initial, next => { next.rules.minRestHours = 12 }, 'mcp', firstTime)
+  const partlyCleared = changed(invalid, next => { next.assignments.shift() }, 'manual', secondTime)
+  assert.deepEqual(partlyCleared.provenance.invalidatedSchedules, invalid.provenance.invalidatedSchedules, 'an off record keeps the month populated')
+  const monthCleared = changed(partlyCleared, next => { next.assignments = next.assignments.filter(item => item.date.startsWith('2026-11')) }, 'http', secondTime)
+  assert.deepEqual(Object.keys(monthCleared.provenance.invalidatedSchedules), ['2026-11'])
+  assert.deepEqual(monthCleared.provenance.invalidatedSchedules['2026-11'], stamp('mcp', firstTime))
+  const allCleared = changed(monthCleared, next => { next.assignments = [] }, 'manual', thirdTime)
+  assert.equal(Object.hasOwn(allCleared.provenance, 'invalidatedSchedules'), false)
+  assert.deepEqual(allCleared.provenance.fields, invalid.provenance.fields)
+  assert.deepEqual(allCleared.provenance.pendingExternalChange, invalid.provenance.pendingExternalChange)
+  assert.deepEqual(allCleared.provenance.scheduleUpdates, monthCleared.provenance.scheduleUpdates)
+  const staleHistory = structuredClone(invalid)
+  staleHistory.provenance.invalidatedSchedules['2020-01'] = stamp('http', secondTime)
+  assert.equal(withChangeProvenance(staleHistory, structuredClone(staleHistory), 'manual', thirdTime).provenance.invalidatedSchedules['2020-01'], undefined, 'stale persisted months are pruned even on no-op calls')
+})
+
+test('submitted metadata cannot clear, forge or redate trusted schedule invalidations', () => {
+  const invalid = changed(scheduledFixture(), next => { next.rules.minRestHours = 12 }, 'manual', firstTime)
+  for (const history of [undefined, { fields: {} }, { fields: {}, invalidatedSchedules: { '2026-10': stamp('http', thirdTime), '2099-01': stamp('mcp', thirdTime) } }]) {
+    const proposed = structuredClone(invalid)
+    proposed.provenance = history
+    const applied = withChangeProvenance(invalid, proposed, 'mcp', secondTime)
+    assert.deepEqual(applied.provenance.invalidatedSchedules, invalid.provenance.invalidatedSchedules)
+    proposed.employees[0].maxHoursPerWeek = 40
+    const modified = withChangeProvenance(invalid, proposed, 'mcp', secondTime)
+    assert.deepEqual(modified.provenance.invalidatedSchedules['2026-10'], stamp('mcp', secondTime))
+    assert.deepEqual(modified.provenance.invalidatedSchedules['2026-11'], stamp('mcp', secondTime))
+    assert.equal(modified.provenance.invalidatedSchedules['2099-01'], undefined)
+  }
+  const clean = scheduledFixture(), forged = structuredClone(clean)
+  forged.provenance = invalid.provenance
+  assert.equal(withChangeProvenance(clean, forged, 'http', secondTime).provenance, undefined)
+})
+
+test('successful-generation acknowledgement clears only named months without mutating any existing history', () => {
+  const external = changed(fixture(), next => { next.assignments = scheduledFixture().assignments }, 'http', firstTime)
+  const invalid = changed(external, next => { next.rules.minRestHours = 12 }, 'mcp', secondTime)
+  invalid.extraClientField = { preserved: true }
+  const before = JSON.stringify(invalid)
+  const current = markSchedulesCurrent(invalid, ['2026-10', '2026-10', '2099-01'])
+  assert.notEqual(current, invalid)
+  assert.deepEqual(Object.keys(current.provenance.invalidatedSchedules), ['2026-11'])
+  assert.deepEqual(current.provenance.invalidatedSchedules['2026-11'], stamp('mcp', secondTime))
+  assert.equal(current.assignments, invalid.assignments)
+  assert.equal(current.extraClientField, invalid.extraClientField)
+  assert.deepEqual(current.provenance.fields, invalid.provenance.fields)
+  assert.deepEqual(current.provenance.pendingExternalChange, invalid.provenance.pendingExternalChange)
+  assert.deepEqual(current.provenance.scheduleUpdates, invalid.provenance.scheduleUpdates)
+  const allCurrent = markSchedulesCurrent(current, ['2026-11'])
+  assert.equal(Object.hasOwn(allCurrent.provenance, 'invalidatedSchedules'), false)
+  assert.deepEqual(allCurrent.provenance.scheduleUpdates, invalid.provenance.scheduleUpdates)
+  assert.equal(JSON.stringify(invalid), before)
+  assert.doesNotThrow(() => backupJSON(allCurrent))
+})
+
+test('acknowledgement returns the original document when no matching invalidation exists', () => {
+  const clean = fixture()
+  assert.equal(markSchedulesCurrent(clean, ['2026-10']), clean)
+  assert.equal(clean.provenance, undefined)
+  const empty = { ...clean, provenance: { fields: {}, invalidatedSchedules: {} } }
+  assert.equal(markSchedulesCurrent(empty, ['2026-10']), empty)
+  const invalid = changed(scheduledFixture(), next => { next.rules.minRestHours = 12 }, 'manual', firstTime)
+  assert.equal(markSchedulesCurrent(invalid, []), invalid)
+  assert.equal(markSchedulesCurrent(invalid, ['2026-12']), invalid)
+  assert.equal(markSchedulesCurrent(invalid, ['__proto__', 'constructor']), invalid)
+})
+
+test('invalidation metadata survives backup and local restart together with external generation history', () => {
+  const external = changed(fixture(), next => { next.assignments = scheduledFixture().assignments }, 'http', firstTime)
+  const invalid = changed(external, next => { next.rules.minRestHours = 12 }, 'manual', secondTime)
+  assert.deepEqual(parseBackup(backupJSON(invalid)).provenance, invalid.provenance)
+  const savedStorage = globalThis.localStorage, memory = new Map()
+  globalThis.localStorage = { getItem: key => memory.get(key) ?? null, setItem: (key, value) => memory.set(key, value) }
+  try {
+    saveLocal(invalid)
+    const restored = loadSaved()
+    assert.deepEqual(restored.provenance, invalid.provenance)
+    assert.deepEqual(withChangeProvenance(restored, structuredClone(restored), 'manual', thirdTime).provenance, invalid.provenance)
+  } finally {
+    if (savedStorage === undefined) delete globalThis.localStorage
+    else globalThis.localStorage = savedStorage
+  }
+  assert.equal(parseBackup(backupJSON(fixture())).provenance?.invalidatedSchedules, undefined)
+  assert.equal(parseDataProvenance({ fields: {}, invalidatedSchedules: {} }, fixture()).invalidatedSchedules, undefined)
+})
+
+test('invalidated schedule metadata strictly validates month keys, stamps, sources, times and count', () => {
+  for (const invalidated of [
+    null, [], 'months',
+    { '0000-01': stamp('mcp', firstTime) }, { '2026-13': stamp('mcp', firstTime) }, { '2026-1': stamp('mcp', firstTime) },
+    JSON.parse('{"__proto__":{"source":"mcp","at":"2026-10-15T12:00:00.000Z"}}'),
+    { '2026-10': null }, { '2026-10': [] }, { '2026-10': { source: 'ai', at: firstTime } }, { '2026-10': { source: 'MCP', at: firstTime } },
+    { '2026-10': { source: 'http', at: '2026-02-30T12:00:00.000Z' } }, { '2026-10': { source: 'manual', at: '2026-10-15' } },
+    { '2026-10': { source: 'manual', at: '2026-10-15T12:00:00Z' } },
+    { '2026-10': { source: 'http', at: firstTime, forged: true } }, { '2026-10': { source: 'mcp' } },
+  ]) {
+    const state = fixture()
+    state.provenance = { fields: {}, invalidatedSchedules: invalidated }
+    assert.throws(() => parseBackup(JSON.stringify(state)), /配置修改来源/)
+  }
+  const state = fixture()
+  state.provenance = { fields: {}, invalidatedSchedules: Object.fromEntries(Array.from({ length: 1200 }, (_, index) => [
+    `${2000 + Math.floor(index / 12)}-${String(index % 12 + 1).padStart(2, '0')}`,
+    stamp(['manual', 'mcp', 'http'][index % 3], firstTime),
+  ])) }
+  const parsed = parseBackup(backupJSON(state)).provenance.invalidatedSchedules
+  assert.equal(Object.keys(parsed).length, 1200)
+  assert.equal(Object.getPrototypeOf(parsed), null)
+  state.provenance.invalidatedSchedules['2100-01'] = stamp('http', secondTime)
+  assert.throws(() => parseBackup(JSON.stringify(state)), /最多保存 1200 个月/)
 })
